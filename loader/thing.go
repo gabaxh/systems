@@ -257,6 +257,7 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		closeCAN(fd)
 		log.Fatalf("loader: cannot open %s for encoder feedback: %v", cfg.Interface, err)
 	}
+	initEncoders(encFd) // the reference implementation does this, and the encoders need it
 	go dt.fb.listenEncoders(sys.Ctx, encFd)
 
 	waistFd := -1
