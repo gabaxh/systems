@@ -54,6 +54,27 @@ const (
 	waistReplyID = 0x701
 )
 
+func initEncoders(fd int) {
+	for nodeID := byte(0x0B); nodeID <= 0x0F; nodeID++ {
+		// Configure PDO1 for position, speed and acceleration.
+		sendCAN(fd, 0x600+uint32(nodeID),
+			[]byte{0x2F, 0x05, 0x20, 0x00, 0x02, 0x00, 0x00})
+		time.Sleep(10 * time.Millisecond)
+
+		// Set encoder cycle timer to 50 ms.
+		sendCAN(fd, 0x600+uint32(nodeID),
+			[]byte{0x2B, 0x00, 0x62, 0x00, 0x32, 0x00, 0x00})
+
+		// Reset encoder position to zero.
+		sendCAN(fd, 0x600+uint32(nodeID),
+			[]byte{0x23, 0x03, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00})
+		time.Sleep(10 * time.Millisecond)
+
+		// Start the encoder node.
+		sendCAN(fd, 0x000, []byte{0x01, nodeID})
+	}
+}
+
 // wheelReading is one wheel's own account of itself.
 type wheelReading struct {
 	revolutions float64 // since the encoder powered up
