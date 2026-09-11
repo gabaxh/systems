@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+	"errors"
 )
 
 const (
@@ -92,6 +93,9 @@ func recvCAN(fd int, timeout time.Duration) (canFrame, error) {
 	var f canFrame
 	buf := unsafe.Slice((*byte)(unsafe.Pointer(&f)), unsafe.Sizeof(f))
 	n, err := syscall.Read(fd, buf)
+	if errors.Is(err, syscall.EINTR) {
+		return f, nil
+	}
 	if err != nil {
 		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
 			return canFrame{}, errCANTimeout

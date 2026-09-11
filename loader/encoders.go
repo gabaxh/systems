@@ -30,6 +30,7 @@ import (
 	"log"
 	"sync"
 	"time"
+	"syscall"
 )
 
 var errCANTimeout = errors.New("no CAN frame within the timeout")
@@ -163,6 +164,9 @@ func (fb *feedback) listenEncoders(ctx context.Context, fd int) {
 		default:
 		}
 		f, err := recvCAN(fd, 250*time.Millisecond)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
 		if err != nil {
 			if errors.Is(err, errCANTimeout) {
 				continue
