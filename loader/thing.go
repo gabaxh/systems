@@ -781,3 +781,25 @@ func (t *Traits) waistService(w http.ResponseWriter, r *http.Request) {
 	}
 	usecases.HTTPProcessGetRequest(w, r, waistForm(raw, at))
 }
+
+func (t *Traits) vehicleTravel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method is not supported.", http.StatusNotFound)
+		return
+	}
+	var readingsum wheelReading
+	for i := 0; i <= 3; i++ {
+		reading, fresh := t.dt.fb.wheel(i)
+		readingsum.rpm = readingsum.rpm + reading.rpm
+		readingsum.revolutions = readingsum.revolutions + reading.revolutions
+		readingsum.at = reading.at
+
+		if !fresh {
+			http.Error(w, "no recent encoder frame for one of the wheels", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	readingsum.rpm = readingsum.rpm / 4
+	readingsum.revolutions = readingsum.revolutions / 4
+	usecases.HTTPProcessGetRequest(w, r, travelForm(readingsum))
+}

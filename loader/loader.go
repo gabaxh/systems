@@ -104,6 +104,8 @@ func serving(t *Traits, w http.ResponseWriter, r *http.Request, servicePath stri
 		t.controlService(w, r)
 	case "stop":
 		t.stopService(w, r)
+	case "vehicleTravel":
+		t.vehicleTravel(w, r)
 	default:
 		http.Error(w, "Invalid service path", http.StatusBadRequest)
 	}
