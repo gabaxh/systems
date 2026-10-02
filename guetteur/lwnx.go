@@ -160,7 +160,7 @@ func (s *serialSource) sweeps(ctx context.Context) (<-chan sweep, error) {
 	time.Sleep(100 * time.Millisecond)
 
 	// 6. Ensure the scanning motor is running
-	if err := s.writeFrame(cmdScanEnable, u8(1)); err != nil {
+	if err := s.writeFrame(cmdScanEnable, u16(1)); err != nil {
 		log.Printf("guetteur: could not enable scanning motor: %v", err)
 	}
 	time.Sleep(100 * time.Millisecond)

@@ -77,7 +77,11 @@ const (
 //
 // The SDO frames are seven bytes, exactly as the reference sends them. CANopen
 // specifies eight, and a stricter node could refuse them; these do not.
-func initEncoders(fd int) {
+//
+// preset is for start-up only. A restart of encoders that have gone quiet
+// leaves their position alone: the travel counted so far is carried on from
+// where it was (see unwrapLocked), not started again.
+func configureEncoders(fd int, preset bool) {
 	send := func(id uint32, data []byte, what string, node byte) {
 		if err := sendCAN(fd, id, data); err != nil {
 			log.Printf("loader: encoder 0x%02X: %s: %v", node, what, err)
@@ -88,11 +92,15 @@ func initEncoders(fd int) {
 		send(sdo, []byte{0x2F, 0x05, 0x20, 0x00, 0x02, 0x00, 0x00}, "select PDO type 2", node)
 		time.Sleep(10 * time.Millisecond)
 		send(sdo, []byte{0x2B, 0x00, 0x62, 0x00, 0x32, 0x00, 0x00}, "set the 50 ms cycle", node)
-		send(sdo, []byte{0x23, 0x03, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00}, "preset the position to zero", node)
+		if preset {
+			send(sdo, []byte{0x23, 0x03, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00}, "preset the position to zero", node)
+		}
 		time.Sleep(10 * time.Millisecond)
 		send(0x000, []byte{0x01, node}, "NMT start", node)
 	}
-	log.Println("loader: wheel encoders configured and started")
+	if preset {
+		log.Println("loader: wheel encoders configured and started")
+	}
 }
 
 // wheelReading is one wheel's own account of itself.
@@ -125,6 +133,9 @@ type feedback struct {
 	waistFresh bool
 
 	staleAfter time.Duration
+	// clock is what freshness is judged against: the wall clock, except in a
+	// test that runs the loader on simulated time.
+	clock func() time.Time
 
 	// Called with every fresh reading, outside the lock, so that the services
 	// can hand it to whoever follows them. Set once, before the listeners start.
@@ -133,7 +144,7 @@ type feedback struct {
 }
 
 func newFeedback(staleAfter time.Duration) *feedback {
-	return &feedback{staleAfter: staleAfter}
+	return &feedback{staleAfter: staleAfter, clock: time.Now}
 }
 
 // decodeWheel unpacks one encoder frame.
@@ -204,11 +215,24 @@ func (fb *feedback) listenEncoders(ctx context.Context, fd int) {
 // total. Frames arrive every 50 ms, far more often than a wheel could turn half
 // the counter's range, so the shortest way round is always the right one.
 // Caller holds the lock.
+//
+// After a silence of encoderSilence or more the frame is not differenced at all:
+// the total carries on from where it was. An encoder that went quiet had most
+// likely reset — a dip in the supply under stall current, on 1 October 2026 —
+// and comes back counting from wherever its counter now starts. Differenced, that
+// was a jump of up to half the counter's range, 100 revolutions, in travel,
+// distance and the cartographer's odometry. What the wheel turned during the
+// silence is lost either way.
 func (fb *feedback) unwrapLocked(i int, r wheelReading) wheelReading {
 	const span = int64(1) << 24
-	if !fb.started[i] {
+	prev := fb.wheels[i].at
+	resync := fb.started[i] && !prev.IsZero() && r.at.Sub(prev) >= encoderSilence
+	switch {
+	case !fb.started[i]:
 		fb.total[i], fb.started[i] = int64(r.count), true
-	} else {
+	case resync:
+		// The total stands, and counting goes on from this frame.
+	default:
 		d := int64(r.count) - int64(fb.lastCount[i])
 		switch {
 		case d > span/2:
@@ -264,6 +288,71 @@ func (fb *feedback) pollWaist(ctx context.Context, fd int, period time.Duration)
 	}
 }
 
+// encoderSilence is how long a wheel encoder may say nothing before it is
+// restarted. It reports every 50 ms, so a second is twenty frames missed.
+const encoderSilence = time.Second
+
+// encoderRestartEvery is the least time between two restarts: the
+// configuration takes a tenth of a second to send, and a node that is still
+// booting gets a moment to finish.
+const encoderRestartEvery = 2 * time.Second
+
+// superviseEncoders restarts wheel encoders that have gone quiet.
+//
+// They are CANopen nodes, and a node that resets comes up pre-operational and
+// says nothing until it is started again. This system started them once, at
+// start-up, so an encoder that reset stayed silent until the loader itself was
+// restarted: twice on 1 October 2026, on a slope, with the motors stalled. The
+// speed loop fell back to open loop as it should, but every wheel's speed and
+// travel were gone. Now a wheel quiet for encoderSilence gets the configuration
+// and NMT start again, without the position preset.
+func (fb *feedback) superviseEncoders(ctx context.Context, fd int) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	var lastRestart time.Time
+	quietBefore := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		now := time.Now()
+		quiet := fb.quietWheels(now)
+		if len(quiet) == 0 {
+			if quietBefore {
+				log.Println("loader: the wheel encoders report again")
+				quietBefore = false
+			}
+			continue
+		}
+		if now.Sub(lastRestart) < encoderRestartEvery {
+			continue
+		}
+		if !quietBefore {
+			log.Printf("loader: wheel encoder(s) %v silent for over %v — restarting them", quiet, encoderSilence)
+			quietBefore = true
+		}
+		configureEncoders(fd, false)
+		lastRestart = now
+	}
+}
+
+// quietWheels names the wheels whose encoder has said nothing for
+// encoderSilence, including any that never has.
+func (fb *feedback) quietWheels(now time.Time) []string {
+	names := [encoderCount]string{"FrontLeft", "FrontRight", "BackLeft", "BackRight"}
+	fb.mu.RLock()
+	defer fb.mu.RUnlock()
+	var quiet []string
+	for i, w := range fb.wheels {
+		if w.at.IsZero() || now.Sub(w.at) >= encoderSilence {
+			quiet = append(quiet, names[i])
+		}
+	}
+	return quiet
+}
+
 //-------------------------------------Reading it back
 
 // wheel returns one wheel's reading and whether it is recent enough to use.
@@ -274,7 +363,7 @@ func (fb *feedback) wheel(index int) (wheelReading, bool) {
 		return wheelReading{}, false
 	}
 	r := fb.wheels[index]
-	if r.at.IsZero() || time.Since(r.at) > fb.staleAfter {
+	if r.at.IsZero() || fb.clock().Sub(r.at) > fb.staleAfter {
 		return r, false
 	}
 	return r, true
@@ -292,7 +381,7 @@ func (fb *feedback) waistLatest() (raw int, at time.Time, have bool) {
 func (fb *feedback) waist() (int, time.Time, bool) {
 	fb.mu.RLock()
 	defer fb.mu.RUnlock()
-	if !fb.waistFresh || time.Since(fb.waistAt) > fb.staleAfter {
+	if !fb.waistFresh || fb.clock().Sub(fb.waistAt) > fb.staleAfter {
 		return fb.waistRaw, fb.waistAt, false
 	}
 	return fb.waistRaw, fb.waistAt, true

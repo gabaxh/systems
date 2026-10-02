@@ -56,15 +56,6 @@ type PadConfig struct {
 	Device    string `json:"device"`
 	CommandHz int    `json:"commandHz"`
 
-	// HIDWatchdogDevice is the raw HID device used only to check that Bluetooth
-	// reports are still arriving. The Linux joystick device can remain open and
-	// keep its last axis value when the Bluetooth link temporarily stalls.
-	HIDWatchdogDevice string `json:"hidWatchdogDevice"`
-
-	// HIDTimeoutMs is how long raw HID reports may be absent before the
-	// controller is treated as disconnected.
-	HIDTimeoutMs int `json:"hidTimeoutMs"`
-
 	// MaxSpeed is full stick, in m/s of the front axle.
 	MaxSpeed float64 `json:"maxSpeedMetresPerSecond"`
 
@@ -145,9 +136,7 @@ func initTemplate() *components.UnitAsset {
 		},
 		Traits: &PadConfig{
 			Device:             "/dev/input/js0",
-			HIDWatchdogDevice:  "/dev/hidraw1",
-			HIDTimeoutMs:       500,
-			CommandHz:          20,
+			CommandHz:          50,
 			MaxSpeed:           1.0,
 			Steering:           steerByEffort,
 			MaxSteeringPercent: 50,
@@ -225,7 +214,6 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		go s.run(sys.Ctx)
 	}
 	go t.pad.run(sys.Ctx)
-	go t.pad.watchHID(sys.Ctx, cfg.HIDWatchdogDevice)
 	go t.run(sys.Ctx)
 
 	return ua, func() {
@@ -237,17 +225,8 @@ func applyDefaults(cfg *PadConfig) {
 	if cfg.Device == "" {
 		cfg.Device = "/dev/input/js0"
 	}
-	// Local DualSense watchdog defaults. The hidraw number may change after
-	// reconnect/reboot, so this path should eventually be discovered rather
-	// than assumed.
-	if cfg.HIDWatchdogDevice == "" {
-		cfg.HIDWatchdogDevice = "/dev/hidraw1"
-	}
-	if cfg.HIDTimeoutMs <= 0 {
-		cfg.HIDTimeoutMs = 500
-	}
 	if cfg.CommandHz <= 0 {
-		cfg.CommandHz = 20
+		cfg.CommandHz = 50
 	}
 	if cfg.MaxSpeed <= 0 {
 		cfg.MaxSpeed = 1.0
@@ -348,17 +327,7 @@ func (t *Traits) run(ctx context.Context) {
 		case <-tick.C:
 		}
 
-		s := t.pad.snapshot()
-
-		// /dev/input/js0 may remain "connected" with a stale axis value during a
-		// temporary Bluetooth radio outage. If raw HID reports have stopped arriving,
-		// treat the pad exactly like a disconnected controller. The existing pilot
-		// safety logic will then request a vehicle stop.
-		if !t.pad.hidFresh(time.Duration(t.cfg.HIDTimeoutMs) * time.Millisecond) {
-			s.connected = false
-		}
-
-		a := p.step(s, time.Now())
+		a := p.step(t.pad.snapshot(), time.Now())
 
 		t.mu.Lock()
 		t.inControl = p.inControl
@@ -509,7 +478,7 @@ func (s *sender) run(ctx context.Context) {
 		case j := <-s.next:
 			err := s.put(j.value)
 			if err != nil && time.Since(s.lastErr) > 5*time.Second {
-				// At twenty requests a second an unreachable loader would fill
+				// At fifty requests a second an unreachable loader would fill
 				// the journal; once every five seconds per service still says
 				// it is happening.
 				log.Printf("gamer: %s: %v", s.name, err)

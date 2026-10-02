@@ -58,6 +58,11 @@ func (t *Traits) controlService(w http.ResponseWriter, r *http.Request) {
 					log.Printf("loader: %s takes control, clearing the steering fault: %s", c, d.waist.fault)
 					d.waist.fault = ""
 				}
+				// As does a stalled wheel; it is theirs to say the wheel is free.
+				if d.wheelFault != "" {
+					log.Printf("loader: %s takes control, clearing the wheel fault: %s", c, d.wheelFault)
+					d.wheelFault = ""
+				}
 				if wasHeld {
 					log.Printf("loader: %s takes control from %s", c, previous)
 				} else {

@@ -20,6 +20,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -247,5 +248,125 @@ func TestTravelIsUnwrapped(t *testing.T) {
 	}
 	if got := distanceForm(last, 1.335).Value; math.Abs(got-1335) > 1e-6 {
 		t.Errorf("1000 revolutions of a 1.335 m wheel = %v m, want 1335", got)
+	}
+}
+
+// frame feeds one encoder frame through the unwrapping as the listener does.
+func frame(fb *feedback, i int, count uint32, at time.Time) wheelReading {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	r := fb.unwrapLocked(i, wheelReading{count: count, at: at})
+	fb.wheels[i] = r
+	return r
+}
+
+// An encoder that went quiet and came back counting from somewhere else —
+// reset, most likely — leaves travel where it was rather than jumping.
+func TestTravelCarriesOnAcrossASilence(t *testing.T) {
+	fb := newFeedback(time.Second)
+	start := time.Unix(1_000_000, 0)
+	var r wheelReading
+	for k := 0; k <= 10; k++ { // a revolution, in ten frames
+		r = frame(fb, 1, uint32(k*8192), start.Add(time.Duration(k)*50*time.Millisecond))
+	}
+	before := r.revolutions
+	// Two seconds of nothing, then the counter at a third of its range.
+	back := start.Add(2550 * time.Millisecond)
+	r = frame(fb, 1, 1<<22, back)
+	if r.revolutions != before {
+		t.Errorf("after the silence travel went from %v to %v revolutions; want it unchanged", before, r.revolutions)
+	}
+	r = frame(fb, 1, 1<<22+8192, back.Add(50*time.Millisecond))
+	if d := r.revolutions - before; math.Abs(d-0.1) > 1e-9 {
+		t.Errorf("the first frame after it moved travel %v revolutions; want 0.1", d)
+	}
+	// A short gap is not a silence: a lost frame or two still differences.
+	r = frame(fb, 1, 1<<22+3*8192, back.Add(200*time.Millisecond))
+	if d := r.revolutions - before; math.Abs(d-0.3) > 1e-9 {
+		t.Errorf("across a 150 ms gap travel is %v revolutions on; want 0.3", d)
+	}
+}
+
+// The wheels that have said nothing for a second, or ever, are the ones to
+// restart.
+func TestQuietWheels(t *testing.T) {
+	fb := newFeedback(time.Second)
+	now := time.Now()
+	fb.wheels[0].at = now.Add(-100 * time.Millisecond)
+	fb.wheels[1].at = now.Add(-1500 * time.Millisecond)
+	fb.wheels[3].at = now
+	got := fb.quietWheels(now)
+	if len(got) != 2 || got[0] != "FrontRight" || got[1] != "BackLeft" {
+		t.Errorf("quiet wheels %v; want FrontRight (1.5 s) and BackLeft (never)", got)
+	}
+	for i := range fb.wheels {
+		fb.wheels[i].at = now
+	}
+	if got := fb.quietWheels(now); len(got) != 0 {
+		t.Errorf("with every wheel reporting, %v are quiet", got)
+	}
+}
+
+// stalledWheel is a drivetrain with control taken, FrontLeft asked for target
+// RPM and given effort percent of full scale, its encoder fresh and reporting
+// rpm.
+func stalledWheel(t *testing.T, target, effort, rpm float64) (*drivetrain, *Traits, map[int]int16) {
+	t.Helper()
+	d := testDrivetrain(t, true)
+	vehicle := &Traits{Name: "Vehicle", Kind: "vehicle", dt: d, encoderIndex: -1}
+	if w := put(t, vehicle.controlService, "gamer", "1"); w.Code != http.StatusOK {
+		t.Fatalf("taking control: %d %s", w.Code, w.Body)
+	}
+	d.setpoint[1] = target
+	d.fb.wheels[0] = wheelReading{rpm: rpm, at: time.Now()}
+	return d, vehicle, map[int]int16{1: int16(effort / 100 * fullScale)}
+}
+
+// A wheel driven hard that does not turn stops the vehicle after
+// wheelStallMs, and not before; taking control again clears the fault.
+func TestAStalledWheelStopsTheVehicle(t *testing.T) {
+	d, vehicle, sent := stalledWheel(t, 60, 50, 0)
+	start := time.Now()
+	d.watchWheelsLocked(start, sent)
+	d.watchWheelsLocked(start.Add(1900*time.Millisecond), sent)
+	if d.helm.stopped {
+		t.Fatal("stopped after 1.9 s; the watchdog allows 2")
+	}
+	d.watchWheelsLocked(start.Add(2000*time.Millisecond), sent)
+	if !d.helm.stopped || !strings.Contains(d.helm.why, "wheel watchdog") || !strings.Contains(d.wheelFault, "FrontLeft") {
+		t.Fatalf("after 2 s of a stalled wheel: stopped %v (%q), fault %q", d.helm.stopped, d.helm.why, d.wheelFault)
+	}
+	if w := put(t, vehicle.controlService, "gamer", "1"); w.Code != http.StatusOK {
+		t.Fatalf("taking control after the fault: %d %s", w.Code, w.Body)
+	}
+	if d.wheelFault != "" {
+		t.Error("taking control again did not clear the wheel fault")
+	}
+}
+
+// What is not a stall: a wheel that turns, one driven gently, one asked to
+// hold still on a hill, and one whose encoder has gone quiet.
+func TestWhatIsNotAStall(t *testing.T) {
+	for _, c := range []struct {
+		why                 string
+		target, effort, rpm float64
+		stale               bool
+	}{
+		{"turning", 60, 50, 30, false},
+		{"driven gently", 20, 17, 0, false},
+		{"holding at zero on a hill", 0, 45, 0, false},
+		{"an encoder gone quiet", 60, 50, 0, true},
+	} {
+		d, _, sent := stalledWheel(t, c.target, c.effort, c.rpm)
+		if c.stale {
+			d.fb.wheels[0].at = time.Now().Add(-5 * time.Second)
+		}
+		start := time.Now()
+		for ms := 0; ms <= 5000; ms += 20 {
+			d.watchWheelsLocked(start.Add(time.Duration(ms)*time.Millisecond), sent)
+		}
+		if d.helm.stopped {
+			t.Errorf("%s: the watchdog stopped the vehicle: %s", c.why, d.wheelFault)
+		}
 	}
 }

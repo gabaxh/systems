@@ -198,7 +198,8 @@ func testDrivetrain(t *testing.T, certified bool) *drivetrain {
 		close(usecases.EnsureCertReady(&sys))
 	}
 	d := &drivetrain{
-		cfg: LoaderConfig{MaxWheelRPM: 120, AccelStep: 150, BrakeStep: 500, SafetyStopMs: 500,
+		cfg: LoaderConfig{CommandHz: 50, MaxWheelRPM: 120, AccelStep: 150, BrakeStep: 500, SafetyStopMs: 500,
+			WheelStallPercent: 40, WheelStallMs: 2000,
 			Motors: []MotorSpec{{Name: "FrontLeft", NodeID: 1, Kind: "wheel"}}},
 		sys:      &sys,
 		fb:       newFeedback(time.Second),

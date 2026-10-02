@@ -93,7 +93,7 @@ sequenceDiagram
     Note over Person,G: the pad drives nothing until it has control
 
     Person->>J: hold L1 + R1, sticks centered
-    loop every cycle, 50 ms
+    loop every cycle, 20 ms
         G->>G: read the pad, and ask if five seconds have passed
     end
     G->>L: PUT Vehicle/control 1
@@ -193,7 +193,7 @@ Generated on the first run.
 | field | default | |
 |---|---|---|
 | `device` | `/dev/input/js0` | |
-| `commandHz` | 20 | how often commands are sent; the loader stops after 0.5 s of silence |
+| `commandHz` | 50 | how often commands are sent; the loader stops after 0.5 s of silence |
 | `maxSpeedMetresPerSecond` | 1.0 | full stick forward or back |
 | `steering` | `effort` | `effort` until the waist is calibrated, then `curvature` |
 | `maxSteeringPercent` | 50 | full stick by effort |

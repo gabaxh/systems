@@ -83,9 +83,10 @@ sequenceDiagram
     Note over P,L: anyone else commanding gets 409,<br/>naming who has control
 
     loop every cycle, 20 ms
-        W-->>D: raw count (polled at 20 Hz)
+        W-->>D: raw count (polled at 50 Hz)
         D->>D: watchdog: what last cycle's effort did to the joint
         D->>D: wheels from velocity and the articulation<br/>the joint actually has
+        D->>D: speed loop per wheel, from its encoder
         D->>D: steering: curvature to target angle, then the angle loop
         D->>D: guard: fresh reading? past the limit?<br/>which way is back?
         D->>M: set velocity, then update, per motor
@@ -111,6 +112,10 @@ Every cycle, before any effort reaches the waist motor:
   `limitDegrees` (35°) once calibrated; before that, `uncalibratedWindowCounts`
   (40 counts) either side of `straightCount` — a few degrees, or up to about
   15°, depending on the scale nobody has measured yet.
+- **Once at the limit, effort outward waits until the joint is back inside by
+  `limitMarginDegrees`** (2°; 5 counts before calibration). A joint resting on
+  the limit wanders a count either way — the chain's slack, the tyres, the
+  sensor — and without the margin every count inside was a fresh push outward.
 - **Until `effortTurnsLeft` is set, nothing is allowed past the limit at all**,
   because which way is back is not known.
 - A refused effort stops the motor **at once**, skipping the ramp: the ramp's
@@ -187,6 +192,11 @@ after every change.
    revolutions; put it in `geometry.wheelCircumferenceMetres`. The 1.335 m in
    the configuration was measured unloaded; the loaded figure will be smaller.
    This is the only place the wheel size lives.
+6. **The waist's breakaway.** On blocks, with control, `PUT Steering/setpoint`
+   in steps of 2 % while following `Steering/waist`, until the count moves. Put
+   a little less than that in `waist.minEffortPercent`. The angle loop never
+   asks for less outside its deadband, so the last few degrees to a target are
+   not left to an effort too small to turn the chain.
 
 ## Driving
 
@@ -250,6 +260,123 @@ which took **15 s to stop** from full speed.
 
 At the measured circumference, 1 km/h is 12.5 RPM and 1 m/s is 45 RPM.
 
+**The steering has its own ramp**, `waist.rampPercentPerSecond`: 500 % a second
+by default, so 0 to 50 % effort takes 0.1 s. Until 30 September 2026 the waist
+motor shared the wheels' ramp. That is 24 % effort a second, so a turn asked
+for from straight took 2 s to reach full effort. The motor also stayed below
+the effort that moves the joint for most of a second, which felt like the
+steering answering the stick a second late.
+
+**Steering by curvature, the angle loop lets go and turns at once.** When the
+loop reaches its target, or turns to correct an overshoot, the effort it was
+applying stops at once and does not run down the ramp. Only the build-up in
+the new direction is ramped. Until 1 October 2026 a reversal went down the
+ramp, and at 100 % a second the motor kept pushing the old way for up to half
+a second. Every overshoot correction also got the full take-up push. Together
+they made the waist swing about its target, wider the longer it went on.
+Three more rules keep it settled:
+
+- **Hysteresis.** Once inside its deadband, the loop starts again only at
+  twice the deadband, so a count of sensor noise is not a kick.
+- **The take-up is for real moves.** It boosts only a move of
+  `takeUpMinErrorDegrees` (2°) or more.
+- **The loop aims inside the limit.** The target is never past
+  `limitDegrees − limitMarginDegrees`, so at full stick the guard never cuts
+  the loop off. `curvatureLimit`, and the tightest turn in the start-up log,
+  are for that angle. Set the gamer's `maxCurvature` to it.
+
+Driven by `velocity`, the ramp applies to each wheel's **target speed**, at the
+same rate, and the [speed loop](#holding-speed-on-a-slope) follows the target.
+The loop's correction is not ramped a second time, so it can push hard as soon
+as the vehicle meets a slope.
+
+## Holding speed on a slope
+
+**The drives do not hold a speed.** Operating mode 3 runs each drive with no loop
+of its own, and `0x77` sets a motor command, which is a share of the voltage, not
+a velocity. 256 counts per RPM only assumes that full voltage turns a wheel at
+120 RPM. That holds on the flat. Uphill the load holds the wheels back, and
+downhill the slope pushes them on, so until 1 October 2026 the same stick drove
+the loader at three speeds. The drives cannot close the loop themselves: the
+wheel encoders are nodes on the bus, not wired to them.
+
+So the loader closes it. While a pilot drives by `velocity`, each wheel's
+command is its target plus a correction from its own encoder:
+
+    command = target + proportionalGain·error + integralGainPerSecond·∫error dt
+
+The error is the target minus the speed measured from the encoder's position,
+frame to frame (every 50 ms). The integral is the part that learns the slope.
+It stops growing once the motor is at full scale or the correction at
+`maxCorrectionRPM`, so the vehicle does not lunge when a hill ends. Downhill
+the correction goes negative and the motors hold the vehicle back. With the
+stick centred, a pilot in control holds the wheels at zero, so the loader does
+not roll away on a slope. A stop, silence or a handover still zero everything
+at once.
+
+- **A wheel whose encoder goes quiet is driven open loop**, as before the loop,
+  and the loader logs it. A dead encoder must not read as a stalled wheel to
+  push ever harder on.
+- **A motor commanded directly** (`PUT FrontLeft/setpoint`) is open loop, so bench
+  measurements keep their meaning.
+- **`speedLoop.openLoop: true` turns the loop off**, and the vehicle drives exactly
+  as it did before.
+
+**Tuning**, on blocks first and then on a slope. The gains are first guesses.
+Follow `speed` on each wheel at a steady stick. Raise `integralGainPerSecond`
+until a slope's error is gone within about a second, and lower it if the speed
+swings. Then raise `proportionalGain` for a stiffer answer to a sudden load.
+Restart after each change.
+
+## Standing still on a hill
+
+**With the stick centred and control kept, the loader holds the vehicle where
+it is.** The gamer goes on sending a velocity of zero, and the speed loop holds
+every wheel at 0 RPM. On a slope that means the motors push against it, at
+stall, for as long as the vehicle stands there. That is heat, and on a steep
+slope it is what the drives' current limit eventually cuts off. After 30 s of
+holding at 40 % or more the loader says so in its log, once. It does not let
+go: on a hill, letting go is the dangerous direction.
+
+**If the drivetrain holds the vehicle by itself, the motors need not.** Set
+`speedLoop.holdRelaxAfterSeconds`, for example to 3, and after that long
+standing still the loader:
+
+1. eases the wheels' effort to zero over half a second, and keeps what the loop
+   has learned;
+2. watches the encoders. If any wheel rolls `creepMetres` (2 cm), the loop
+   catches it at once, starting from the effort it had learned, and holds
+   actively again;
+3. counts the catches. `maxCatches` (3) of them within a minute mean this slope
+   needs holding, and the loader holds actively for as long as the vehicle
+   stands there.
+
+With an encoder quiet a creep cannot be seen, so the loader never rests then.
+It is **off by default**, until you have seen that this vehicle stays put on a
+slope with its motors off. Find that out with `holdtest.py 10 5 60 stop`, on the
+steepest slope you drive, with someone ready to catch it: it drives up, holds,
+then stops the vehicle and shows whether it rolls back.
+
+A stop, silence, a handover or a fault still sets every motor to zero at once.
+Holding does not survive a stop, and how the vehicle should stop on a hill is a
+question of its own.
+
+Driving off again starts from the effort the hold had learned, so the vehicle
+does not roll back first when it sets off uphill.
+
+## When a wheel does not turn
+
+**A wheel asked to move, driven at `wheelStallPercent` (40 %) or more, that its
+encoder says is not turning (under 2 RPM) for `wheelStallMs` (2 s), stops the
+vehicle.** The log names the wheel, and taking control again clears the fault.
+On 1 October 2026, on a slope, full stick drove all four wheels at full scale
+into a stall until the drives cut out hot, and the stick went on asking: nothing
+watched the wheels as the steering's watchdog watches the waist.
+
+It judges what the wheel was sent, whatever drives it: the speed loop, open
+loop, or a setpoint on the bench. Holding still on a hill is a target of zero
+and never counts. A stale encoder says nothing either way.
+
 ## The lowest speed that turns a wheel
 
 Reported from the bench, 8 September 2026: 20 RPM turns the wheels, 10 RPM does
@@ -266,12 +393,12 @@ Generated on the first run.
 | field | default | |
 |---|---|---|
 | `canInterface` / `canSensorInterface` | `can0` / `can1` | motors and encoders at 500 kbit/s; the waist sensor alone at 250 |
-| `waistPollHz` | 20 | the sensor answers only when polled |
+| `waistPollHz` | 50 | the sensor answers only when polled; once a command cycle |
 | `feedbackStaleMs` | 500 | how old an encoder reading may be and still count |
 | `commandHz` | 50 | the drives treat a command older than 100 ms as stale |
 | `safetyStopMs` | 500 | how long the pilot may be silent |
 | `maxWheelRPM` | 120 | full scale, `0x7800` |
-| `accelStep` / `brakeStep` | 150 / 500 | ramp, per cycle |
+| `accelStep` / `brakeStep` | 150 / 500 | the wheels' ramp, per cycle |
 | `priority` | `["gamer"]` | who may take control from anyone, and after a stop |
 | `maxSpeedMetresPerSecond` | 1.5 | the velocity command's ceiling |
 | `geometry.jointToFrontAxleMetres` / `jointToRearAxleMetres` | 0.6175 / 0.6175 | L1 and L2 |
@@ -281,10 +408,21 @@ Generated on the first run.
 | `waist.effortTurnsLeft` | 0 | calibrate: step 2; `1`, `-1`, or `0` for not known |
 | `waist.calibrationCount` / `calibrationDegrees` | 0 / 0 | calibrate: steps 3–4; degrees positive left |
 | `waist.limitDegrees` | 35 | the software limit; the joint's travel is about ±40° |
+| `waist.limitMarginDegrees` | 2 | how far back inside the limit the joint must come before it may be steered outward again |
 | `waist.uncalibratedWindowCounts` | 40 | the limit before calibration, while a count's worth is unknown |
 | `waist.staleMs` | 200 | how old a reading may be and still steer |
 | `waist.gainPercentPerDegree` / `maxEffortPercent` / `deadbandDegrees` | 4 / 50 / 0.5 | the angle loop; not yet tuned on the vehicle |
+| `waist.minEffortPercent` | 0 | the least effort the angle loop applies outside the deadband; calibrate: step 6 |
+| `waist.rampPercentPerSecond` | 500 | the steering's ramp; see [the ramp](#the-ramp) |
+| `waist.takeUpEffortPercent` / `takeUpCounts` / `takeUpMaxMs` | 0 / 4 / 300 | the push that crosses the chain's slack when the angle loop turns, until the joint has moved that many counts or that long has passed; 0 turns it off |
+| `waist.takeUpMinErrorDegrees` | 2 | the smallest move the take-up boosts |
 | `waist.stallEffortPercent` / `stallMs` / `stallCounts` | 30 / 1500 / 3 | the watchdog |
+| `speedLoop.proportionalGain` / `integralGainPerSecond` | 0.3 / 1.0 | the wheels' speed loop; not yet tuned on the vehicle — see [holding speed on a slope](#holding-speed-on-a-slope) |
+| `speedLoop.maxCorrectionRPM` | 60 | how far the loop may move a wheel's command from its target |
+| `speedLoop.openLoop` | false | `true` drives the wheels without the loop, as before it |
+| `speedLoop.holdRelaxAfterSeconds` | 0 | seconds standing still before resting on the drivetrain; 0 holds actively always — see [standing still on a hill](#standing-still-on-a-hill) |
+| `speedLoop.creepMetres` / `maxCatches` | 0.02 / 3 | how far a resting vehicle may roll before it is caught, and how many catches in a minute mean holding for good |
+| `wheelStallPercent` / `wheelStallMs` | 40 / 2000 | the wheels' watchdog — see [when a wheel does not turn](#when-a-wheel-does-not-turn) |
 | `motors` | the five | each wheel with its `axle` and `side` |
 
 A configuration written before 18 September 2026 lacks the vehicle services, the
@@ -325,9 +463,10 @@ handle unequal half-lengths. What would not carry over as it is:
 
 Motors are Magellan motion-control ICs at `0x600 + node`: reset `{00 39}`,
 current foldback `{00 41 00 00 98 8F}`, operating mode 3 `{00 65 00 03}`, with
-the reference's delays. A speed is `{00 77 hi lo}` then `{00 1A}`, the value
+the reference's delays. A command is `{00 77 hi lo}` then `{00 1A}`, the value
 being RPM × 256 — and, for the steering, effort as a share of the same full
-scale.
+scale. It is a motor command, a share of the voltage, not a speed the drive
+holds; the speed is held by the loader's own loop.
 
 Wheel encoders are CANopen nodes `0x0B`–`0x0F` and say nothing until started.
 At start-up the loader configures each as `can_dds` does — PDO type 2
@@ -338,6 +477,16 @@ position as a 24-bit little-endian counter in bytes 0–2, speed as a signed
 16-bit count per 5 ms window in bytes 4–5. 4096 counts per encoder revolution
 through a 20:1 gearbox is 81 920 per wheel revolution. **The two left-hand
 encoders count backwards** and are negated on the way in.
+
+**An encoder that goes quiet is started again.** A CANopen node that resets —
+a dip in the supply under stall current, most likely — comes back
+pre-operational and silent, and until 1 October 2026 it stayed that way until
+the loader was restarted. Now any wheel silent for a second gets the
+configuration and NMT start again, at most every 2 s, without the position
+preset. The first frame after the silence is not differenced: `travel` and
+`distance` carry on from where they were, rather than jumping by however far
+the reset counter happens to start from. What the wheel turned during the
+silence is lost.
 
 The articulation sensor is polled: `0x700` with no data, answered on `0x701`
 with `((data[0] & 0x03) << 8) | data[1]`.
