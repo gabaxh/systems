@@ -85,9 +85,9 @@ sequenceDiagram
     loop every cycle, 20 ms
         W-->>D: raw count (polled at 50 Hz)
         D->>D: watchdog: what last cycle's effort did to the joint
-        D->>D: wheels from velocity and the articulation<br/>the joint actually has
-        D->>D: speed loop per wheel, from its encoder
-        D->>D: steering: curvature to target angle, then the angle loop
+        D->>D: wheels from velocity, the articulation<br/>the joint actually has, and its rate
+        D->>D: speed loop: one shared integral,<br/>a proportional correction per wheel
+        D->>D: steering: curvature to target angle,<br/>then the angle loop (hold, or move with a PI)
         D->>D: guard: fresh reading? past the limit?<br/>which way is back?
         D->>M: set velocity, then update, per motor
     end
@@ -192,11 +192,12 @@ after every change.
    revolutions; put it in `geometry.wheelCircumferenceMetres`. The 1.335 m in
    the configuration was measured unloaded; the loaded figure will be smaller.
    This is the only place the wheel size lives.
-6. **The waist's breakaway.** On blocks, with control, `PUT Steering/setpoint`
-   in steps of 2 % while following `Steering/waist`, until the count moves. Put
-   a little less than that in `waist.minEffortPercent`. The angle loop never
-   asks for less outside its deadband, so the last few degrees to a target are
-   not left to an effort too small to turn the chain.
+6. **The waist's breakaway.** On blocks, with control, run `waistkick.py left`
+   and `waistkick.py right`. Each walks the effort up 2 % at a time until the
+   count moves. Put the lower of the two in `waist.breakawayPercent` (22 on 1
+   October 2026). Then, steering by curvature, watch the log's `waist moving` /
+   `waist holding` lines. If a move stops short and needs a second push,
+   lower `waist.coastSeconds`. If it coasts past, raise it.
 
 ## Driving
 
@@ -267,28 +268,106 @@ for from straight took 2 s to reach full effort. The motor also stayed below
 the effort that moves the joint for most of a second, which felt like the
 steering answering the stick a second late.
 
-**Steering by curvature, the angle loop lets go and turns at once.** When the
-loop reaches its target, or turns to correct an overshoot, the effort it was
-applying stops at once and does not run down the ramp. Only the build-up in
-the new direction is ramped. Until 1 October 2026 a reversal went down the
-ramp, and at 100 % a second the motor kept pushing the old way for up to half
-a second. Every overshoot correction also got the full take-up push. Together
-they made the waist swing about its target, wider the longer it went on.
-Three more rules keep it settled:
-
-- **Hysteresis.** Once inside its deadband, the loop starts again only at
-  twice the deadband, so a count of sensor noise is not a kick.
-- **The take-up is for real moves.** It boosts only a move of
-  `takeUpMinErrorDegrees` (2°) or more.
-- **The loop aims inside the limit.** The target is never past
-  `limitDegrees − limitMarginDegrees`, so at full stick the guard never cuts
-  the loop off. `curvatureLimit`, and the tightest turn in the start-up log,
-  are for that angle. Set the gamer's `maxCurvature` to it.
+**The steering lets go at once.** Effort builds up on the ramp, but drops
+towards zero immediately, and a reversal passes through zero for one cycle.
+Until 8 October 2026 it also ramped down, so 22 % took a fifth of a second to
+reach zero at the vehicle's 100 % a second, and the joint coasted on past where
+[the angle loop](#the-angle-loop) had let go.
 
 Driven by `velocity`, the ramp applies to each wheel's **target speed**, at the
 same rate, and the [speed loop](#holding-speed-on-a-slope) follows the target.
 The loop's correction is not ramped a second time, so it can push hard as soon
 as the vehicle meets a slope.
+
+## The angle loop
+
+Steering by curvature, the waist is driven by a loop that either **holds** or
+**moves**. The waist gearbox is self-locking: with no effort it holds the
+joint where it is, apart from the chain's slack. So the loop has nothing to do
+near its target, and does nothing there.
+
+```
+holding:  effort 0, integral 0
+          → moving, once the joint would rest more than holdDegrees from the target
+moving:   effort = kp·e + ki·∫e dt, one way only, up to the ceiling,
+          the integral starting from 0.9·breakawayPercent
+          → holding, once the joint would rest within settleDegrees of the target, or past it
+```
+
+`e` is the target less the measured angle, in degrees. "Would rest" is the
+angle plus `coastSeconds` of the joint's rate. The rate comes from the same
+filter the wheels use ([the wheels follow the joint](#the-wheels-follow-the-joint)).
+
+- **Holding covers a small error and a small command alike.** A count of
+  noise, a target that wanders with the stick near its centre, or a fraction
+  of a degree is no reason to cross the chain's slack. Whether to start moving
+  is judged on the filtered angle, so noise at the edge of `holdDegrees` does
+  not start a move either. After letting go, the loop waits up to a second
+  for the joint to come to rest before judging it again.
+- **A move starts at once.** Its integral starts just below the breakaway,
+  instead of winding up to it at `ki`·e a second. For a step of 2° that wait
+  was two seconds, which felt like steering through treacle.
+- **A move pushes one way only.** A push that turned into a push the other way
+  would take up the slack both ways.
+- **A move ends before the joint gets there.** The motor and the joint coast
+  once let go, and the loop lets go `coastSeconds` of their rate early.
+
+**The loop aims inside the limit.** The target is never past
+`limitDegrees − limitMarginDegrees`, so at full stick the guard never cuts the
+loop off. `curvatureLimit`, and the tightest turn in the start-up log, are for
+that angle. Set the gamer's `maxCurvature` to it.
+
+Every start and end of a move is logged (`waist moving left: …`,
+`waist holding: …`). A loop that has settled says nothing, and one that
+hunts says so every second: that is what to read on the vehicle.
+
+**The history.**
+- Until 7 October 2026 the loop was proportional, with a minimum effort for the
+  breakaway, a take-up push across the slack, a deadband with hysteresis, and
+  its effort cut whenever it turned. Together they swung the waist about its
+  target on the ground.
+- On 7 October it became a PI with a deadzone on its effort. That settled in
+  the simulation, but on 8 October, on blocks with the stick centred, it hunted.
+  The integral wound up to the breakaway. A motor that has broken away keeps
+  turning on less, so the joint lurched past its target, and the still-loaded
+  integral carried it on. Each reversal crossed the slack again.
+
+The simulation (`waistsim_test.go`) now has a breakaway higher than the
+effort that keeps the motor turning, a self-locking drive, slack, coasting and
+noise. It reproduces that hunting with the PI, and the loop above settles in
+one push. A configuration still carrying removed keys loads, and the loader
+says at start-up that they are ignored.
+
+## The wheels follow the joint
+
+**The waist motor and the wheels used to fight.** While the joint swings, the
+two halves turn relative to each other, and every wheel has to roll with
+them. The wheels were set from the steady-state model, which assumes the joint
+is held still. So their speed loops held them at speeds that did not allow the
+swing, and pushed back against the waist motor. Standing still with the stick
+centred, they held all four at zero RPM. The two loops fought through the
+machine, and the vehicle oscillated.
+
+Now the wheels are set from the joint's angle **and its rate**. With neither
+axle sliding sideways, the front half turns at
+`ψ̇f = (v sin γ + L2 γ̇) / (L1 cos γ + L2)`, the rear half at `ψ̇f − γ̇`, and
+each wheel rolls with its half. Standing still and swinging left, the front
+axle's center stays put: the front wheels turn the front half left and the
+rear wheels turn the rear half right.
+
+The rate comes from a filter on the waist sensor, `waist.jointFilterSeconds`.
+One count between two readings is several degrees a second, and a raw
+difference would set the wheels twitching. Below half a degree a second the
+joint counts as still, so a resting vehicle stays resting. The angle loop
+steers by the raw reading, since its feedback must not lag. It takes two
+things from the filter: the rate, to know when to let go, and the filtered
+angle, to decide whether to move at all. The filter needs readings to work
+with: at a `waistPollHz` under 25 the loader warns at start-up.
+
+For comparing on the vehicle:
+- `waist.ignoreJointRate` sets the wheels as before, from the raw angle alone.
+- `speedLoop.freezeIntegralWhileSteering` holds the wheels' integral while the
+  joint swings, if following the rate turns out not to be enough.
 
 ## Holding speed on a slope
 
@@ -301,12 +380,27 @@ the loader at three speeds. The drives cannot close the loop themselves: the
 wheel encoders are nodes on the bus, not wired to them.
 
 So the loader closes it. While a pilot drives by `velocity`, each wheel's
-command is its target plus a correction from its own encoder:
+command is its target plus a correction from the encoders:
 
-    command = target + proportionalGain·error + integralGainPerSecond·∫error dt
+    command = target + proportionalGain·ē + differentialGain·(error − ē) + integralGainPerSecond·∫ē dt
 
 The error is the target minus the speed measured from the encoder's position,
-frame to frame (every 50 ms). The integral is the part that learns the slope.
+frame to frame (every 50 ms). `ē` is the four wheels' mean error. The integral
+is the part that learns the slope.
+
+**The four wheels share one integral.** They are tied together, through the
+ground and through the joint, and the kinematics set all four from the same
+two numbers. Any difference between the model and the machine is an error no
+set of wheel speeds can clear: a tyre's radius, the joint's rate read a little
+late, scrub. Until 8 October 2026 each wheel had an integral of its own, and
+the four wound up against each other, and against the waist motor, through
+the machine. In the simulation, one tyre reading 5 % fast spread the commands
+by 17 RPM after 15 s, and the shared integral spreads them by 0.3 RPM. Each
+wheel's own difference from the others gets a proportional correction
+(`differentialGain`, by default the same as `proportionalGain`) and no more.
+The four share the work the way an open differential does.
+`speedLoop.perWheelIntegral: true` restores one integral per wheel, for
+comparing the two on the vehicle.
 It stops growing once the motor is at full scale or the correction at
 `maxCorrectionRPM`, so the vehicle does not lunge when a hill ends. Downhill
 the correction goes negative and the motors hold the vehicle back. With the
@@ -411,15 +505,17 @@ Generated on the first run.
 | `waist.limitMarginDegrees` | 2 | how far back inside the limit the joint must come before it may be steered outward again |
 | `waist.uncalibratedWindowCounts` | 40 | the limit before calibration, while a count's worth is unknown |
 | `waist.staleMs` | 200 | how old a reading may be and still steer |
-| `waist.gainPercentPerDegree` / `maxEffortPercent` / `deadbandDegrees` | 4 / 50 / 0.5 | the angle loop; not yet tuned on the vehicle |
-| `waist.minEffortPercent` | 0 | the least effort the angle loop applies outside the deadband; calibrate: step 6 |
-| `waist.rampPercentPerSecond` | 500 | the steering's ramp; see [the ramp](#the-ramp) |
-| `waist.takeUpEffortPercent` / `takeUpCounts` / `takeUpMaxMs` | 0 / 4 / 300 | the push that crosses the chain's slack when the angle loop turns, until the joint has moved that many counts or that long has passed; 0 turns it off |
-| `waist.takeUpMinErrorDegrees` | 2 | the smallest move the take-up boosts |
+| `waist.gainPercentPerDegree` / `integralPercentPerDegreeSecond` / `maxEffortPercent` | 4 / 4 / 50 | the [angle loop](#the-angle-loop): kp, ki and ceiling, in percent of effort; tuned in simulation, not yet on the vehicle |
+| `waist.breakawayPercent` | 0 | the effort that starts the joint from rest (calibrate: step 6); a move starts from 0.9 of it. 0 starts from the gain alone, which waits seconds on small steps |
+| `waist.holdDegrees` / `settleDegrees` / `coastSeconds` | 1 / 0.3 / 0.1 | the angle loop starts moving the joint this far from its target, lets go this close, and reckons the joint coasts this long on its rate; see [the angle loop](#the-angle-loop) |
+| `waist.rampPercentPerSecond` | 500 | how fast the steering's effort builds up; it lets go at once — see [the ramp](#the-ramp) |
+| `waist.jointFilterSeconds` / `ignoreJointRate` | 0.15 / false | how much the joint's angle and rate are smoothed before [the wheels follow them](#the-wheels-follow-the-joint); `true` sets the wheels as before 7 October 2026 |
 | `waist.stallEffortPercent` / `stallMs` / `stallCounts` | 30 / 1500 / 3 | the watchdog |
 | `speedLoop.proportionalGain` / `integralGainPerSecond` | 0.3 / 1.0 | the wheels' speed loop; not yet tuned on the vehicle — see [holding speed on a slope](#holding-speed-on-a-slope) |
 | `speedLoop.maxCorrectionRPM` | 60 | how far the loop may move a wheel's command from its target |
 | `speedLoop.openLoop` | false | `true` drives the wheels without the loop, as before it |
+| `speedLoop.freezeIntegralWhileSteering` | false | hold the wheels' integral while the joint swings; see [the wheels follow the joint](#the-wheels-follow-the-joint) |
+| `speedLoop.perWheelIntegral` / `differentialGain` | false / = `proportionalGain` | `true` gives each wheel its own integral, as before 8 October 2026; the gain on each wheel's difference from the others — see [holding speed on a slope](#holding-speed-on-a-slope) |
 | `speedLoop.holdRelaxAfterSeconds` | 0 | seconds standing still before resting on the drivetrain; 0 holds actively always — see [standing still on a hill](#standing-still-on-a-hill) |
 | `speedLoop.creepMetres` / `maxCatches` | 0.02 / 3 | how far a resting vehicle may roll before it is caught, and how many catches in a minute mean holding for good |
 | `wheelStallPercent` / `wheelStallMs` | 40 / 2000 | the wheels' watchdog — see [when a wheel does not turn](#when-a-wheel-does-not-turn) |
@@ -454,10 +550,12 @@ handle unequal half-lengths. What would not carry over as it is:
 
 ## Not here yet
 
-- **The joint's own rate.** While the joint is swinging, the two halves turn
-  relative to each other; the kinematics use the steady-state model and ignore
-  that. At the rates this machine steers it is small.
-- **A tuned angle loop.** Gain, ceiling and deadband are first guesses.
+- **An angle loop tuned on the vehicle.** Gains, hold band and coasting are
+  tuned against a simulated waist, not the real one; the breakaway was measured.
+- **Taking up the chain's slack properly.** That needs the waist motor's own
+  position, to know where in the slack the joint is. Until then, a joint that
+  wanders across the slack while rolling straight is a job for a chain
+  tensioner.
 
 ## Protocol notes
 

@@ -17,8 +17,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 )
 
@@ -86,16 +88,25 @@ type WaistConfig struct {
 	// than for any other measurement, because it is what the limit stands on.
 	StaleMs int `json:"staleMs"`
 
-	// The angle loop: effort in percent per degree of error, its ceiling, and
-	// a deadband inside which the joint is left alone. Not tuned on the vehicle.
-	GainPercentPerDegree float64 `json:"gainPercentPerDegree"`
-	MaxEffortPercent     float64 `json:"maxEffortPercent"`
-	DeadbandDegrees      float64 `json:"deadbandDegrees"`
-	// MinEffortPercent is the least effort the angle loop applies outside the
-	// deadband: what it takes to get the joint moving at all, against the chain
-	// and the tyres. Below it the loop asks for effort that turns nothing, and
-	// the last few degrees take seconds. 0 until measured on the vehicle.
-	MinEffortPercent float64 `json:"minEffortPercent"`
+	// The angle loop holds, or moves the joint; see anglePI. Holding, it gives
+	// the motor nothing: the gearbox is self-locking, and holds the joint by
+	// itself. It moves the joint once it is HoldDegrees from its target, with
+	// a PI, and lets go once the joint will coast to within SettleDegrees of
+	// it, CoastSeconds of its rate from now.
+	//
+	// GainPercentPerDegree is kp and IntegralPercentPerDegreeSecond ki, both in
+	// percent of effort, and MaxEffortPercent the ceiling. BreakawayPercent is
+	// the effort that starts the joint from rest, measured with waistkick.py:
+	// a move starts just below it, and the integral finds the rest. 0 starts a
+	// move from the gain alone. Tuned in the simulation (waistsim_test.go), not
+	// on the vehicle.
+	GainPercentPerDegree           float64 `json:"gainPercentPerDegree"`
+	IntegralPercentPerDegreeSecond float64 `json:"integralPercentPerDegreeSecond"`
+	MaxEffortPercent               float64 `json:"maxEffortPercent"`
+	BreakawayPercent               float64 `json:"breakawayPercent"`
+	HoldDegrees                    float64 `json:"holdDegrees"`
+	SettleDegrees                  float64 `json:"settleDegrees"`
+	CoastSeconds                   float64 `json:"coastSeconds"`
 
 	// RampPercentPerSecond is how fast the steering effort may change. The
 	// wheels' ramp (accelStep) is in RPM and far too slow for the waist: at 24%
@@ -104,27 +115,12 @@ type WaistConfig struct {
 	// commandHz does not retune it.
 	RampPercentPerSecond float64 `json:"rampPercentPerSecond"`
 
-	// The take-up, which crosses the slack in the chain. When the effort asked
-	// for turns the other way from the side the chain is loaded on, the motor
-	// winds through the slack before the joint moves at all, and a small effort
-	// takes a long time to do it. Until the joint has moved TakeUpCounts that
-	// way, or TakeUpMaxMs has passed, the effort is at least
-	// TakeUpEffortPercent. 0 turns it off; measure it on the ground, where the
-	// tyres are part of the load.
-	//
-	// TakeUpCounts is 4 because the sensor at rest reads ±1 and now and then ±2
-	// (measured on the vehicle, 30 September 2026): 2 would end a take-up on
-	// noise.
-	TakeUpEffortPercent float64 `json:"takeUpEffortPercent"`
-	TakeUpCounts        int     `json:"takeUpCounts"`
-	TakeUpMaxMs         int     `json:"takeUpMaxMs"`
-	// TakeUpMinErrorDegrees is how far from its target the angle loop must be
-	// for a take-up to be worth it. Every correction of an overshoot turns the
-	// other way from the side the chain is loaded on, and boosting each one to
-	// TakeUpEffortPercent threw the joint past its target again: the waist
-	// swung about the target, wider the longer it went on. A new stick
-	// position is a move worth boosting; a degree of overshoot is not.
-	TakeUpMinErrorDegrees float64 `json:"takeUpMinErrorDegrees"`
+	// JointFilterSeconds is how much the joint's angle and rate are smoothed
+	// before the wheels are set from them; see jointEstimate. IgnoreJointRate
+	// sets the wheels from the steady-state model and the raw angle, as before
+	// 7 October 2026, for comparing the two on the vehicle.
+	JointFilterSeconds float64 `json:"jointFilterSeconds"`
+	IgnoreJointRate    bool    `json:"ignoreJointRate"`
 
 	// The watchdog: effort of at least StallEffortPercent held for StallMs must
 	// move the joint by at least StallCounts.
@@ -135,21 +131,22 @@ type WaistConfig struct {
 
 func defaultWaist() WaistConfig {
 	return WaistConfig{
-		StraightCount:            450,
-		LimitDegrees:             35,
-		LimitMarginDegrees:       2,
-		UncalibratedWindowCounts: 40,
-		StaleMs:                  200,
-		GainPercentPerDegree:     4,
-		MaxEffortPercent:         50,
-		DeadbandDegrees:          0.5,
-		RampPercentPerSecond:     500, // 0 to 50% in 0.1 s
-		TakeUpCounts:             4,
-		TakeUpMaxMs:              300,
-		TakeUpMinErrorDegrees:    2,
-		StallEffortPercent:       30,
-		StallMs:                  1500,
-		StallCounts:              3,
+		StraightCount:                  450,
+		LimitDegrees:                   35,
+		LimitMarginDegrees:             2,
+		UncalibratedWindowCounts:       40,
+		StaleMs:                        200,
+		GainPercentPerDegree:           4,
+		IntegralPercentPerDegreeSecond: 4,
+		MaxEffortPercent:               50,
+		HoldDegrees:                    1,
+		SettleDegrees:                  0.3,
+		CoastSeconds:                   0.1,
+		RampPercentPerSecond:           500, // 0 to 50% in 0.1 s
+		JointFilterSeconds:             0.15,
+		StallEffortPercent:             30,
+		StallMs:                        1500,
+		StallCounts:                    3,
 	}
 }
 
@@ -179,26 +176,29 @@ func applyWaistDefaults(w *WaistConfig) {
 	if w.MaxEffortPercent <= 0 {
 		w.MaxEffortPercent = d.MaxEffortPercent
 	}
-	if w.DeadbandDegrees <= 0 {
-		w.DeadbandDegrees = d.DeadbandDegrees
+	if w.IntegralPercentPerDegreeSecond <= 0 {
+		w.IntegralPercentPerDegreeSecond = d.IntegralPercentPerDegreeSecond
 	}
-	if w.MinEffortPercent < 0 {
-		w.MinEffortPercent = 0
+	if w.BreakawayPercent < 0 {
+		w.BreakawayPercent = 0
+	}
+	w.BreakawayPercent = math.Min(w.BreakawayPercent, w.MaxEffortPercent)
+	if w.HoldDegrees <= 0 {
+		w.HoldDegrees = d.HoldDegrees
+	}
+	if w.SettleDegrees <= 0 {
+		w.SettleDegrees = d.SettleDegrees
+	}
+	// Letting go no closer than it starts would let go at once.
+	w.SettleDegrees = math.Min(w.SettleDegrees, w.HoldDegrees/2)
+	if w.CoastSeconds <= 0 {
+		w.CoastSeconds = d.CoastSeconds
 	}
 	if w.RampPercentPerSecond <= 0 {
 		w.RampPercentPerSecond = d.RampPercentPerSecond
 	}
-	if w.TakeUpEffortPercent < 0 {
-		w.TakeUpEffortPercent = 0
-	}
-	if w.TakeUpCounts <= 0 {
-		w.TakeUpCounts = d.TakeUpCounts
-	}
-	if w.TakeUpMaxMs <= 0 {
-		w.TakeUpMaxMs = d.TakeUpMaxMs
-	}
-	if w.TakeUpMinErrorDegrees <= 0 {
-		w.TakeUpMinErrorDegrees = d.TakeUpMinErrorDegrees
+	if w.JointFilterSeconds <= 0 {
+		w.JointFilterSeconds = d.JointFilterSeconds
 	}
 	if w.StallEffortPercent <= 0 {
 		w.StallEffortPercent = d.StallEffortPercent
@@ -209,6 +209,34 @@ func applyWaistDefaults(w *WaistConfig) {
 	if w.StallCounts <= 0 {
 		w.StallCounts = d.StallCounts
 	}
+}
+
+// removedWaistKeys are the angle loop's settings that are gone: the P loop's
+// until 7 October 2026, and the deadzone's until 8 October.
+var removedWaistKeys = []string{
+	"deadbandDegrees", "minEffortPercent",
+	"takeUpEffortPercent", "takeUpCounts", "takeUpMaxMs", "takeUpMinErrorDegrees",
+	"deadzonePercent", "integralBleedSeconds",
+}
+
+// staleWaistKeys lists the removed settings a configuration's traits still
+// carry. They are ignored, and a tuning someone measured should not vanish
+// without a word.
+func staleWaistKeys(traits []byte) []string {
+	var t struct {
+		Waist map[string]json.RawMessage `json:"waist"`
+	}
+	if json.Unmarshal(traits, &t) != nil {
+		return nil
+	}
+	var stale []string
+	for _, k := range removedWaistKeys {
+		if _, ok := t.Waist[k]; ok {
+			stale = append(stale, k)
+		}
+	}
+	slices.Sort(stale)
+	return stale
 }
 
 // calibrated reports whether the reading can be turned into degrees.
@@ -294,17 +322,17 @@ type waistState struct {
 	// is refused until then.
 	held int
 
-	// engaged is the side the chain is loaded on, 1 left or -1 right, 0 when
-	// not known — as at start-up, so the first move takes up the slack too.
-	// takingUp is the direction of a take-up in progress, 0 when none.
-	engaged     int
-	takingUp    int
-	takeUpSince time.Time
-	takeUpFrom  int
+	// The angle loop: the way it is moving the joint, 1 left or -1 right, and
+	// 0 while it holds; its integral, in percent of effort; and the time of the
+	// reading it last learned from: it learns once per reading, not per cycle.
+	// letGo is when it last let go, until the joint has come to rest.
+	moving   int
+	integral float64
+	piAt     time.Time
+	letGo    time.Time
 
-	// settled is set once the angle loop has brought the joint inside its
-	// deadband, and holds it there until the error is twice the deadband.
-	settled bool
+	// joint is the angle and rate the wheels are set from.
+	joint jointEstimate
 
 	watching   int // the sign of the effort being watched, 0 when none
 	watchSince time.Time
@@ -363,56 +391,6 @@ func (s *waistState) latch(raw int) {
 	}
 }
 
-// takeUp is the effort, in percent with positive to the left, that crosses the
-// slack in the chain before the loop's own effort is left to move the joint.
-// A request the other way from the side the chain is loaded on, however small,
-// gets at least TakeUpEffortPercent until the joint has moved TakeUpCounts that
-// way, or TakeUpMaxMs has passed. ended is set on the cycle a take-up finishes,
-// and says how long it took, for tuning it.
-//
-// With boost false the effort is left as it is and only the side the chain is
-// loaded on is followed: a person steering by effort gets what the stick says,
-// and the angle loop that takes over later starts from where the chain really
-// is.
-//
-// An idle motor leaves the chain where it is, so zero effort keeps the side it
-// is engaged on; it does abandon a take-up half done, which starts again from
-// the beginning the next time it is asked for.
-func (s *waistState) takeUp(effort float64, raw int, fresh bool, now time.Time, boost bool) (e float64, ended string) {
-	if s.cfg.TakeUpEffortPercent <= 0 {
-		return effort, ""
-	}
-	d := sign(effort)
-	if d == 0 || d == s.engaged {
-		s.takingUp = 0
-		return effort, ""
-	}
-	if s.takingUp != d {
-		s.takingUp, s.takeUpSince, s.takeUpFrom = d, now, raw
-	}
-	took := now.Sub(s.takeUpSince)
-	moved := 0
-	if fresh {
-		moved = (raw - s.takeUpFrom) * s.cfg.leftward() * d
-	}
-	switch {
-	case moved >= s.cfg.TakeUpCounts:
-		ended = fmt.Sprintf("took up the slack to the %s in %d ms", sideName(d), took.Milliseconds())
-	case took >= time.Duration(s.cfg.TakeUpMaxMs)*time.Millisecond:
-		ended = fmt.Sprintf("the waist did not move within takeUpMaxMs (%d ms) of taking up the slack to the %s; "+
-			"carrying on as if it had", s.cfg.TakeUpMaxMs, sideName(d))
-	case boost:
-		return float64(d) * math.Max(math.Abs(effort), s.cfg.TakeUpEffortPercent), ""
-	default:
-		return effort, ""
-	}
-	s.engaged, s.takingUp = d, 0
-	if !boost {
-		return effort, ""
-	}
-	return effort, ended
-}
-
 // watch compares the effort applied with what the joint did, and reports a
 // fault when they disagree. applied is in percent, positive to the left.
 func (s *waistState) watch(applied float64, raw int, fresh bool, now time.Time) (fault string, observation string) {
@@ -449,26 +427,151 @@ func (s *waistState) watch(applied float64, raw int, fresh bool, now time.Time) 
 	return "", ""
 }
 
-// angleEffort is the angle loop: the effort, in percent with positive to the
+// breakawayPreload is the share of BreakawayPercent a move starts from: a
+// little short of it, so that a breakaway measured high, or one that has
+// eased, does not throw the joint past its target; the integral finds the rest
+// within a fraction of a second.
+const breakawayPreload = 0.9
+
+// settleWait is the longest the angle loop waits, after letting go, for the
+// joint to come to rest: a joint still moving after that is being moved by
+// something else, the tyres or the wheels, and the loop takes it on.
+const settleWait = time.Second
+
+// anglePI is the angle loop: the effort, in percent with positive to the
 // left, that moves the joint from measured towards target, both in degrees.
+// measured is the reading as it is; the joint estimate, which the caller keeps
+// up to date, gives the joint's rate and a smoothed angle. at is when the
+// reading was taken; the integral learns once per reading, over the time since
+// the last, and not across a gap the reading would be stale after.
 //
-// The deadband has hysteresis. Once inside it the loop lets go, and starts
-// again only when the error is twice the deadband. Outside the deadband the
-// effort is at least MinEffortPercent, so without it a count of sensor noise at
-// the deadband's edge was a kick of the breakaway's effort, and another back.
-func (s *waistState) angleEffort(target, measured float64) float64 {
-	err := target - measured
-	band := s.cfg.DeadbandDegrees
-	if s.settled {
-		band *= 2
+// The loop holds or it moves. Holding, the effort is zero and so is the
+// integral, whatever the error, until the joint is HoldDegrees from its target:
+// a count of noise, a target wandering with a stick near its centre, or a
+// fraction of a degree is no reason to cross the chain's slack, and the
+// self-locking gearbox holds the joint without help. Where the joint is, for
+// that, is the smoothed angle, and where it will come to rest: noise and a joint
+// coasting after a move are no reason either.
+//
+// Moving, it is a PI, pushing one way only. It starts from just below the
+// breakaway, rather than waiting for the integral to wind up to it, which took
+// two seconds for a step of two degrees; and it lets go, back to holding, once
+// the joint will coast to within SettleDegrees of the target, or past it. A
+// push one way that turned into a push the other way would take up the slack
+// in the chain both ways, and that is what the joint hunted on.
+//
+// Until 8 October 2026 the loop was a PI with a deadzone on its effort. It
+// settled in the simulation, and hunted on the vehicle on blocks with the stick
+// centred: the integral wound up to the breakaway, a motor that has broken away
+// keeps turning on less, so the joint lurched past its target, and the
+// integral, still loaded, carried it on.
+func (s *waistState) anglePI(target, measured float64, at time.Time) float64 {
+	c := s.cfg
+	dt := 0.0
+	if at.After(s.piAt) {
+		if gap := at.Sub(s.piAt); !s.piAt.IsZero() && gap <= time.Duration(c.StaleMs)*time.Millisecond {
+			dt = gap.Seconds()
+		}
+		s.piAt = at
 	}
-	if math.Abs(err) < band {
-		s.settled = true
+	err := target - measured
+	p := c.GainPercentPerDegree * err
+	rate, smoothed := 0.0, measured
+	if s.joint.ok {
+		rate, smoothed = s.joint.rate(), s.joint.deg
+	}
+	if s.moving == 0 {
+		// Just let go, the joint is left to come to rest before it is judged:
+		// coasting, it is neither where it will stop nor anything the loop can
+		// help, and a push back would only take up the chain's slack.
+		if !s.letGo.IsZero() {
+			if rate != 0 && at.Sub(s.letGo) < settleWait {
+				return 0
+			}
+			s.letGo = time.Time{}
+		}
+		// Whether to move at all is judged on the smoothed angle: a joint
+		// resting near the edge of HoldDegrees is not to be pushed by a count
+		// of noise.
+		resting := target - smoothed - rate*c.CoastSeconds
+		if math.Abs(resting) <= c.HoldDegrees {
+			return 0
+		}
+		s.moving = sign(resting)
+		s.integral = float64(s.moving) * math.Max(0, breakawayPreload*c.BreakawayPercent-math.Abs(p))
+	}
+	// Everything from here is in the direction of the move. It ends where the
+	// joint will come to rest if let go now, CoastSeconds of its rate on.
+	dir := float64(s.moving)
+	if dir*(err-rate*c.CoastSeconds) <= c.SettleDegrees {
+		s.moving, s.integral, s.letGo = 0, 0, at
 		return 0
 	}
-	s.settled = false
-	e := math.Copysign(math.Max(s.cfg.MinEffortPercent, s.cfg.GainPercentPerDegree*math.Abs(err)), err)
-	return math.Max(-s.cfg.MaxEffortPercent, math.Min(s.cfg.MaxEffortPercent, e))
+	pushing := math.Max(0, math.Min(c.MaxEffortPercent-dir*p, dir*s.integral+c.IntegralPercentPerDegreeSecond*dir*err*dt))
+	s.integral = dir * pushing
+	return dir * math.Max(0, math.Min(c.MaxEffortPercent, dir*p+pushing))
+}
+
+// resetPI forgets the angle loop's integral, and that it was moving the joint,
+// whenever the loop is not the one steering: no curvature command, no reading
+// to steer by, or the guard refusing what it asked for. What it learned against
+// a refusal is a push waiting for the refusal to end.
+func (s *waistState) resetPI() {
+	s.moving, s.integral, s.piAt, s.letGo = 0, 0, time.Time{}, time.Time{}
+}
+
+// jointEstimate is the joint's angle and rate as the wheels see them: an
+// alpha-beta filter on the waist sensor, learning once per reading.
+//
+// While the joint swings, the two halves turn relative to each other and the
+// wheels have to roll with them. Set from the steady-state model alone, the
+// wheels' speed loops held them at speeds that did not allow the swing, and
+// pushed back against the waist motor; standing still, they held all four at
+// zero. The waist motor and the wheels fought, and the vehicle oscillated. The
+// wheels need the joint's rate for that, and one count of the sensor between
+// two readings is several degrees a second: hence the filter. The angle loop
+// steers by the raw reading, since its feedback must not lag; it takes the
+// rate from here to know when to let go, and the smoothed angle to decide
+// whether to move at all.
+type jointEstimate struct {
+	ok      bool
+	at      time.Time // the reading last learned from
+	deg     float64   // degrees, positive to the left
+	rateDeg float64   // degrees a second
+}
+
+// jointRestDegPerSec is the rate below which the joint is taken to be still: a
+// count of noise must not set a resting vehicle's wheels turning.
+const jointRestDegPerSec = 0.5
+
+// update learns from a reading of deg degrees taken at at. The filter is the
+// critically damped one with a memory of tau seconds: g = 1 − θ², h = (1 − θ)²,
+// θ = e^(−dt/tau). A gap the reading would be stale after starts it afresh.
+func (j *jointEstimate) update(deg float64, at time.Time, tau float64, stale time.Duration) {
+	if j.ok && !at.After(j.at) {
+		return
+	}
+	dt := at.Sub(j.at)
+	if !j.ok || dt > stale {
+		*j = jointEstimate{ok: true, at: at, deg: deg}
+		return
+	}
+	sec := dt.Seconds()
+	theta := math.Exp(-sec / tau)
+	g, h := 1-theta*theta, (1-theta)*(1-theta)
+	predicted := j.deg + j.rateDeg*sec
+	residual := deg - predicted
+	j.deg = predicted + g*residual
+	j.rateDeg += h * residual / sec
+	j.at = at
+}
+
+// rate is the joint's rate in degrees a second, zero while it is still.
+func (j *jointEstimate) rate() float64 {
+	if math.Abs(j.rateDeg) < jointRestDegPerSec {
+		return 0
+	}
+	return j.rateDeg
 }
 
 // rampStep is how far, in raw counts, the steering effort may move in one

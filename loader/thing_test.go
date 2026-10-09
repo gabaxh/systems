@@ -104,6 +104,25 @@ func TestRateLimit(t *testing.T) {
 	}
 }
 
+// The steering builds up by its step, lets go at once, and passes through zero
+// on a reversal.
+func TestSteerLimit(t *testing.T) {
+	for _, c := range []struct {
+		name                string
+		last, desired, want int16
+	}{
+		{"building up, by the step", 0, 10000, 300},
+		{"letting go, at once", 9000, 0, 0},
+		{"easing off, at once", 9000, 4000, 4000},
+		{"reversing, through zero", 9000, -9000, 0},
+		{"and then by the step", 0, -9000, -300},
+	} {
+		if got := steerLimit(c.last, c.desired, 300); got != c.want {
+			t.Errorf("%s: steerLimit(%d, %d) = %d; want %d", c.name, c.last, c.desired, got, c.want)
+		}
+	}
+}
+
 // A command far outside the range must not wrap around into full reverse.
 func TestRateLimitDoesNotOverflow(t *testing.T) {
 	if got := rateLimit(32760, 32767, 30, 100); got < 0 {

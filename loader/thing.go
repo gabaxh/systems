@@ -150,9 +150,10 @@ type drivetrain struct {
 	byVelocity bool
 	byAngle    bool
 
-	waist *waistState
-	loops map[int]*speedLoop // node ID -> the wheel's speed loop
-	stand standstill         // standing still on a hill; see speedloop.go
+	waist  *waistState
+	loops  map[int]*speedLoop // node ID -> the wheel's speed loop
+	shared sharedLoop         // the integral the wheels share; see speedloop.go
+	stand  standstill         // standing still on a hill; see speedloop.go
 
 	// The wheels' watchdog: since when each wheel has been driven hard without
 	// turning, and the fault it raised, cleared by taking control again.
@@ -460,6 +461,15 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		}
 	}
 	applyDefaults(&cfg)
+	if len(configuredAsset.Traits) > 0 {
+		for _, k := range staleWaistKeys(configuredAsset.Traits[0]) {
+			hint := ""
+			if k == "minEffortPercent" {
+				hint = "; if it was measured, it is the breakaway, and waist.breakawayPercent takes it"
+			}
+			log.Printf("loader: waist.%s is gone and ignored — see the README's angle loop%s", k, hint)
+		}
+	}
 
 	fd, err := openCAN(cfg.Interface)
 	if err != nil {
@@ -707,7 +717,8 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 		d.haltLocked()
 	}
 
-	raw, fresh := d.waistNowLocked(now)
+	raw, at, fresh := d.waistReadingLocked(now)
+	d.followJointLocked(raw, at, fresh)
 	steer, hasSteering := d.steeringMotor()
 
 	// The watchdog judges the effort the motor has actually been given.
@@ -726,11 +737,8 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 	}
 
 	if d.byVelocity && !d.helm.stopped {
-		gamma := 0.0
-		if deg, ok := d.articulationLocked(raw, fresh); ok {
-			gamma = deg * math.Pi / 180
-		}
-		rpm := d.cfg.Geometry.wheelRPMs(d.cfg.Geometry.wheelSpeeds(d.velocity, gamma), d.cfg.MaxWheelRPM)
+		gamma, rate := d.jointForWheelsLocked(raw, fresh)
+		rpm := d.cfg.Geometry.wheelRPMs(d.cfg.Geometry.wheelSpeedsMoving(d.velocity, gamma, rate), d.cfg.MaxWheelRPM)
 		for _, m := range d.cfg.Motors {
 			if pos := m.position(); m.Kind == "wheel" && pos >= 0 {
 				d.setpoint[m.NodeID] = rpm[pos]
@@ -738,10 +746,11 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 		}
 	}
 
-	// The wheels ramp in RPM steps; the steering by its own, much faster ramp,
-	// since the waist does nothing until its effort passes the breakaway.
-	// Driven by velocity, a wheel ramps its target instead and closes its speed
-	// loop on it; anything else leaves the loop to start afresh next time.
+	// The wheels ramp in RPM steps; the steering builds up by its own, much
+	// faster ramp, since the waist does nothing until its effort passes the
+	// breakaway, and lets go at once (steerLimit). Driven by velocity, a wheel
+	// ramps its target instead and closes its speed loop on it; anything else
+	// leaves the loops to start afresh next time.
 	steerStep := d.cfg.Waist.rampStep(d.cfg.CommandHz)
 	closed := d.byVelocity && !d.helm.stopped && !d.cfg.SpeedLoop.OpenLoop
 	mode := driving
@@ -750,30 +759,36 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 	} else {
 		d.stand = standstill{}
 	}
+	var wheels map[int]int16
+	if closed {
+		wheels = d.wheelsRawLocked(mode)
+	} else {
+		d.shared.reset()
+	}
 	targets := make(map[int]int16, len(d.cfg.Motors))
 	for _, m := range d.cfg.Motors {
 		if m.Kind == "wheel" {
 			if closed {
-				out := d.wheelRawLocked(m, mode)
-				d.last[m.NodeID] = out
-				targets[m.NodeID] = out
+				d.last[m.NodeID] = wheels[m.NodeID]
+				targets[m.NodeID] = wheels[m.NodeID]
 				continue
 			}
 			d.loopFor(m.NodeID).reset()
 		}
 		desired := int16(0)
-		accel, brake := int16(d.cfg.AccelStep), int16(d.cfg.BrakeStep)
-		if m.Kind == "steering" {
-			accel, brake = steerStep, steerStep
-		}
 		if !d.helm.stopped {
 			if m.Kind == "steering" {
-				desired = d.steeringRawLocked(m, raw, fresh, now)
+				desired = d.steeringRawLocked(m, raw, at, fresh, now)
 			} else {
 				desired = d.rawFor(m)
 			}
 		}
-		limited := rateLimit(d.last[m.NodeID], desired, accel, brake)
+		var limited int16
+		if m.Kind == "steering" {
+			limited = steerLimit(d.last[m.NodeID], desired, steerStep)
+		} else {
+			limited = rateLimit(d.last[m.NodeID], desired, int16(d.cfg.AccelStep), int16(d.cfg.BrakeStep))
+		}
 		d.last[m.NodeID] = limited
 		targets[m.NodeID] = limited
 	}
@@ -800,54 +815,50 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 // angle loop's effort while a curvature command stands, the motor's own
 // setpoint otherwise, and in either case only what the guard allows. A refused
 // effort also resets the ramp, so the motor stops now rather than coasting
-// through the limit on the way down. Caller holds the lock.
+// through the limit on the way down, and the angle loop's integral, so that it
+// does not wind up against the refusal. at is when the reading raw was taken.
+// Caller holds the lock.
 //
-// The angle loop's effort is raised to cross the slack in the chain when it
-// turns the other way, and dropped back at once when the joint moves: through
-// the ramp, the extra push outlived the slack by a fifth of a second and the
-// joint lunged at every reversal. Only a move of TakeUpMinErrorDegrees or more
-// is boosted: boosting the corrections of every overshoot made the waist swing
-// about its target. A direct setpoint is left as asked — a person steering by
-// effort gets what the stick says.
+// Until 7 October 2026 the angle loop was proportional, with a minimum effort
+// for the breakaway, a push to cross the chain's slack, a deadband with
+// hysteresis, and its effort cut at once whenever it turned; each answered a
+// symptom, and together they swung the waist about its target. The loop in
+// waist.go replaces all four.
 //
-// When the angle loop turns the other way, or lets go, the effort it was
-// applying stops at once rather than down the ramp. Through the ramp the motor
-// went on pushing the old way for up to half a second after the loop had
-// turned, and the joint went on past its target by as much.
-func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, fresh bool, now time.Time) int16 {
+// Every time the loop starts or stops moving the joint, the log says so: a
+// loop that has settled says nothing, and one that hunts says it every second.
+func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh bool, now time.Time) int16 {
 	effort := d.setpoint[m.NodeID]
-	boost := false
 	if d.byAngle {
 		effort = 0
 		if deg, ok := d.articulationLocked(raw, fresh); ok {
 			limit := d.cfg.Waist.targetLimitDegrees() * math.Pi / 180
 			target := d.cfg.Geometry.articulationFor(d.curvature, limit) * 180 / math.Pi
-			effort = d.waist.angleEffort(target, deg)
-			boost = math.Abs(target-deg) >= d.cfg.Waist.TakeUpMinErrorDegrees
+			was := d.waist.moving
+			effort = d.waist.anglePI(target, deg, at)
+			if d.waist.moving != was {
+				if d.waist.moving != 0 {
+					log.Printf("loader: waist moving %s: target %.1f°, at %.1f°, effort %.0f%%",
+						sideName(d.waist.moving), target, deg, effort)
+				} else {
+					log.Printf("loader: waist holding: target %.1f°, at %.1f°, %.1f°/s", target, deg, d.waist.joint.rate())
+				}
+			}
+		} else {
+			d.waist.resetPI()
 		}
-	}
-	// Before the guard, so the limit applies to the take-up as to anything else.
-	effort, ended := d.waist.takeUp(effort, raw, fresh, now, boost)
-	if ended != "" && d.waist.every("take-up", 5*time.Second, now) {
-		log.Printf("loader: %s", ended)
+	} else {
+		d.waist.resetPI()
 	}
 	allowed, why := d.waist.guard(effort, raw, fresh)
 	if allowed != effort {
 		d.last[m.NodeID] = 0
+		d.waist.resetPI()
 		if why != "" && d.waist.every(why, 2*time.Second, now) {
 			log.Printf("loader: steering held — %s", why)
 		}
 	}
-	out := clampToScale(allowed / 100 * fullScale * d.waist.rawEffortSign())
-	// The slack is crossed: down to what the loop asks for now, not down the
-	// ramp. Only ever down; building effort still goes through the ramp.
-	if l := d.last[m.NodeID]; ended != "" && ((l > 0 && out >= 0 && out < l) || (l < 0 && out <= 0 && out > l)) {
-		d.last[m.NodeID] = out
-	}
-	if l := d.last[m.NodeID]; d.byAngle && l != 0 && (out == 0 || (out > 0) != (l > 0)) {
-		d.last[m.NodeID] = 0
-	}
-	return out
+	return clampToScale(allowed / 100 * fullScale * d.waist.rawEffortSign())
 }
 
 // Thresholds of the wheels' watchdog that are not worth configuring: a wheel
@@ -906,25 +917,53 @@ func (d *drivetrain) watchWheelsLocked(now time.Time, sent map[int]int16) {
 	}
 }
 
-// wheelRawLocked is this cycle's raw command for a wheel driven by velocity:
-// its kinematic setpoint, ramped, through its speed loop. Wheel encoders answer
-// in motor-node order, so node 1 is encoder 0. Caller holds the lock.
+// wheelsRawLocked is this cycle's raw command for every wheel, driven by
+// velocity: its kinematic setpoint, ramped, through the speed loop — the
+// integral the wheels share, or with perWheelIntegral one each. Wheel encoders
+// answer in motor-node order, so node 1 is encoder 0. Caller holds the lock.
 //
-// Resting on a hill, the loop only follows the encoder, keeping what it has
-// learned, and the wheel gets its holding effort eased towards zero.
-func (d *drivetrain) wheelRawLocked(m MotorSpec, mode standMode) int16 {
-	s := d.loopFor(m.NodeID)
-	s.ramp(d.setpoint[m.NodeID], float64(d.last[m.NodeID])/rpmToCommand, d.cfg.AccelStep, d.cfg.BrakeStep)
-	r, fresh := d.fb.wheel(m.NodeID - 1)
-	if mode == resting {
-		s.track(r, fresh)
-		return clampToScale(d.stand.restingCommand(m.NodeID) * rpmToCommand)
+// Resting on a hill, the loops only follow the encoders, keeping what they have
+// learned, and each wheel gets its holding effort eased towards zero.
+func (d *drivetrain) wheelsRawLocked(mode standMode) map[int]int16 {
+	cfg := d.cfg.SpeedLoop
+	fullRPM := fullScale / rpmToCommand
+	frozen := cfg.FreezeIntegralWhileSteering && d.waist.joint.rate() != 0
+	d.shared.frozen = frozen
+	out := make(map[int]int16, 4)
+	var nodes []int
+	var loops []*speedLoop
+	for _, m := range d.cfg.Motors {
+		if m.Kind != "wheel" {
+			continue
+		}
+		s := d.loopFor(m.NodeID)
+		s.frozen = frozen
+		s.ramp(d.setpoint[m.NodeID], float64(d.last[m.NodeID])/rpmToCommand, d.cfg.AccelStep, d.cfg.BrakeStep)
+		r, fresh := d.fb.wheel(m.NodeID - 1)
+		if mode == resting {
+			s.track(r, fresh)
+			out[m.NodeID] = clampToScale(d.stand.restingCommand(m.NodeID) * rpmToCommand)
+			continue
+		}
+		var note string
+		if cfg.PerWheelIntegral {
+			var rpm float64
+			rpm, note = s.step(cfg, r, fresh, fullRPM)
+			out[m.NodeID] = clampToScale(rpm * rpmToCommand)
+		} else {
+			note = s.measure(r, fresh)
+			nodes, loops = append(nodes, m.NodeID), append(loops, s)
+		}
+		if note != "" {
+			log.Printf("loader: %s: %s", m.Name, note)
+		}
 	}
-	rpm, note := s.step(d.cfg.SpeedLoop, r, fresh, fullScale/rpmToCommand)
-	if note != "" {
-		log.Printf("loader: %s: %s", m.Name, note)
+	if len(loops) > 0 {
+		for i, rpm := range d.shared.step(cfg, loops, fullRPM) {
+			out[nodes[i]] = clampToScale(rpm * rpmToCommand)
+		}
 	}
-	return clampToScale(rpm * rpmToCommand)
+	return out
 }
 
 // standstillLocked moves the standstill on by a cycle and says which mode the
@@ -977,9 +1016,43 @@ func (d *drivetrain) steeringMotor() (MotorSpec, bool) {
 // waistNowLocked is the newest waist reading and whether it is fresh enough to
 // steer by. Caller holds the lock.
 func (d *drivetrain) waistNowLocked(now time.Time) (int, bool) {
-	raw, at, have := d.fb.waistLatest()
-	fresh := have && now.Sub(at) <= time.Duration(d.cfg.Waist.StaleMs)*time.Millisecond
+	raw, _, fresh := d.waistReadingLocked(now)
 	return raw, fresh
+}
+
+// waistReadingLocked is waistNowLocked with the time the reading was taken.
+// Caller holds the lock.
+func (d *drivetrain) waistReadingLocked(now time.Time) (raw int, at time.Time, fresh bool) {
+	raw, at, have := d.fb.waistLatest()
+	fresh = have && now.Sub(at) <= time.Duration(d.cfg.Waist.StaleMs)*time.Millisecond
+	return raw, at, fresh
+}
+
+// followJointLocked moves the joint estimate on by the newest reading, and
+// forgets it when there is no fresh, calibrated one. Caller holds the lock.
+func (d *drivetrain) followJointLocked(raw int, at time.Time, fresh bool) {
+	deg, ok := d.articulationLocked(raw, fresh)
+	if !ok {
+		d.waist.joint = jointEstimate{}
+		return
+	}
+	w := d.cfg.Waist
+	d.waist.joint.update(deg, at, w.JointFilterSeconds, time.Duration(w.StaleMs)*time.Millisecond)
+}
+
+// jointForWheelsLocked is the articulation and its rate, in radians and
+// radians a second, that the wheels are set from: the joint estimate's, or,
+// with ignoreJointRate, the raw reading and no rate. Straight and still when
+// there is no reading to go by. Caller holds the lock.
+func (d *drivetrain) jointForWheelsLocked(raw int, fresh bool) (gamma, rate float64) {
+	if d.cfg.Waist.IgnoreJointRate {
+		deg, _ := d.articulationLocked(raw, fresh)
+		return deg * math.Pi / 180, 0
+	}
+	if j := d.waist.joint; j.ok {
+		return j.deg * math.Pi / 180, j.rate() * math.Pi / 180
+	}
+	return 0, 0
 }
 
 // articulationLocked is the measured articulation in degrees, positive to the
@@ -1015,6 +1088,10 @@ func (d *drivetrain) logCalibration() {
 			log.Printf("loader: WARNING — %.2f counts per degree would put %.0f° beyond the sensor's range from %d; "+
 				"check the calibration", math.Abs(cpd), w.LimitDegrees, w.StraightCount)
 		}
+	}
+	if !w.IgnoreJointRate && d.cfg.WaistPollHz < 25 {
+		log.Printf("loader: waistPollHz is %d — the wheels follow the joint's rate, and at fewer than 25 readings "+
+			"a second it lags; 50 is the default", d.cfg.WaistPollHz)
 	}
 	switch w.EffortTurnsLeft {
 	case 0:
@@ -1055,6 +1132,17 @@ func clampToScale(v float64) int16 {
 // rateLimit walks the command towards what was asked for, no faster than the
 // configured step. Braking gets its own, larger step: coming to a stop should
 // not be slower than setting off.
+// steerLimit is the steering motor's rate limit: effort builds up by step a
+// cycle and is let go at once, and a reversal passes through zero for a cycle.
+// Let go down a ramp, the joint coasted on through it, past where the angle
+// loop let go: at 100% a second, 22% took a fifth of a second to reach zero.
+func steerLimit(last, desired, step int16) int16 {
+	if (desired > 0 && last < 0) || (desired < 0 && last > 0) {
+		return 0
+	}
+	return rateLimit(last, desired, step, fullScale)
+}
+
 func rateLimit(last, desired, accel, brake int16) int16 {
 	signsDiffer := (desired > 0 && last < 0) || (desired < 0 && last > 0)
 	towardsZero := (last > 0 && desired < last && desired >= 0) ||
@@ -1097,6 +1185,7 @@ func (d *drivetrain) clearSetpointsLocked() {
 	d.velocity, d.curvature = 0, 0
 	d.byVelocity, d.byAngle = false, false
 	d.stand = standstill{}
+	d.waist.resetPI()
 }
 
 // callerOf names who sent a request, and brings the helm up to date with

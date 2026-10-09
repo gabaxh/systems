@@ -184,96 +184,6 @@ func TestNoNudgingAtTheLimit(t *testing.T) {
 	}
 }
 
-func takingUp() WaistConfig {
-	w := calibrated() // lower counts are left
-	w.TakeUpEffortPercent = 40
-	return w
-}
-
-func TestTakeUp(t *testing.T) {
-	start := time.Now()
-	at := func(ms int) time.Time { return start.Add(time.Duration(ms) * time.Millisecond) }
-	s := newWaistState(takingUp())
-	step := func(effort float64, raw, ms int, want float64, ended bool, what string) {
-		t.Helper()
-		got, note := s.takeUp(effort, raw, true, at(ms), true)
-		if got != want || (note != "") != ended {
-			t.Errorf("%s: takeUp(%v, count %d) = %v, %q; want %v, ended %v", what, effort, raw, got, note, want, ended)
-		}
-	}
-	step(4, 450, 0, 40, false, "from start-up, a small request left")
-	step(4, 448, 20, 40, false, "two counts is noise")
-	step(4, 446, 40, 4, true, "four counts left: the chain is tight")
-	step(4, 446, 60, 4, false, "engaged left")
-	step(0, 446, 80, 0, false, "idle")
-	step(4, 446, 100, 4, false, "idle kept the side")
-	step(-4, 446, 120, -40, false, "a reversal takes up again")
-	step(-4, 450, 140, -4, true, "four counts right")
-	step(4, 450, 160, 40, false, "back left")
-	step(4, 456, 180, 40, false, "moving the wrong way does not end it")
-	step(4, 456, 470, 4, true, "takeUpMaxMs ends it")
-
-	off := newWaistState(calibrated())
-	if got, note := off.takeUp(4, 450, true, at(0), true); got != 4 || note != "" {
-		t.Errorf("with takeUpEffortPercent 0: %v, %q; want the effort untouched", got, note)
-	}
-
-	// Without the boost, the side is still followed.
-	s = newWaistState(takingUp())
-	if got, note := s.takeUp(4, 450, true, at(0), false); got != 4 || note != "" {
-		t.Errorf("without the boost: %v, %q; want the effort untouched", got, note)
-	}
-	s.takeUp(4, 446, true, at(40), false)
-	if got, _ := s.takeUp(4, 446, true, at(60), true); got != 4 {
-		t.Errorf("after the joint moved left under effort, the loop took up the slack again: %v", got)
-	}
-}
-
-// The push that crossed the slack goes as soon as the joint moves, not down
-// the ramp: through the ramp it outlived the slack, and the joint lunged.
-func TestTakeUpDropsAtOnce(t *testing.T) {
-	d, vehicle, _ := drivingDrivetrain(t, takingUp())
-	withWaist(d, 450)
-	put(t, vehicle.curvatureService, "gamer", formatFloat(artitrax.frontCurvature(deg(4))))
-	for i := 0; i < 5; i++ {
-		d.writeCycle()
-	}
-	if d.last[5] < int16(0.35*fullScale) {
-		t.Fatalf("asked for 4° from straight, the take-up reached only %d", d.last[5])
-	}
-	withWaist(d, 446) // the joint moves: the chain is tight
-	d.writeCycle()
-	if d.last[5] <= 0 || d.last[5] > fullScale*16/100 {
-		t.Errorf("once the joint moved, the steering motor is at %d; want the loop's 4%% a degree at once", d.last[5])
-	}
-}
-
-// Steering by effort gets what the stick says.
-func TestNoTakeUpByEffort(t *testing.T) {
-	d, _, steering := drivingDrivetrain(t, takingUp())
-	withWaist(d, 450)
-	put(t, steering.setpointService, "gamer", "10")
-	for i := 0; i < 5; i++ {
-		d.writeCycle()
-	}
-	if want := int16(0.1 * fullScale); d.last[5] != want {
-		t.Errorf("a 10%% setpoint gave %d; want %d, with no take-up", d.last[5], want)
-	}
-}
-
-// The limit applies to the take-up as to anything else.
-func TestTakeUpStopsAtTheLimit(t *testing.T) {
-	d, vehicle, _ := drivingDrivetrain(t, takingUp())
-	put(t, vehicle.curvatureService, "gamer", formatFloat(d.curvatureLimit())) // as far left as allowed
-	withWaist(d, 64)                                                           // past the left limit
-	d.writeCycle()
-	withWaist(d, 80) // back inside, not yet by the margin; the loop asks for more left
-	d.writeCycle()
-	if d.last[5] != 0 {
-		t.Errorf("within the margin of the left limit, a take-up to the left gave %d", d.last[5])
-	}
-}
-
 func TestWatchdog(t *testing.T) {
 	cfg := calibrated()
 	cfg.StallMs = 1000
@@ -322,16 +232,128 @@ func TestWatchdog(t *testing.T) {
 	}
 }
 
-func TestAngleLoop(t *testing.T) {
-	s := newWaistState(calibrated())
-	if e := s.angleEffort(10, 0); e != 40 {
-		t.Errorf("10° to the left of the target: effort %v, want 40", e)
+// Holding, the loop gives nothing until the joint is holdDegrees from its
+// target; moving, it is the gain, at most the ceiling, and one way only.
+func TestAngleLoopHolds(t *testing.T) {
+	w := calibrated() // 4% a degree, hold 1°, ceiling 50%, no breakaway set
+	w.IntegralPercentPerDegreeSecond = 0
+	at := time.Unix(1_000_000, 0)
+	for _, c := range []struct {
+		target, want float64
+		why          string
+	}{
+		{0.5, 0, "half a degree: holding"},
+		{-1, 0, "a degree: still holding"},
+		{1.5, 6, "a degree and a half: moving, at the gain"},
+		{-1.5, -6, "the same to the right"},
+		{10, 40, "ten degrees"},
+		{30, 50, "thirty: the ceiling"},
+	} {
+		s := newWaistState(w)
+		if got := s.anglePI(c.target, 0, at); math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("%s: effort %v; want %v", c.why, got, c.want)
+		}
 	}
-	if e := s.angleEffort(-30, 0); e != -50 {
-		t.Errorf("30° off: effort %v, want the -50 ceiling", e)
+}
+
+// A move starts just below the breakaway: the integral is preloaded, rather
+// than left to wind up to it.
+func TestAngleLoopStartsAtTheBreakaway(t *testing.T) {
+	w := calibrated()
+	w.BreakawayPercent = 22
+	s := newWaistState(w)
+	at := time.Unix(1_000_000, 0)
+	if got, want := s.anglePI(2, 0, at), 0.9*22; math.Abs(got-want) > 1e-9 {
+		t.Errorf("2° off from rest: effort %v; want %v, just below the breakaway", got, want)
 	}
-	if e := s.angleEffort(10, 9.8); e != 0 {
-		t.Errorf("inside the deadband: effort %v, want 0", e)
+	s = newWaistState(w)
+	if got := s.anglePI(-8, 0, at); math.Abs(got+32) > 1e-9 {
+		t.Errorf("8° off to the right: effort %v; want -32, the gain alone, past the breakaway already", got)
+	}
+}
+
+// Moving, the loop lets go once the joint will coast to within settleDegrees
+// of its target, and it never pushes the other way: past the target it holds.
+func TestAngleLoopLetsGoBeforeItCoastsPast(t *testing.T) {
+	s := newWaistState(calibrated()) // settle 0.3°, coast 0.1 s
+	at := time.Unix(1_000_000, 0)
+	ms := func(n int) time.Time { return at.Add(time.Duration(n) * time.Millisecond) }
+	if s.anglePI(5, 0, at) <= 0 {
+		t.Fatal("5° off, the loop did not move the joint")
+	}
+	s.joint = jointEstimate{ok: true, deg: 4, rateDeg: 5}
+	if e := s.anglePI(5, 4, ms(20)); e <= 0 {
+		t.Errorf("a degree short at 5°/s, coasting to half a degree short: effort %v; want still pushing", e)
+	}
+	s.joint = jointEstimate{ok: true, deg: 4.2, rateDeg: 6}
+	if e := s.anglePI(5, 4.2, ms(40)); e != 0 || s.moving != 0 {
+		t.Errorf("0.8° short at 6°/s, coasting to 0.2° short: effort %v, moving %d; want let go", e, s.moving)
+	}
+	s.joint = jointEstimate{ok: true, deg: 6.5, rateDeg: 4}
+	if e := s.anglePI(5, 6.5, ms(60)); e != 0 {
+		t.Errorf("just let go and still coasting, 1.5° past: effort %v; want left to come to rest", e)
+	}
+	s.joint = jointEstimate{ok: true, deg: 5.5}
+	if e := s.anglePI(5, 5.5, ms(80)); e != 0 || s.moving != 0 {
+		t.Errorf("at rest half a degree past: effort %v, moving %d; want holding, not pushing back", e, s.moving)
+	}
+	if e := s.anglePI(5, 6.3, ms(100)); e != 0 {
+		t.Errorf("a reading 1.3° past with the smoothed angle half a degree past: effort %v; want none, it is noise", e)
+	}
+	s.joint = jointEstimate{ok: true, deg: 6.5}
+	if e := s.anglePI(5, 6.5, ms(120)); e >= 0 {
+		t.Errorf("at rest 1.5° past: effort %v; want a push back", e)
+	}
+}
+
+// The integral learns once per reading, over the time since the last, and is
+// bounded so that the effort stays within the ceiling.
+func TestAngleLoopIntegral(t *testing.T) {
+	s := newWaistState(calibrated()) // ki 4% a degree-second
+	at := time.Unix(1_000_000, 0)
+	s.anglePI(5, 0, at) // the first reading: nothing to learn over yet
+	if s.integral != 0 {
+		t.Fatalf("the first reading taught the integral %v", s.integral)
+	}
+	s.anglePI(5, 0, at.Add(100*time.Millisecond))
+	if math.Abs(s.integral-2) > 1e-9 {
+		t.Errorf("5° off for 0.1 s: integral %v; want 2", s.integral)
+	}
+	s.anglePI(5, 0, at.Add(100*time.Millisecond)) // the same reading again
+	if math.Abs(s.integral-2) > 1e-9 {
+		t.Errorf("the same reading taught it again: %v", s.integral)
+	}
+	s.anglePI(5, 0, at.Add(time.Second)) // a gap the reading would be stale after
+	if math.Abs(s.integral-2) > 1e-9 {
+		t.Errorf("it learned across a gap: %v", s.integral)
+	}
+	for i := 1; i <= 200; i++ {
+		s.anglePI(5, 0, at.Add(time.Second+time.Duration(i)*20*time.Millisecond))
+	}
+	if want := 50 - 20.0; math.Abs(s.integral-want) > 1e-9 {
+		t.Errorf("5° off for 4 s: integral %v; want it held at %v, where the effort is at its ceiling", s.integral, want)
+	}
+	s.resetPI()
+	if s.integral != 0 || !s.piAt.IsZero() || s.moving != 0 {
+		t.Errorf("reset left %v at %v, moving %d", s.integral, s.piAt, s.moving)
+	}
+}
+
+// A refusal by the guard resets the integral: it must not wind up against it.
+func TestARefusalResetsTheAngleLoop(t *testing.T) {
+	d, _, _ := drivingDrivetrain(t, calibrated())
+	steer, _ := d.steeringMotor()
+	d.curvature, d.byAngle = d.curvatureLimit(), true
+	at := time.Now()
+	d.steeringRawLocked(steer, waistAt(30), at, true, at)
+	d.steeringRawLocked(steer, waistAt(30), at.Add(20*time.Millisecond), true, at)
+	if d.waist.integral <= 0 {
+		t.Fatalf("3° short of its target the loop learned %v", d.waist.integral)
+	}
+	d.waist.fault = "the watchdog's"
+	d.steeringRawLocked(steer, waistAt(30), at.Add(40*time.Millisecond), true, at)
+	if d.waist.integral != 0 || d.waist.moving != 0 {
+		t.Errorf("the guard refused and the integral is still %v, moving %d", d.waist.integral, d.waist.moving)
 	}
 }
 
@@ -463,26 +485,6 @@ func TestTheWheelsKeepTheirRamp(t *testing.T) {
 	}
 }
 
-func TestTheAngleLoopOvercomesBreakaway(t *testing.T) {
-	w := calibrated()
-	w.MinEffortPercent = 20
-	s := newWaistState(w)
-	for _, c := range []struct {
-		target, measured, want float64
-	}{
-		{0.2, 0, 0},  // inside the deadband
-		{1, 0, 20},   // 4% by the gain, lifted to the breakaway
-		{-1, 0, -20}, // the same, to the right
-		{8, 0, 32},   // above the breakaway, the gain's
-		{30, 0, 50},  // clamped to the ceiling
-		{-30, 0, -50},
-	} {
-		if got := s.angleEffort(c.target, c.measured); math.Abs(got-c.want) > 1e-9 {
-			t.Errorf("angleEffort(%v, %v) = %v; want %v", c.target, c.measured, got, c.want)
-		}
-	}
-}
-
 // Past the limit the steering motor stops at once, not down the ramp.
 func TestTheLimitStopsTheSteeringAtOnce(t *testing.T) {
 	d, _, steering := drivingDrivetrain(t, calibrated())
@@ -549,51 +551,8 @@ func TestReleaseLeavesTheSteeringAlone(t *testing.T) {
 
 func formatFloat(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 
-// Once inside the deadband the loop lets go, and starts again only at twice
-// the deadband: a count of noise at its edge is not a kick.
-func TestTheDeadbandHasHysteresis(t *testing.T) {
-	s := newWaistState(calibrated()) // 0.5° deadband, 4% a degree
-	for _, c := range []struct {
-		measured, want float64
-		why            string
-	}{
-		{9.0, 4, "1° short, outside the deadband"},
-		{9.6, 0, "inside the deadband"},
-		{9.2, 0, "0.8° short after settling: inside twice the deadband"},
-		{8.9, 4.4, "1.1° short: past twice the deadband, so the loop starts again"},
-		{9.3, 2.8, "0.7° short while moving: the deadband is 0.5° again"},
-	} {
-		if got := s.angleEffort(10, c.measured); math.Abs(got-c.want) > 1e-9 {
-			t.Errorf("%s: effort %v; want %v", c.why, got, c.want)
-		}
-	}
-}
-
 // waistAt is the raw count for an articulation on the calibrated() waist.
 func waistAt(degrees float64) int { return 450 - int(math.Round(11*degrees)) }
-
-// Correcting a small overshoot turns the other way from the side the chain is
-// loaded on, and is not boosted to the take-up's effort; a real move is.
-func TestOnlyRealMovesAreTakenUp(t *testing.T) {
-	w := calibrated()
-	w.TakeUpEffortPercent = 40
-	for _, c := range []struct {
-		joint, want float64
-		why         string
-	}{
-		{11, 4, "1° past a 10° target"},
-		{15, 40, "5° past it"},
-	} {
-		d, _, _ := drivingDrivetrain(t, w)
-		steer, _ := d.steeringMotor()
-		d.curvature, d.byAngle = artitrax.frontCurvature(deg(10)), true
-		d.waist.engaged = 1 // the chain is loaded on the left
-		out := d.steeringRawLocked(steer, waistAt(c.joint), true, time.Now())
-		if got := -float64(out) / fullScale * 100; math.Abs(got-c.want) > 0.01 {
-			t.Errorf("%s: effort %.2f%% to the right; want %v%%", c.why, got, c.want)
-		}
-	}
-}
 
 // Full stick aims inside the limit by its margin, so the guard never has to
 // cut the loop off, and the curvature limit says so.
@@ -604,29 +563,89 @@ func TestTheLoopAimsInsideTheLimit(t *testing.T) {
 	}
 	steer, _ := d.steeringMotor()
 	d.curvature, d.byAngle = 10, true // far tighter than the waist can turn
-	if out := d.steeringRawLocked(steer, waistAt(33), true, time.Now()); out != 0 {
+	if out := d.steeringRawLocked(steer, waistAt(33), time.Now(), true, time.Now()); out != 0 {
 		t.Errorf("at 33° with the tightest curve asked for, the steering got %d; want 0, the target reached", out)
 	}
 }
 
-// When the angle loop turns the other way, the effort it was applying stops
-// at once; a person steering by effort still gets the ramp.
-func TestTheLoopCutsItsEffortWhenItTurns(t *testing.T) {
-	d, _, _ := drivingDrivetrain(t, calibrated())
-	steer, _ := d.steeringMotor()
-	d.curvature, d.byAngle = artitrax.frontCurvature(deg(10)), true
-	d.last[steer.NodeID] = int16(0.4 * fullScale) // pushing left
-	d.steeringRawLocked(steer, waistAt(12), true, time.Now())
-	if l := d.last[steer.NodeID]; l != 0 {
-		t.Errorf("2° past its target the loop's old effort is still %d; want it cut to 0", l)
+// swingAtAStandstill has the gamer in control with the stick centred while the
+// joint swings left at 10° a second for a second, and then rests at 10° with a
+// count of noise; it returns the wheels' setpoints during the swing and at
+// rest, on simulated time.
+func swingAtAStandstill(t *testing.T, w WaistConfig) (swinging, resting map[int]float64, d *drivetrain) {
+	t.Helper()
+	d, vehicle, _ := drivingDrivetrain(t, w)
+	if w := put(t, vehicle.velocityService, "gamer", "0"); w.Code != http.StatusOK {
+		t.Fatalf("velocity: %d %s", w.Code, w.Body)
 	}
+	now := time.Unix(1_000_000, 0)
+	cycle := func(deg float64) {
+		now = now.Add(20 * time.Millisecond)
+		d.fb.mu.Lock()
+		d.fb.waistRaw, d.fb.waistAt, d.fb.waistFresh = waistAt(deg), now, true
+		d.fb.mu.Unlock()
+		d.helm.heard = now
+		d.writeCycleAt(now)
+	}
+	copyOf := func() map[int]float64 {
+		m := map[int]float64{}
+		for k, v := range d.setpoint {
+			m[k] = v
+		}
+		return m
+	}
+	for c := 0; c < 50; c++ {
+		cycle(float64(c) / 5)
+	}
+	swinging = copyOf()
+	for c := 0; c < 100; c++ {
+		cycle(10 + []float64{0, 0.09, 0, -0.09}[c%4])
+	}
+	return swinging, copyOf(), d
+}
 
-	d2, _, s2 := drivingDrivetrain(t, calibrated())
-	withWaist(d2, waistAt(12))
-	put(t, s2.setpointService, "gamer", "-30")
-	d2.last[steer.NodeID] = int16(0.4 * fullScale)
-	d2.steeringRawLocked(steer, waistAt(12), true, time.Now())
-	if l := d2.last[steer.NodeID]; l != int16(0.4*fullScale) {
-		t.Errorf("steering by effort, the ramp's memory became %d; want it left for the ramp", l)
+// Standing still with the joint swinging, the wheels roll with it rather than
+// hold it: held at zero, they fought the waist motor.
+func TestTheWheelsFollowTheJoint(t *testing.T) {
+	swinging, resting, d := swingAtAStandstill(t, calibrated())
+	if !(swinging[1] < 0 && swinging[2] > 0 && swinging[3] > 0 && swinging[4] < 0) {
+		t.Errorf("swinging left at a standstill, the wheels are set to %v; want the front pair turning the front half "+
+			"left and the rear pair the rear half right", swinging)
+	}
+	want := artitrax.wheelRPMs(artitrax.wheelSpeedsMoving(0, deg(9.8), deg(10)), 120)
+	if math.Abs(swinging[2]-want[frontRight]) > 0.25*math.Abs(want[frontRight]) {
+		t.Errorf("front right at %.3f RPM; want about %.3f", swinging[2], want[frontRight])
+	}
+	for node := 1; node <= 4; node++ {
+		if resting[node] != 0 {
+			t.Errorf("at rest with a count of noise, wheel %d is set to %v; want 0", node, resting[node])
+		}
+	}
+	if d.stand.mode == driving {
+		t.Error("at rest the vehicle is still driving; want the standstill holding it")
+	}
+}
+
+// ignoreJointRate is the wheels as they were: held while the joint swings.
+func TestIgnoreJointRate(t *testing.T) {
+	w := calibrated()
+	w.IgnoreJointRate = true
+	swinging, _, _ := swingAtAStandstill(t, w)
+	for node := 1; node <= 4; node++ {
+		if swinging[node] != 0 {
+			t.Errorf("with ignoreJointRate, wheel %d is set to %v while the joint swings; want 0", node, swinging[node])
+		}
+	}
+}
+
+// A configuration still carrying the P loop's settings, or the deadzone's, is
+// told they are gone.
+func TestStaleWaistKeys(t *testing.T) {
+	traits := []byte(`{"waist": {"straightCount": 471, "minEffortPercent": 22, "takeUpEffortPercent": 40, "deadzonePercent": 3}}`)
+	if got := staleWaistKeys(traits); strings.Join(got, ",") != "deadzonePercent,minEffortPercent,takeUpEffortPercent" {
+		t.Errorf("stale keys %v", got)
+	}
+	if got := staleWaistKeys([]byte(`{"commandHz": 50}`)); len(got) != 0 {
+		t.Errorf("with no waist, stale keys %v", got)
 	}
 }

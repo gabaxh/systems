@@ -120,3 +120,71 @@ func TestRPMLimitKeepsTheCurve(t *testing.T) {
 		t.Errorf("1 m/s is %.3f RPM, want 44.944", r[0])
 	}
 }
+
+// With the joint still, the moving model is the steady-state one.
+func TestStillJointIsTheSteadyStateModel(t *testing.T) {
+	g := Geometry{JointToFront: 0.9, JointToRear: 0.5, Track: 0.8, WheelCircumference: 1}
+	for _, a := range []float64{-35, -10, 0, 7, 35} {
+		gamma := deg(a)
+		kf, kr := g.frontCurvature(gamma), g.rearCurvature(gamma)
+		vr := kf / kr
+		want := [4]float64{1 - kf*g.Track/2, 1 + kf*g.Track/2, vr * (1 - kr*g.Track/2), vr * (1 + kr*g.Track/2)}
+		if a == 0 {
+			want = [4]float64{1, 1, 1, 1}
+		}
+		got := g.wheelSpeedsMoving(1, gamma, 0)
+		for i := range got {
+			if math.Abs(got[i]-want[i]) > 1e-12 {
+				t.Errorf("%v°: wheel %d at %v; want %v, the steady-state model's", a, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// Standing still with the joint swinging left, the front axle's center stays
+// put: the front half turns left and the rear half right, each pair of wheels
+// rolling in opposite directions.
+func TestSwingingAtAStandstill(t *testing.T) {
+	rate := deg(10)
+	w := artitrax.wheelSpeedsMoving(0, 0, rate)
+	front := artitrax.JointToRear * rate / (artitrax.JointToFront + artitrax.JointToRear)
+	if want := front * artitrax.Track / 2; math.Abs(w[frontRight]-want) > 1e-12 || math.Abs(w[frontLeft]+want) > 1e-12 {
+		t.Errorf("front wheels at %v and %v; want ∓%v, the front half turning left", w[frontLeft], w[frontRight], want)
+	}
+	if !(w[backLeft] > 0 && w[backRight] < 0) {
+		t.Errorf("rear wheels at %v and %v; want the rear half turning right", w[backLeft], w[backRight])
+	}
+}
+
+// Neither axle slides sideways: drive the model through a swing while moving,
+// and the rear axle's center moves only along the rear half.
+func TestNoAxleSlides(t *testing.T) {
+	g := Geometry{JointToFront: 0.9, JointToRear: 0.5, Track: 0.8, WheelCircumference: 1}
+	const dt = 1e-5
+	x, y, heading, gamma := 0.0, 0.0, 0.0, deg(-20) // front axle center, front half's heading
+	rear := func() (float64, float64) {
+		jx, jy := x-g.JointToFront*math.Cos(heading), y-g.JointToFront*math.Sin(heading)
+		return jx - g.JointToRear*math.Cos(heading-gamma), jy - g.JointToRear*math.Sin(heading-gamma)
+	}
+	v, rate := 0.7, deg(25)
+	for i := 0; i < 100000; i++ { // 1 s
+		w := g.wheelSpeedsMoving(v, gamma, rate)
+		yaw := (w[frontRight] - w[frontLeft]) / g.Track
+		rx0, ry0 := rear()
+		x += v * math.Cos(heading) * dt
+		y += v * math.Sin(heading) * dt
+		heading += yaw * dt
+		gamma += rate * dt
+		rx1, ry1 := rear()
+		vx, vy := (rx1-rx0)/dt, (ry1-ry0)/dt
+		rearHeading := heading - gamma
+		lateral := -vx*math.Sin(rearHeading) + vy*math.Cos(rearHeading)
+		along := vx*math.Cos(rearHeading) + vy*math.Sin(rearHeading)
+		if math.Abs(lateral) > 1e-3 {
+			t.Fatalf("at %.0f° the rear axle slides sideways at %v m/s", gamma*180/math.Pi, lateral)
+		}
+		if mean := (w[backLeft] + w[backRight]) / 2; math.Abs(along-mean) > 1e-3 {
+			t.Fatalf("at %.0f° the rear axle moves at %v m/s; its wheels say %v", gamma*180/math.Pi, along, mean)
+		}
+	}
+}

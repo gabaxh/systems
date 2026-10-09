@@ -41,8 +41,8 @@ import "math"
 // held at an angle, both halves turn about one center at one rate, the front
 // axle on radius (L1 cos γ + L2) / sin γ and the rear on (L2 cos γ + L1) / sin γ,
 // where L1 and L2 are the distances from the joint to each axle. While the
-// joint is moving the halves also turn relative to each other; at the rates this
-// machine steers that term is ignored.
+// joint is moving the halves also turn relative to each other, and the wheels
+// have to roll with them; wheelSpeedsMoving has that term.
 
 // Geometry is the vehicle's dimensions.
 type Geometry struct {
@@ -97,7 +97,7 @@ const (
 )
 
 // wheelSpeeds is how fast each wheel's contact point must move, in meters per
-// second, for the front axle to move at v with the joint at gamma.
+// second, for the front axle to move at v with the joint held at gamma.
 //
 // It is computed from the articulation the joint actually has, not the one it
 // was asked for: the wheels have to agree with the machine as it is, and while
@@ -107,18 +107,34 @@ const (
 // on its own radius, at its own speed. At full articulation on the Artitrax the
 // spread is nearly a fifth either side of the mean.
 func (g Geometry) wheelSpeeds(v, gamma float64) [4]float64 {
-	if math.Abs(gamma) < 1e-9 {
-		return [4]float64{v, v, v, v}
-	}
-	kf := g.frontCurvature(gamma)
-	kr := g.rearCurvature(gamma)
-	vr := v * kf / kr // both halves turn at one rate: v·kf = vr·kr
+	return g.wheelSpeedsMoving(v, gamma, 0)
+}
+
+// wheelSpeedsMoving is wheelSpeeds with the joint turning at gammaRate radians
+// a second, positive to the left.
+//
+// With neither axle sliding sideways, the front half turns at
+//
+//	ψ̇f = (v sin γ + L2 γ̇) / (L1 cos γ + L2)
+//
+// the rear half at ψ̇r = ψ̇f − γ̇, and the rear axle's center moves at
+// vr = v cos γ + L1 ψ̇f sin γ. Each wheel is its axle's center's speed less or
+// more its half's turning, half a track either side. With the joint still this
+// is the steady-state model; standing still with the joint swinging, the front
+// axle's center stays put and every wheel rolls with the swing, the front pair
+// one way and the rear the other.
+func (g Geometry) wheelSpeedsMoving(v, gamma, gammaRate float64) [4]float64 {
+	l1, l2 := g.JointToFront, g.JointToRear
+	sin, cos := math.Sin(gamma), math.Cos(gamma)
+	front := (v*sin + l2*gammaRate) / (l1*cos + l2)
+	rear := front - gammaRate
+	vr := v*cos + l1*front*sin
 	half := g.Track / 2
 	return [4]float64{
-		frontLeft:  v * (1 - kf*half),
-		frontRight: v * (1 + kf*half),
-		backLeft:   vr * (1 - kr*half),
-		backRight:  vr * (1 + kr*half),
+		frontLeft:  v - front*half,
+		frontRight: v + front*half,
+		backLeft:   vr - rear*half,
+		backRight:  vr + rear*half,
 	}
 }
 

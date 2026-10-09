@@ -18,6 +18,8 @@ Each measurement entry in the configuration file describes:
 - **serviceDefinition** — the Arrowhead service name to look up (e.g. `pressure`)
 - **mdetails** — optional filter details passed to the orchestrator
 - **samplingPeriod** — polling interval in seconds
+- **samplingPeriodMs** — optional; a polling interval in milliseconds, which takes the place of `samplingPeriod`. It is for signals that change faster than once a second, such as a steering loop following its target
+- **providerTime** — optional, `false` by default; stamps each point with the time the provider says it took the reading, rather than the time the collector read it. See *[Fast signals](#fast-signals)*
 
 On every tick the collector:
 1. Calls `Search4MultipleServices` to discover *all* registered providers of that measurement type.
@@ -90,6 +92,37 @@ sequenceDiagram
   ]
 }
 ```
+
+### Fast signals
+
+Read once a second, a control loop's step response is a point or two. Read
+every 50 ms, it is a trace:
+
+```json
+{
+  "serviceDefinition": "articulation",
+  "mdetails": { "Model": ["artitrax"] },
+  "samplingPeriod": 1,
+  "samplingPeriodMs": 50,
+  "providerTime": true
+}
+```
+
+**`providerTime` matters at that rate.** Stamped when it was read, a point is
+late by the network's delay and up to one period, and a reading read twice is
+two points. Stamped with the provider's time, it is where it belongs, and a
+reading read twice is the same point written twice. That is also why it is
+off by default. A provider that does not renew an unchanged reading, such as a
+switch left on for an hour, would then be one point an hour back. The mean
+over the last hour, the duty cycle above, would have nothing in its window to
+average. A reading without a timestamp is stamped when it was read, either
+way.
+
+Read faster than once a second, the collector logs one reading per provider
+every ten seconds rather than every one.
+
+The loader's configuration for it is in the loader's README, under
+*Watching the steering in InfluxDB*.
 
 ## Status
 
@@ -188,6 +221,48 @@ deployment.
 If both are ever needed, the honest split is to keep writes on the
 v2-compatible endpoint, which works everywhere, and make only the measurement
 query version-aware. It is the single Flux call in the system.
+
+## Running InfluxDB 2 in Docker
+
+This is the quickest way, and the one used on the Artitrax's computer. The
+official image does the setup of step 3 below by itself, on its first start.
+
+```bash
+sudo apt-get install docker.io
+sudo usermod -aG docker $USER     # then log out and in again
+
+docker run -d --name influxdb --restart unless-stopped \
+  -p 8086:8086 \
+  -v influxdb2-data:/var/lib/influxdb2 \
+  -v influxdb2-config:/etc/influxdb2 \
+  -e DOCKER_INFLUXDB_INIT_MODE=setup \
+  -e DOCKER_INFLUXDB_INIT_USERNAME=<you> \
+  -e DOCKER_INFLUXDB_INIT_PASSWORD='<a real password>' \
+  -e DOCKER_INFLUXDB_INIT_ORG=artitrax \
+  -e DOCKER_INFLUXDB_INIT_BUCKET=loader \
+  influxdb:2
+```
+
+- **The two volumes are the database and its setup.** Without them, the next
+  `docker run` starts from nothing. With them, setup runs only once, and
+  later starts keep the data.
+- **No retention given means none.** The bucket keeps its data indefinitely,
+  as `--retention 0` does below.
+- `--restart unless-stopped` brings it back after a reboot.
+
+The `influx` CLI is inside the container, already set up with the operator
+token. Check the server, then give the collector a token for its bucket alone
+(see step 4 for why):
+
+```bash
+docker exec influxdb influx ping
+BUCKET=$(docker exec influxdb influx bucket list --org artitrax --name loader --hide-headers | cut -f1)
+docker exec influxdb influx auth create --org artitrax \
+  --write-bucket "$BUCKET" --read-bucket "$BUCKET" --description collector
+```
+
+Put that token, `http://localhost:8086`, `artitrax` and `loader` into the
+collector's `systemconfig.json`.
 
 ## Deploying InfluxDB 2 (Linux / Raspberry Pi)
 
