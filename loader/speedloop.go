@@ -61,6 +61,21 @@ type SpeedLoopConfig struct {
 	// MaxCorrectionRPM bounds how far the loop may move a wheel's command from
 	// its target, either way: a wrong measurement costs at most this much.
 	MaxCorrectionRPM float64 `json:"maxCorrectionRPM"`
+	// FreezeIntegralWhileSteering holds the integral while the joint is
+	// swinging, so that what the wheels learn about the slope is not what they
+	// met fighting the waist. Off: the wheels follow the joint's rate instead
+	// (see jointEstimate), and this is for trying on the vehicle if that is not
+	// enough.
+	FreezeIntegralWhileSteering bool `json:"freezeIntegralWhileSteering"`
+
+	// The four wheels share one integral; see sharedLoop. PerWheelIntegral
+	// gives each wheel its own again, as until 8 October 2026, for comparing
+	// the two on the vehicle. DifferentialGain is the proportional gain on how
+	// far each wheel is from the others' error, RPM per RPM, the same as
+	// ProportionalGain when it is not set: lowering it lets the wheels share
+	// the work more as a differential does, and argue less.
+	PerWheelIntegral bool     `json:"perWheelIntegral"`
+	DifferentialGain *float64 `json:"differentialGain"`
 
 	// Standing still on a hill; see standstill. HoldRelaxAfterSeconds is how
 	// long the loop holds the vehicle actively before letting the drivetrain
@@ -81,6 +96,16 @@ func defaultSpeedLoop() SpeedLoopConfig {
 		CreepMetres:           0.02,
 		MaxCatches:            3,
 	}
+}
+
+// differentialGain is DifferentialGain, or ProportionalGain when it is not
+// set. A pointer, so that 0 can be asked for: the wheels sharing the work
+// evenly, with no correction of their own.
+func (s SpeedLoopConfig) differentialGain() float64 {
+	if s.DifferentialGain == nil {
+		return s.ProportionalGain
+	}
+	return math.Max(0, *s.DifferentialGain)
 }
 
 func applySpeedLoopDefaults(s *SpeedLoopConfig) {
@@ -118,6 +143,7 @@ const maxFrameGap = 250 * time.Millisecond
 // between frames it holds its correction.
 type speedLoop struct {
 	active    bool    // closing the loop, as against freshly reset
+	frozen    bool    // the integral is held this cycle
 	open      bool    // fell back to open loop for want of an encoder
 	reference float64 // the ramped target, RPM
 	integral  float64 // RPM
@@ -154,10 +180,26 @@ func (s *speedLoop) ramp(target, from float64, accelStep, brakeStep int) {
 }
 
 // step is this cycle's command for the wheel, in RPM, from its reference and
-// its encoder's newest reading. fullRPM is the speed full scale stands for,
-// where the command saturates. note is non-empty when the loop has just fallen
-// back to open loop or come back from it, for the log.
+// its encoder's newest reading, with an integral of its own. fullRPM is the
+// speed full scale stands for, where the command saturates. note is non-empty
+// when the loop has just fallen back to open loop or come back from it, for
+// the log.
 func (s *speedLoop) step(cfg SpeedLoopConfig, r wheelReading, fresh bool, fullRPM float64) (command float64, note string) {
+	learned := s.frameAt
+	note = s.measure(r, fresh)
+	if s.open {
+		return s.reference, note
+	}
+	if gap := s.frameAt.Sub(learned); !learned.IsZero() && gap > 0 && gap <= maxFrameGap {
+		s.learn(cfg, gap.Seconds(), fullRPM)
+	}
+	return s.reference + s.correction(cfg), note
+}
+
+// measure brings the wheel's measured speed up to date, and falls back to open
+// loop when its encoder is quiet, forgetting what the loop had learned; note is
+// as for step.
+func (s *speedLoop) measure(r wheelReading, fresh bool) (note string) {
 	if !fresh {
 		if !s.open {
 			note = "no fresh encoder reading, so open loop"
@@ -165,23 +207,14 @@ func (s *speedLoop) step(cfg SpeedLoopConfig, r wheelReading, fresh bool, fullRP
 		reference := s.reference
 		s.reset()
 		s.active, s.open, s.reference = true, true, reference
-		return reference, note
+		return note
 	}
 	if s.open {
 		s.open = false
 		note = "the encoder reports again, so closed loop"
 	}
-	if r.at.After(s.frameAt) {
-		gap := r.at.Sub(s.frameAt)
-		if !s.frameAt.IsZero() && gap <= maxFrameGap {
-			dt := gap.Seconds()
-			s.measured = (r.revolutions - s.frameRev) / dt * 60
-			s.haveSpeed = true
-			s.learn(cfg, dt, fullRPM)
-		}
-		s.frameAt, s.frameRev = r.at, r.revolutions
-	}
-	return s.reference + s.correction(cfg), note
+	s.track(r, true)
+	return note
 }
 
 // track follows the encoder without learning: the loop's measured speed stays
@@ -210,7 +243,10 @@ func (s *speedLoop) learn(cfg SpeedLoopConfig, dt, fullRPM float64) {
 	p := cfg.ProportionalGain * err
 	high := math.Max(0, math.Min(cfg.MaxCorrectionRPM, fullRPM-s.reference)-p)
 	low := math.Min(0, math.Max(-cfg.MaxCorrectionRPM, -fullRPM-s.reference)-p)
-	next := s.integral + cfg.IntegralGainPerSecond*err*dt
+	next := s.integral
+	if !s.frozen {
+		next += cfg.IntegralGainPerSecond * err * dt
+	}
 	s.integral = math.Max(low, math.Min(high, next))
 }
 
@@ -221,6 +257,114 @@ func (s *speedLoop) correction(cfg SpeedLoopConfig) float64 {
 	}
 	c := cfg.ProportionalGain*(s.reference-s.measured) + s.integral
 	return math.Max(-cfg.MaxCorrectionRPM, math.Min(cfg.MaxCorrectionRPM, c))
+}
+
+//-------------------------------------One integral for four wheels
+
+// sharedLoop is the integral the four wheels share, and what each wheel's
+// command is made of with it:
+//
+//	command = reference + kp·ē + kd·(error − ē) + integral,  ē the wheels' mean error
+//
+// The wheels are tied together: through the ground, and through the joint,
+// since the kinematics decide every wheel's speed from the same two numbers
+// and the joint's angle and rate. With an integral each, any difference
+// between the model and the machine — a tyre's radius, the joint's rate read a
+// little late, scrub — is an error no set of wheel speeds can clear, and four
+// integrals wound up against each other, and against the waist motor, through
+// the machine; a stiffer loop fought harder. One integral learns what all four
+// need, the slope; each wheel's own difference from the others gets a
+// proportional correction and no more, which is bounded and does not wind up.
+// It is the way an open differential shares the work, and the way the
+// literature on four-wheel-driven articulated vehicles allocates torque rather
+// than speed (Seiffer et al., 2023).
+type sharedLoop struct {
+	integral float64   // RPM, added to every wheel
+	at       time.Time // the newest encoder frame learned from
+	frozen   bool      // the integral is held this cycle
+}
+
+func (sh *sharedLoop) reset() {
+	*sh = sharedLoop{}
+}
+
+// step is this cycle's command for each wheel, in RPM, in the order of loops,
+// whose measurements are up to date. It learns once per cycle in which a new
+// frame has come, from the mean error of the wheels whose encoders report.
+// A wheel whose encoder is quiet gets its reference, open loop, as with an
+// integral of its own; with every wheel quiet the integral is forgotten.
+func (sh *sharedLoop) step(cfg SpeedLoopConfig, loops []*speedLoop, fullRPM float64) []float64 {
+	commands := make([]float64, len(loops))
+	sum, seen, open := 0.0, 0, 0
+	var newest time.Time
+	for _, s := range loops {
+		if s.open {
+			open++
+		}
+		if s.open || !s.haveSpeed {
+			continue
+		}
+		sum += s.reference - s.measured
+		seen++
+		if s.frameAt.After(newest) {
+			newest = s.frameAt
+		}
+	}
+	if open == len(loops) {
+		sh.reset()
+	}
+	if seen == 0 {
+		for i, s := range loops {
+			commands[i] = s.reference
+		}
+		return commands
+	}
+	mean := sum / float64(seen)
+	own := func(s *speedLoop) float64 {
+		return cfg.ProportionalGain*mean + cfg.differentialGain()*(s.reference-s.measured-mean)
+	}
+
+	if newest.After(sh.at) {
+		if gap := newest.Sub(sh.at); !sh.at.IsZero() && gap <= maxFrameGap {
+			sh.learn(cfg, mean, gap.Seconds(), loops, own, fullRPM)
+		}
+		sh.at = newest
+	}
+
+	for i, s := range loops {
+		switch {
+		case s.open:
+			commands[i] = s.reference
+		case !s.haveSpeed:
+			commands[i] = s.reference + math.Max(-cfg.MaxCorrectionRPM, math.Min(cfg.MaxCorrectionRPM, sh.integral))
+		default:
+			c := own(s) + sh.integral
+			commands[i] = s.reference + math.Max(-cfg.MaxCorrectionRPM, math.Min(cfg.MaxCorrectionRPM, c))
+		}
+	}
+	return commands
+}
+
+// learn moves the integral by one frame's mean error, and then no further than
+// keeps every wheel's command inside full scale and its correction inside the
+// bound, as speedLoop.learn does for one wheel; nor does the bound push it
+// across zero.
+func (sh *sharedLoop) learn(cfg SpeedLoopConfig, mean, dt float64, loops []*speedLoop, own func(*speedLoop) float64, fullRPM float64) {
+	high, low := math.Inf(1), math.Inf(-1)
+	for _, s := range loops {
+		if s.open || !s.haveSpeed {
+			continue
+		}
+		p := own(s)
+		high = math.Min(high, math.Min(cfg.MaxCorrectionRPM, fullRPM-s.reference)-p)
+		low = math.Max(low, math.Max(-cfg.MaxCorrectionRPM, -fullRPM-s.reference)-p)
+	}
+	high, low = math.Max(0, high), math.Min(0, low)
+	next := sh.integral
+	if !sh.frozen {
+		next += cfg.IntegralGainPerSecond * mean * dt
+	}
+	sh.integral = math.Max(low, math.Min(high, next))
 }
 
 //-------------------------------------Standing still on a hill

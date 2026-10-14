@@ -197,14 +197,14 @@ func TestAStopResetsTheLoop(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		d.writeCycle()
 	}
-	d.loopFor(1).integral = 30
+	d.loopFor(1).integral, d.shared.integral = 30, 30
 	put(t, vehicle.stopService, "gamer", "1")
 	d.writeCycle()
 	if d.last[1] != 0 {
 		t.Errorf("after a stop the wheel got %d; want 0", d.last[1])
 	}
-	if s := d.loopFor(1); s.integral != 0 || s.active {
-		t.Errorf("after a stop the loop kept integral %.1f, active %v", s.integral, s.active)
+	if s := d.loopFor(1); s.integral != 0 || s.active || d.shared.integral != 0 {
+		t.Errorf("after a stop the loop kept integral %.1f, active %v, shared %.1f", s.integral, s.active, d.shared.integral)
 	}
 }
 
@@ -262,4 +262,141 @@ func TestSpeedLoopDefaults(t *testing.T) {
 	if s.ProportionalGain != 0 || s.IntegralGainPerSecond != 2 {
 		t.Errorf("an integral-only loop became %+v", s)
 	}
+	d := defaultSpeedLoop()
+	if got := d.differentialGain(); got != d.ProportionalGain {
+		t.Errorf("unset, the differential gain is %v; want the proportional gain, %v", got, d.ProportionalGain)
+	}
+	zero := 0.0
+	d.DifferentialGain = &zero
+	if got := d.differentialGain(); got != 0 {
+		t.Errorf("set to 0, the differential gain is %v", got)
+	}
+}
+
+//-------------------------------------Four wheels on one machine
+
+// coupledWheels is four wheels on one rigid machine driving straight: the
+// ground makes them roll at one speed, which the four commands together decide,
+// and each encoder reads that speed scaled by its tyre — a tyre a little larger
+// or smaller, as a worn or soft one is, reads slower or faster than the rest.
+type coupledWheels struct {
+	scale [4]float64 // what each encoder reads per RPM of the machine's speed
+	rpm   float64
+	rev   [4]float64
+}
+
+func (w *coupledWheels) advance(commands [4]float64, dt float64) {
+	mean := 0.0
+	for _, c := range commands {
+		mean += math.Max(-120, math.Min(120, c)) / 4
+	}
+	w.rpm += (mean - w.rpm) * dt / 0.2
+	for i := range w.rev {
+		w.rev[i] += w.rpm * w.scale[i] / 60 * dt
+	}
+}
+
+// fightOver drives the machine at 0.5 m/s straight for the given time and
+// returns the spread between the largest and smallest wheel command at the
+// end, in RPM: how hard the wheels push against each other.
+func fightOver(t *testing.T, cfg SpeedLoopConfig, scale [4]float64, seconds float64) float64 {
+	t.Helper()
+	d, _, _ := drivingDrivetrain(t, calibrated())
+	applySpeedLoopDefaults(&cfg)
+	d.cfg.SpeedLoop = cfg
+	now := time.Unix(1_000_000, 0)
+	d.fb.clock = func() time.Time { return now }
+	w := &coupledWheels{scale: scale}
+	d.velocity, d.byVelocity = 0.5, true
+	var commands [4]float64
+	for ms := 0; ms < int(seconds*1000); ms++ {
+		w.advance(commands, 0.001)
+		now = now.Add(time.Millisecond)
+		if now.UnixMilli()%50 == 0 {
+			d.fb.mu.Lock()
+			for i := range w.rev {
+				d.fb.wheels[i] = wheelReading{revolutions: w.rev[i], rpm: w.rpm * scale[i], at: now}
+			}
+			d.fb.mu.Unlock()
+		}
+		if now.UnixMilli()%20 == 0 {
+			d.fb.mu.Lock()
+			d.fb.waistRaw, d.fb.waistAt, d.fb.waistFresh = 450, now, true
+			d.fb.mu.Unlock()
+			d.helm.heard = now
+			d.writeCycleAt(now)
+			for i := range commands {
+				commands[i] = float64(d.last[i+1]) / rpmToCommand
+			}
+		}
+	}
+	lo, hi := math.Inf(1), math.Inf(-1)
+	for _, c := range commands {
+		lo, hi = math.Min(lo, c), math.Max(hi, c)
+	}
+	return hi - lo
+}
+
+// One tyre reading 5% fast is an error no set of wheel speeds can clear: the
+// ground holds all four to one speed. With an integral each, the wheels wound
+// up against each other until one was at its bound; with one shared, each
+// wheel's own correction is proportional and stays small.
+func TestTheWheelsDoNotFightOverATyre(t *testing.T) {
+	scale := [4]float64{1.05, 1, 1, 1}
+	perWheel := defaultSpeedLoop()
+	perWheel.PerWheelIntegral = true
+	fought := fightOver(t, perWheel, scale, 15)
+	shared := fightOver(t, defaultSpeedLoop(), scale, 15)
+	t.Logf("after 15 s at 0.5 m/s with one tyre reading 5%% fast: the commands spread %.1f RPM with an integral each, "+
+		"%.1f RPM with one shared", fought, shared)
+	if shared > 3 {
+		t.Errorf("with the integral shared, the wheel commands spread %.1f RPM; want under 3, the proportional part alone", shared)
+	}
+	if fought < 4*shared {
+		t.Errorf("with an integral each the commands spread %.1f RPM, with one shared %.1f; want the old loop visibly fighting",
+			fought, shared)
+	}
+}
+
+// Shared, the integral still holds the speed on a slope, up or down.
+func TestTheSharedIntegralHoldsTheSpeed(t *testing.T) {
+	for _, load := range []float64{15, -15} {
+		if got := sharedOnASlope(load); math.Abs(got-40) > 0.8 {
+			t.Errorf("on a slope of %v RPM with the integral shared, the wheels settled at %.1f RPM; want 40", load, got)
+		}
+	}
+}
+
+// sharedOnASlope runs four identical wheels on a slope through the shared loop
+// at a target of 40 RPM, the loop at 50 Hz and the encoders every 50 ms, and
+// returns where they settle.
+func sharedOnASlope(load float64) float64 {
+	cfg := defaultSpeedLoop()
+	loops := []*speedLoop{{}, {}, {}, {}}
+	var sh sharedLoop
+	wheels := make([]*wheelOnASlope, 4)
+	for i := range wheels {
+		wheels[i] = &wheelOnASlope{load: load}
+	}
+	start := time.Unix(1_000_000, 0)
+	commands := make([]float64, 4)
+	frames := make([]wheelReading, 4)
+	for ms := time.Duration(0); ms < 8*time.Second; ms += time.Millisecond {
+		for i, w := range wheels {
+			w.advance(commands[i], 0.001)
+		}
+		if ms%(50*time.Millisecond) == 0 {
+			for i, w := range wheels {
+				frames[i] = wheelReading{revolutions: w.rev, rpm: w.rpm, at: start.Add(ms)}
+			}
+		}
+		if ms%(20*time.Millisecond) == 0 {
+			for i, s := range loops {
+				s.ramp(40, 0, 150, 500)
+				s.measure(frames[i], true)
+			}
+			commands = sh.step(cfg, loops, 120)
+		}
+	}
+	return wheels[0].rpm
 }

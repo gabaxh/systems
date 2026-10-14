@@ -190,7 +190,7 @@ func TestDrivingOffFromAHold(t *testing.T) {
 		h := newHill(t, defaultSpeedLoop(), 15, 5)
 		h.run(2)
 		if cold {
-			h.d.loops = nil
+			h.d.loops, h.d.shared = nil, sharedLoop{}
 			for node := range h.d.last {
 				h.d.last[node] = 0
 			}
