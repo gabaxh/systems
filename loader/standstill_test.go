@@ -105,7 +105,7 @@ func (h *hill) run(seconds float64) {
 }
 
 func (h *hill) distance(i int) float64 {
-	return h.wheels[i].rev * h.d.cfg.Geometry.WheelCircumference
+	return h.wheels[i].rev * h.d.cfg.circumferenceOfNode(i+1)
 }
 
 // effort is the largest wheel command now, in percent of full scale.
