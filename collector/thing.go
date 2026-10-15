@@ -49,6 +49,29 @@ type MeasurementT struct {
 	// The unit belongs in the name and the conversion belongs at the point of
 	// use.
 	Period int `json:"samplingPeriod"`
+
+	// PeriodMs is the sampling period in milliseconds, for a signal that
+	// changes faster than once a second: a steering loop's step response is
+	// over in a fraction of one. When set it takes the place of Period.
+	PeriodMs int `json:"samplingPeriodMs,omitempty"`
+
+	// ProviderTime stamps each point with the time the provider says its
+	// reading was taken, rather than the time it was read. Read many times a
+	// second, the time of reading blurs a fast signal by the network's delay
+	// and the period, and a reading read twice is two points; with the
+	// provider's time it is one. Off by default: a reading the provider does
+	// not renew, a switch left on for an hour, would then be one point an hour
+	// back, and the mean over the last hour — a heater's duty cycle — would
+	// have nothing to average.
+	ProviderTime bool `json:"providerTime,omitempty"`
+}
+
+// period is how often the measurement is read.
+func (m MeasurementT) period() time.Duration {
+	if m.PeriodMs > 0 {
+		return time.Duration(m.PeriodMs) * time.Millisecond
+	}
+	return time.Duration(m.Period) * time.Second
 }
 
 //-------------------------------------Define the unit asset
@@ -177,7 +200,7 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 			if err := t.collectIngest(name, period, writeAPI); err != nil {
 				log.Printf("Error in collectIngest for measurement: %v", err)
 			}
-		}(measurement.Name, time.Duration(measurement.Period)*time.Second)
+		}(measurement.Name, measurement.period())
 	}
 
 	return ua, func() {
@@ -225,6 +248,12 @@ func (t *Traits) collectIngest(name string, period time.Duration, writeAPI api.W
 	// state to guard. Rebuilt when discovery runs, because that is exactly when
 	// the set of providers may have changed.
 	perNode := map[string]*components.Cervice{}
+
+	// Read many times a second, a line per reading would bury the log; then
+	// each provider is logged once in a while.
+	providerTime := t.providerTime(name)
+	quiet := period < time.Second
+	logged := map[string]time.Time{}
 
 	for {
 		select {
@@ -286,18 +315,57 @@ func (t *Traits) collectIngest(name string, period time.Duration, writeAPI api.W
 						tags[key] = strings.Join(values, ",")
 					}
 
+					now := time.Now()
+					at := now
+					if providerTime {
+						at = signalTime(tf, now)
+					}
 					point := write.NewPoint(
 						name,
 						tags,
 						map[string]interface{}{"value": value},
-						time.Now(),
+						at,
 					)
 					writeAPI.WritePoint(point)
-					log.Printf("collected %s from %-20s  value=%v\n", name, node, value)
+					if !quiet || now.Sub(logged[node]) >= quietLogEvery {
+						logged[node] = now
+						log.Printf("collected %s from %-20s  value=%v\n", name, node, value)
+					}
 				}
 			}
 		}
 	}
+}
+
+// quietLogEvery is how often a measurement read faster than once a second
+// logs a reading, for each provider.
+const quietLogEvery = 10 * time.Second
+
+// providerTime reports whether the named measurement is stamped with its
+// provider's time; see MeasurementT.ProviderTime.
+func (t *Traits) providerTime(name string) bool {
+	for _, m := range t.Measurements {
+		if m.Name == name {
+			return m.ProviderTime
+		}
+	}
+	return false
+}
+
+// signalTime is when the provider says a reading was taken, or now when it
+// does not say.
+func signalTime(f forms.Form, now time.Time) time.Time {
+	var at time.Time
+	switch sig := f.(type) {
+	case *forms.SignalA_v1a:
+		at = sig.Timestamp
+	case *forms.SignalB_v1a:
+		at = sig.Timestamp
+	}
+	if at.IsZero() {
+		return now
+	}
+	return at
 }
 
 // signalValue reduces a reading to the value this system records, and says

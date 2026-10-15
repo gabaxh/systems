@@ -557,3 +557,89 @@ func TestOneCerviceIsKeptPerProvider(t *testing.T) {
 			"still be followed")
 	}
 }
+
+// ── sampling faster than once a second, at the provider's time ───────────────
+
+// samplingPeriodMs takes the place of samplingPeriod, and a configuration
+// without it reads as before.
+func TestSamplingPeriodMs(t *testing.T) {
+	var m MeasurementT
+	if err := json.Unmarshal([]byte(`{"serviceDefinition": "articulation", "samplingPeriod": 3}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.period(); got != 3*time.Second {
+		t.Errorf("samplingPeriod 3 alone: period %v, want 3s", got)
+	}
+	if err := json.Unmarshal([]byte(`{"serviceDefinition": "articulation", "samplingPeriod": 3, "samplingPeriodMs": 50}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.period(); got != 50*time.Millisecond {
+		t.Errorf("samplingPeriodMs 50: period %v, want 50ms", got)
+	}
+}
+
+// newStampedServer is newSignalServer with the reading's timestamp fixed at.
+func newStampedServer(t *testing.T, value float64, at time.Time) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(forms.SignalA_v1a{Value: value, Timestamp: at, Version: "SignalA_v1.0"})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// With providerTime a point carries the time the provider took its reading;
+// without it, as before, the time it was read.
+func TestProviderTime(t *testing.T) {
+	taken := time.Date(2026, 10, 9, 8, 0, 0, 0, time.UTC)
+	for _, providerTime := range []bool{true, false} {
+		srv := newStampedServer(t, 12.5, taken)
+		ctx, cancel := context.WithCancel(context.Background())
+		sys := newTestSystem(ctx)
+		cer := &components.Cervice{
+			Definition: "articulation",
+			Protos:     []string{"http"},
+			Nodes: map[string][]components.NodeInfo{
+				"loader": {readNode(srv.URL, nil)},
+			},
+		}
+		mwa := &mockWriteAPI{}
+		tr := &Traits{
+			owner:        &sys,
+			cervices:     components.Cervices{"articulation": cer},
+			Measurements: []MeasurementT{{Name: "articulation", PeriodMs: 20, ProviderTime: providerTime}},
+		}
+		done := make(chan struct{})
+		go func() { tr.collectIngest("articulation", 20*time.Millisecond, mwa); close(done) }()
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+		<-done
+
+		pts := mwa.captured()
+		if len(pts) < 2 {
+			t.Fatalf("providerTime %v: %d points in 100 ms at 20 ms; want several", providerTime, len(pts))
+		}
+		for _, p := range pts {
+			switch {
+			case providerTime && !p.Time().Equal(taken):
+				t.Errorf("with providerTime, a point stamped %v; want the provider's %v", p.Time(), taken)
+			case !providerTime && time.Since(p.Time()) > time.Minute:
+				t.Errorf("without providerTime, a point stamped %v; want the time it was read", p.Time())
+			}
+		}
+	}
+}
+
+// A reading without a timestamp is stamped when it was read, provider's time
+// or not.
+func TestSignalTimeFallsBackToNow(t *testing.T) {
+	now := time.Now()
+	if got := signalTime(&forms.SignalA_v1a{Value: 1}, now); !got.Equal(now) {
+		t.Errorf("no timestamp: %v, want now", got)
+	}
+	at := now.Add(-time.Second)
+	if got := signalTime(&forms.SignalB_v1a{Value: true, Timestamp: at}, now); !got.Equal(at) {
+		t.Errorf("a switch's timestamp: %v, want %v", got, at)
+	}
+}

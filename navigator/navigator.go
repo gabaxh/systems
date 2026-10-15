@@ -14,14 +14,11 @@
  *   Jan A. van Deventer, Luleå - initial implementation
  ***************************************************************************SDG*/
 
-// The gamepad drives the loader by hand. It reads a game controller and
-// commands the loader's wheel and steering setpoints, and its emergency stop
-// sends zero and then nothing.
+// The navigator plans a route through the cartographer's map to wherever it is
+// asked to go, forward only and no tighter than the vehicle can turn, and to
+// the nearest point it can reach when the destination itself cannot be.
 //
-// It replaces the artitrax gamepad_controller, which published the same
-// commands over DDS to can_dds; here the loader is the bridge and the commands
-// are ordinary service calls, discovered, authorized and encrypted like any
-// other in the cloud.
+// It plans; it does not drive. The route is a service a chauffeur follows.
 package main
 
 import (
@@ -40,15 +37,15 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	sys := components.NewSystem("gamepad", ctx)
+	sys := components.NewSystem("navigator", ctx)
 	usecases.WatchShutdown(&sys, cancel)
 
 	sys.Husk = &components.Husk{
-		Description: "drives the mini wheel loader from a game controller",
+		Description: "plans a route through the map to a destination",
 		Details:     map[string][]string{"Developer": {"Synecdoque"}},
 		Host:        components.NewDevice(),
-		ProtoPort:   map[string]int{"https": 30198, "http": 20198, "coap": 0},
-		InfoLink:    "https://github.com/sdoque/systems/tree/main/gamepad",
+		ProtoPort:   map[string]int{"https": 30204, "http": 20204, "coap": 0},
+		InfoLink:    "https://github.com/sdoque/systems/tree/main/navigator",
 		DName: pkix.Name{
 			CommonName:         sys.Name,
 			Organization:       []string{"Synecdoque"},
@@ -90,8 +87,10 @@ func main() {
 
 func serving(t *Traits, w http.ResponseWriter, r *http.Request, servicePath string) {
 	switch servicePath {
-	case "engaged":
-		t.engaged(w, r)
+	case "goal":
+		t.goalService(w, r)
+	case "path":
+		t.pathService(w, r)
 	default:
 		http.Error(w, "Invalid service path", http.StatusBadRequest)
 	}

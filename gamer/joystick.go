@@ -92,12 +92,32 @@ type pad struct {
 
 	mu    sync.Mutex
 	state padState
+
+	// lastHIDReport records when the most recent raw Bluetooth HID report
+	// arrived. This catches a failure that /dev/input/js0 alone cannot:
+	// js0 can stay open with the last joystick value cached while the
+	// Bluetooth radio link has stopped delivering controller reports.
+	lastHIDReport time.Time
 }
 
 func (p *pad) snapshot() padState {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.state
+}
+
+// hidFresh reports whether raw controller traffic has arrived recently.
+// A fresh HID report means the Bluetooth controller is actually communicating,
+// rather than merely still being reported as connected by Linux/BlueZ.
+func (p *pad) hidFresh(maxAge time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.lastHIDReport.IsZero() {
+		return false
+	}
+
+	return time.Since(p.lastHIDReport) <= maxAge
 }
 
 // run reads the device until the context ends, reopening it whenever it goes
@@ -111,7 +131,7 @@ func (p *pad) run(ctx context.Context) {
 		f, err := os.Open(p.path)
 		if err != nil {
 			if !reported {
-				log.Printf("gamepad: cannot open %s: %v — will keep trying", p.path, err)
+				log.Printf("gamer: cannot open %s: %v — will keep trying", p.path, err)
 				reported = true
 			}
 			select {
@@ -121,7 +141,7 @@ func (p *pad) run(ctx context.Context) {
 			continue
 		}
 		reported = false
-		log.Printf("gamepad: %s opened", p.path)
+		log.Printf("gamer: %s opened", p.path)
 
 		// Closing the file is what unblocks the read when the system shuts down.
 		done := make(chan struct{})
@@ -140,11 +160,69 @@ func (p *pad) run(ctx context.Context) {
 		p.state = padState{}
 		p.mu.Unlock()
 		if ctx.Err() == nil {
-			log.Printf("gamepad: %s lost", p.path)
+			log.Printf("gamer: %s lost", p.path)
 		}
 	}
 }
 
+// watchHID monitors raw HID traffic from the controller.
+//
+// During testing, the DualSense could move out of Bluetooth range while Linux
+// still kept /dev/input/js0 open. The joystick state therefore remained at its
+// last value and gamer continued sending that stale command.
+//
+// Raw HID reports normally arrive continuously. Recording their arrival time
+// gives the control loop a watchdog independent of joystick axis changes.
+func (p *pad) watchHID(ctx context.Context, path string) {
+	reported := false
+
+	for ctx.Err() == nil {
+		f, err := os.Open(path)
+		if err != nil {
+			if !reported {
+				log.Printf("gamer: cannot open HID watchdog %s: %v — will keep trying", path, err)
+				reported = true
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+			continue
+		}
+
+		reported = false
+		log.Printf("gamer: HID watchdog opened %s", path)
+
+		buf := make([]byte, 128)
+
+		for ctx.Err() == nil {
+			n, err := f.Read(buf)
+			if err != nil {
+				break
+			}
+
+			if n > 0 {
+				p.mu.Lock()
+				p.lastHIDReport = time.Now()
+				p.mu.Unlock()
+			}
+		}
+
+		f.Close()
+
+		// Do not leave an old timestamp looking healthy while the watchdog
+		// device is being reopened.
+		p.mu.Lock()
+		p.lastHIDReport = time.Time{}
+		p.mu.Unlock()
+
+		if ctx.Err() == nil {
+			log.Printf("gamer: HID watchdog %s stopped receiving", path)
+		}
+	}
+}
 func (p *pad) read(r io.Reader) {
 	// A fresh state on every open: the driver replays the current position of
 	// every control as init events, and nothing from before the disconnect may

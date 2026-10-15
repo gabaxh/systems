@@ -31,7 +31,6 @@ const (
 	unitMetre  = "<http://qudt.org/vocab/unit/M>"
 	unitDegree = "<http://qudt.org/vocab/unit/DEG>"
 	unitPct    = "<http://qudt.org/vocab/unit/PERCENT>"
-	unitRev    = "<http://qudt.org/vocab/unit/REV>"
 )
 
 // CartographerConfig is what the operator may set.
@@ -73,6 +72,12 @@ type CartographerConfig struct {
 type Traits struct {
 	cfg   CartographerConfig
 	owner *components.System
+
+	// frame names this map. Each run starts a new map with its origin at the
+	// first sweep, so the same coordinates name another place after a
+	// restart; the frame carries the start time so that a path or goal from
+	// the previous map can be recognized as such rather than followed.
+	frame string
 
 	scanCervice  *components.Cervice
 	leftCervice  *components.Cervice
@@ -176,6 +181,7 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 	t := &Traits{
 		cfg:   cfg,
 		owner: sys,
+		frame: forms.PolarMap + "@" + time.Now().UTC().Format(time.RFC3339),
 		g:     newGrid(cfg.WidthMetres, cfg.HeightMetres, cfg.Resolution),
 		scanCervice: &components.Cervice{
 			Definition: "scan",
@@ -192,12 +198,12 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 		odo:          newOdometer(cfg.Odometry),
 	}
 	if cfg.Odometry.on() {
-		log.Printf("cartographer: odometry from the loader's wheels %d and %d (%s), %.4f m around, %.4f m apart",
-			cfg.Odometry.LeftNodeID, cfg.Odometry.RightNodeID, axleName(cfg.Odometry),
-			cfg.Odometry.WheelCircumference, cfg.Odometry.Track)
+		log.Printf("cartographer: odometry from the loader's wheels %d and %d (%s), %.4f m apart",
+			cfg.Odometry.LeftNodeID, cfg.Odometry.RightNodeID, axleName(cfg.Odometry), cfg.Odometry.Track)
 	} else {
 		log.Println("cartographer: odometry is switched off; each sweep starts from constant velocity")
 	}
+	log.Printf("cartographer: this map is %s", t.frame)
 
 	t.readWheels = t.readLoaderWheels
 	t.g.matchRange = cfg.MatchRangeMetres
@@ -270,7 +276,7 @@ func wheelCervice(o OdometryConfig, ref string, nodeID int, sys *components.Syst
 	}
 	return &components.Cervice{
 		IReferentce: ref,
-		Definition:  "travel",
+		Definition:  "distance",
 		Protos:      components.SProtocols(sys.Husk.ProtoPort),
 		Mode:        "get",
 		Nodes:       make(map[string][]components.NodeInfo),
@@ -407,12 +413,12 @@ func (t *Traits) readWheel(cer *components.Cervice) (wheelSample, error) {
 	if !ok {
 		return wheelSample{}, errUnexpectedForm
 	}
-	// The loader's travel is in revolutions. Anything else would be read as
-	// revolutions and scaled by the circumference into nonsense.
-	if sig.Unit != "" && sig.Unit != unitRev {
-		return wheelSample{}, fmt.Errorf("%s: travel came in %s, not revolutions", cer.IReferentce, sig.Unit)
+	// The loader's distance is in meters. Anything else would be integrated
+	// as meters into a map of the wrong size.
+	if sig.Unit != "" && sig.Unit != unitMetre {
+		return wheelSample{}, fmt.Errorf("%s: distance came in %s, not meters", cer.IReferentce, sig.Unit)
 	}
-	return wheelSample{revolutions: sig.Value, at: sig.Timestamp}, nil
+	return wheelSample{metres: sig.Value, at: sig.Timestamp}, nil
 }
 
 // noteOdometry reports why a sweep had no odometry: the first time, and then
@@ -563,6 +569,7 @@ func (t *Traits) mapService(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nothing has been mapped yet", http.StatusServiceUnavailable)
 		return
 	}
+	f.Frame = t.frame
 	f.Timestamp = time.Now()
 	usecases.HTTPProcessGetRequest(w, r, &f)
 }
@@ -588,7 +595,7 @@ func (t *Traits) poseService(w http.ResponseWriter, r *http.Request) {
 	f.NewForm()
 	f.X, f.Y = at.x, at.y
 	f.Heading = at.theta * 180 / math.Pi
-	f.Frame = "map"
+	f.Frame = t.frame
 	f.DistanceUnit = unitMetre
 	f.AngleUnit = unitDegree
 	f.Timestamp = last
