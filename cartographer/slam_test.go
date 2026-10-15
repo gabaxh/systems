@@ -4,7 +4,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/sdoque/mbaigo/forms"
 )
@@ -181,6 +183,47 @@ func TestIntegrateMarksFreeBetweenSensorAndWall(t *testing.T) {
 	}
 }
 
+// Baseline reproduction of the fixed-grid limitation. Once automatic growth is
+// implemented, replace the small-grid expectation with retained observations.
+func TestFixedGridDropsBeamWithEndpointOutsideMap(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		width        float64
+		wantRecorded bool
+	}{
+		{"endpoint outside small map", 4, false},
+		{"same endpoint inside larger map", 8, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGrid(tc.width, tc.width, 0.1)
+			// The scanner is at the origin; the obstacle is 3 m ahead.
+			g.integrate(pose{}, []float64{0}, []float64{3}, []bool{true})
+
+			cx, cy, inside := g.cellOf(1, 0)
+			if !inside {
+				t.Fatal("the point along the beam must be inside both maps")
+			}
+			if gotFree := g.at(cx, cy) < 0; gotFree != tc.wantRecorded {
+				t.Errorf("free space recorded = %v, want %v", gotFree, tc.wantRecorded)
+			}
+			ex, ey, endpointInside := g.cellOf(3, 0)
+			if endpointInside != tc.wantRecorded {
+				t.Errorf("endpoint inside map = %v, want %v", endpointInside, tc.wantRecorded)
+			}
+			if tc.wantRecorded && g.at(ex, ey) <= 0 {
+				t.Error("the obstacle should be recorded in the larger map")
+			}
+			if !tc.wantRecorded {
+				for i, v := range g.cells {
+					if v != 0 {
+						t.Fatalf("cell %d changed although the whole beam is currently discarded", i)
+					}
+				}
+			}
+		})
+	}
+}
+
 // An invalid point must contribute nothing at all. Treating it as free space to
 // maximum range is the failure this whole design is built to avoid.
 func TestIntegrateIgnoresInvalidReturns(t *testing.T) {
@@ -242,4 +285,265 @@ func TestLineExcludesTheEndpoint(t *testing.T) {
 	if len(cells) != 3 {
 		t.Errorf("got %d intermediate cells, want 3", len(cells))
 	}
+}
+
+func TestGridGrowthPreservesWorldCoordinates(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		left, right, bottom, top int
+	}{
+		{"left", 2, 0, 0, 0},
+		{"right", 0, 2, 0, 0},
+		{"bottom", 0, 0, 2, 0},
+		{"top", 0, 0, 0, 2},
+		{"bottom left corner", 2, 0, 3, 0},
+		{"top right corner", 0, 2, 0, 3},
+		{"all sides", 1, 2, 3, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGrid(1, 1, 0.25)
+			for i := range g.cells {
+				g.cells[i] = float32(i+1) / 10
+			}
+			g.cells[0] = logFree
+			original := append([]float32(nil), g.cells...)
+			originX, originY := g.originX, g.originY
+			g.matchRange = 10
+
+			// Repeat growth to catch row-copy errors after the first resize.
+			for pass := 1; pass <= 2; pass++ {
+				if err := g.grow(tc.left, tc.right, tc.bottom, tc.top, 10000); err != nil {
+					t.Fatal(err)
+				}
+				if g.width != 4+pass*(tc.left+tc.right) || g.height != 4+pass*(tc.bottom+tc.top) {
+					t.Fatalf("unexpected dimensions: %d x %d", g.width, g.height)
+				}
+				if g.res != 0.25 || g.matchRange != 10 || !g.dirty || len(g.field) != len(g.cells) {
+					t.Fatal("resolution/range changed or matching field not invalidated")
+				}
+				oldCells := make(map[int]bool)
+				for i, want := range original {
+					// Sample cell centres to avoid floating-point boundary ambiguity.
+					x := originX + (float64(i%4)+0.5)*g.res
+					y := originY + (float64(i/4)+0.5)*g.res
+					cx, cy, inside := g.cellOf(x, y)
+					if !inside || g.at(cx, cy) != want {
+						t.Fatalf("evidence moved at world coordinate (%v, %v)", x, y)
+					}
+					oldCells[cy*g.width+cx] = true
+				}
+				for i, v := range g.cells {
+					if !oldCells[i] && v != 0 {
+						t.Fatalf("new cell %d is not unknown", i)
+					}
+				}
+				g.rebuildField()
+				if g.dirty {
+					t.Fatal("matching field did not rebuild")
+				}
+			}
+		})
+	}
+}
+
+func TestGridGrowthLimitsLeaveMapUnchanged(t *testing.T) {
+	maxInt := int(^uint(0) >> 1)
+	for _, tc := range []struct {
+		name                            string
+		left, right, bottom, top, limit int
+	}{
+		{"negative addition", -1, 0, 0, 0, 100},
+		{"no cell budget", 1, 0, 0, 0, 0},
+		{"area exceeds budget", 1, 0, 0, 0, 4},
+		{"width overflow", maxInt, 1, 0, 0, maxInt},
+		{"height overflow", 0, 0, maxInt, 1, maxInt},
+		{"area overflow", maxInt / 2, 0, 0, 0, maxInt},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newGrid(2, 2, 1)
+			g.cells[0] = logOcc
+			before := *g
+			before.cells = append([]float32(nil), g.cells...)
+			before.field = append([]float32(nil), g.field...)
+			if err := g.grow(tc.left, tc.right, tc.bottom, tc.top, tc.limit); err == nil {
+				t.Fatal("expected growth to be refused")
+			}
+			if !reflect.DeepEqual(before, *g) {
+				t.Fatal("refused growth changed the map")
+			}
+		})
+	}
+}
+
+func TestGridGrowthAtLimitAndNoOp(t *testing.T) {
+	g := newGrid(2, 2, 1)
+	if err := g.grow(1, 0, 0, 0, 6); err != nil {
+		t.Fatalf("growth exactly at limit was refused: %v", err)
+	}
+	g.rebuildField()
+	before := *g
+	if err := g.grow(0, 0, 0, 0, 6); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, *g) {
+		t.Fatal("zero growth changed the map")
+	}
+}
+
+func TestScanExpansionEdgesAndCorners(t *testing.T) {
+	for _, xy := range [][2]float64{{3, 0}, {-3, 0}, {0, 3}, {0, -3}, {3, 3}, {-3, 3}, {3, -3}, {-3, -3}, {2, 0}} {
+		g := newGrid(4, 4, 1)
+		g.cells[0] = logOcc
+		cfg := ExpansionConfig{Enabled: true, BlockMetres: 2, MaxCells: 100, MaxRangeMetres: 10}
+		a := []float64{math.Atan2(xy[1], xy[0]) * 180 / math.Pi}
+		d := []float64{math.Hypot(xy[0], xy[1])}
+		if err := g.expandForScan(pose{}, a, d, []bool{true}, cfg); err != nil {
+			t.Fatal(err)
+		}
+		cx, cy, ok := g.cellOf(-1.5, -1.5)
+		if !ok || g.at(cx, cy) != logOcc {
+			t.Fatal("old evidence moved")
+		}
+		g.integrate(pose{}, a, d, []bool{true})
+		// Use the same projection as the mapper, including its rounding.
+		x, y := project(pose{}, a[0], d[0])
+		cx, cy, ok = g.cellOf(x, y)
+		if !ok || g.at(cx, cy) <= 0 {
+			t.Fatalf("endpoint (%v,%v) lost", x, y)
+		}
+		w, h := g.width, g.height
+		if err := g.expandForScan(pose{}, a, d, []bool{true}, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if g.width != w || g.height != h {
+			t.Fatal("identical scan grew map again")
+		}
+	}
+}
+
+func TestScanExpansionMarginAndFiltering(t *testing.T) {
+	cfg := ExpansionConfig{Enabled: true, MarginMetres: 1, BlockMetres: 2, MaxCells: 100, MaxRangeMetres: 10}
+	g := newGrid(4, 4, 1)
+	if err := g.expandForScan(pose{}, []float64{0}, []float64{1}, []bool{true}, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if g.width != 6 || g.height != 4 {
+		t.Fatalf("margin did not trigger right-side growth: %dx%d", g.width, g.height)
+	}
+	for _, tc := range []struct {
+		angle, distance float64
+		valid           bool
+	}{
+		{0, 3, false}, {0, 0, true}, {0, -3, true}, {0, 11, true},
+		{0, math.NaN(), true}, {0, math.Inf(1), true}, {math.NaN(), 3, true}, {math.Inf(1), 3, true},
+	} {
+		g = newGrid(4, 4, 1)
+		if err := g.expandForScan(pose{}, []float64{tc.angle}, []float64{tc.distance}, []bool{tc.valid}, cfg); err != nil {
+			t.Fatal(err)
+		}
+		if g.width != 4 || g.height != 4 {
+			t.Fatal("invalid or out-of-range return triggered growth")
+		}
+	}
+}
+
+func TestScanExpansionDisabledOrRefused(t *testing.T) {
+	for _, cfg := range []ExpansionConfig{
+		{},
+		{Enabled: true, BlockMetres: 2, MaxCells: 16, MaxRangeMetres: 10},
+		{Enabled: true, BlockMetres: 2, MaxCells: 100, MaxRangeMetres: 10, MarginMetres: math.NaN()},
+	} {
+		g := newGrid(4, 4, 1)
+		err := g.expandForScan(pose{}, []float64{0}, []float64{3}, []bool{true}, cfg)
+		if cfg.Enabled && err == nil {
+			t.Fatal("expected refusal")
+		}
+		if !cfg.Enabled && err != nil {
+			t.Fatal(err)
+		}
+		if g.width != 4 || g.height != 4 || g.originX != -2 || g.originY != -2 {
+			t.Fatal("map changed on refusal/disabled expansion")
+		}
+	}
+}
+
+func TestConsumeExpandsBeforeIntegrating(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		off := false
+		cfg := CartographerConfig{WidthMetres: 4, HeightMetres: 4, Resolution: 1,
+			Odometry:  OdometryConfig{Enabled: &off},
+			Expansion: ExpansionConfig{Enabled: enabled, BlockMetres: 2, MaxCells: 100, MaxRangeMetres: 10}}
+		applyDefaults(&cfg)
+		tr := &Traits{cfg: cfg, g: newGrid(4, 4, 1), frame: "test-frame"}
+		tr.consume(&forms.ScanA_v1a{Angles: []float64{0}, Distances: []float64{3}, Valid: []bool{true}, Timestamp: time.Now()})
+		cx, cy, inside := tr.g.cellOf(3, 0)
+		if inside != enabled {
+			t.Fatalf("endpoint inside = %v, expansion enabled = %v", inside, enabled)
+		}
+		if enabled && tr.g.at(cx, cy) <= 0 {
+			t.Fatal("new observation not integrated")
+		}
+		if tr.frame != "test-frame" || tr.at != (pose{}) {
+			t.Fatal("growth changed frame or vehicle pose")
+		}
+	}
+}
+
+// Known poses isolate expansion from localisation: this checks the corridor
+// geometry used by the scan simulator, not live Guetteur/Arrowhead integration.
+func TestExpansionAlongSimulatedCorridor(t *testing.T) {
+	g := newGrid(4, 4, 0.1)
+	cfg := ExpansionConfig{Enabled: true, MarginMetres: 0.5, BlockMetres: 4,
+		MaxCells: 100000, MaxRangeMetres: 12}
+	growths, sweeps := 0, 0
+	for _, returning := range []bool{false, true} {
+		for i := 0; i <= 32; i++ {
+			x, heading := 2+float64(i)*0.5, 0.0
+			if returning {
+				x, heading = 18-float64(i)*0.5, math.Pi
+			}
+			angles, distances, valid := sweepFrom(pose{x: x, theta: heading}, 200, 200)
+			// Map origin is the first scan position (corridor x=2).
+			at := pose{x: x - 2, theta: heading}
+			w, h := g.width, g.height
+			if err := g.expandForScan(at, angles, distances, valid, cfg); err != nil {
+				t.Fatal(err)
+			}
+			if g.width != w || g.height != h {
+				growths++
+			}
+			if len(g.cells) > cfg.MaxCells {
+				t.Fatal("cell budget exceeded")
+			}
+			for j, d := range distances {
+				if !valid[j] || d <= 0 || d > cfg.MaxRangeMetres {
+					continue
+				}
+				px, py := project(at, angles[j], d)
+				if _, _, ok := g.cellOf(px, py); !ok {
+					t.Fatalf("accepted return outside expanded map: (%v, %v)", px, py)
+				}
+			}
+			g.integrate(at, angles, distances, valid)
+			sweeps++
+		}
+	}
+	if growths == 0 {
+		t.Fatal("corridor route never expanded the map")
+	}
+	// The corridor ends at x=20, which is x=18 in the map frame.
+	cx, cy, inside := g.cellOf(18, 0)
+	if !inside || g.at(cx, cy) <= 0 {
+		t.Fatal("far wall was not retained beyond the original map")
+	}
+	g.rebuildField()
+	f := g.form()
+	if err := f.Check(); err != nil {
+		t.Fatal(err)
+	}
+	if f.Width != g.width || f.Height != g.height || f.OriginX != g.originX || f.OriginY != g.originY {
+		t.Fatal("map output does not reflect expanded bounds")
+	}
+	t.Logf("%d simulated sweeps; %d growth events; 4x4 m initial map -> %.1fx%.1f m; %d cells",
+		sweeps, growths, float64(g.width)*g.res, float64(g.height)*g.res, len(g.cells))
 }

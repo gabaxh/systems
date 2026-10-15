@@ -37,9 +37,10 @@ const (
 type CartographerConfig struct {
 	// The map's extent in metres and how fine its cells are. A hallway needs
 	// little area and reasonable resolution; 5 cm is enough to see a doorway.
-	WidthMetres  float64 `json:"widthMetres"`
-	HeightMetres float64 `json:"heightMetres"`
-	Resolution   float64 `json:"resolutionMetres"`
+	WidthMetres  float64         `json:"widthMetres"`
+	HeightMetres float64         `json:"heightMetres"`
+	Resolution   float64         `json:"resolutionMetres"`
+	Expansion    ExpansionConfig `json:"expansion"`
 
 	// PollMs is how often a sweep is asked for.
 	PollMs int `json:"pollMs"`
@@ -94,12 +95,13 @@ type Traits struct {
 	// velocity carried between sweeps, used as the prior when no odometry is
 	// available: the best guess about where the vehicle is now is where it was
 	// going last time.
-	vx, vy, vtheta float64
-	lastSweep      time.Time
-	integrated     int
-	degenerate     int
-	failures       int
-	usingOdometry  bool
+	vx, vy, vtheta       float64
+	lastSweep            time.Time
+	integrated           int
+	degenerate           int
+	failures             int
+	usingOdometry        bool
+	lastExpansionWarning time.Time
 }
 
 //-------------------------------------Instantiate a unit asset template
@@ -238,6 +240,17 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 }
 
 func applyDefaults(cfg *CartographerConfig) {
+	// Opt-in: old configurations retain their fixed-grid behaviour.
+	if cfg.Expansion.BlockMetres == 0 {
+		cfg.Expansion.BlockMetres = 10
+	}
+	if cfg.Expansion.MaxCells == 0 {
+		cfg.Expansion.MaxCells = 4_000_000
+	}
+	if cfg.Expansion.MaxRangeMetres == 0 {
+		cfg.Expansion.MaxRangeMetres = 10
+	}
+
 	if cfg.WidthMetres <= 0 {
 		cfg.WidthMetres = 60
 	}
@@ -504,6 +517,15 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	moved := math.Hypot(at.x-t.at.x, at.y-t.at.y)
 	turned := math.Abs(wrapAngle(at.theta-t.at.theta)) * 180 / math.Pi
 	if first || moved >= t.cfg.MinTravelMetres || turned >= t.cfg.MinTurnDegrees {
+		oldWidth, oldHeight := g.width, g.height
+		if err := g.expandForScan(at, sw.Angles, sw.Distances, sw.Valid, t.cfg.Expansion); err != nil {
+			if time.Since(t.lastExpansionWarning) >= 10*time.Second {
+				log.Printf("cartographer: map expansion refused; keeping existing bounds: %v", err)
+				t.lastExpansionWarning = time.Now()
+			}
+		} else if oldWidth != g.width || oldHeight != g.height {
+			log.Printf("cartographer: map grew from %dx%d to %dx%d cells", oldWidth, oldHeight, g.width, g.height)
+		}
 		g.integrate(at, sw.Angles, sw.Distances, sw.Valid)
 		t.integrated++
 	}

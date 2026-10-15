@@ -97,6 +97,120 @@ func newGrid(widthM, heightM, res float64) *grid {
 	}
 }
 
+// grow adds whole rows/columns without changing the world coordinates of
+// existing evidence. New cells are unknown; the matching field is rebuilt on
+// its next use. The caller must hold exclusive access to the grid.
+// maxCells bounds the final grid, not peak memory while old/new arrays coexist.
+func (g *grid) grow(left, right, bottom, top, maxCells int) error {
+	if left < 0 || right < 0 || bottom < 0 || top < 0 || maxCells <= 0 {
+		return fmt.Errorf("grid growth requires non-negative additions and a positive cell limit")
+	}
+	if left == 0 && right == 0 && bottom == 0 && top == 0 {
+		return nil
+	}
+
+	// Guard dimension addition and area multiplication before allocating.
+	maxInt := int(^uint(0) >> 1)
+	if left > maxInt-g.width || right > maxInt-g.width-left ||
+		bottom > maxInt-g.height || top > maxInt-g.height-bottom {
+		return fmt.Errorf("grid growth dimensions overflow")
+	}
+	width, height := g.width+left+right, g.height+bottom+top
+	if height > maxCells/width {
+		return fmt.Errorf("grid growth to %d x %d exceeds the %d-cell limit", width, height, maxCells)
+	}
+	cells := make([]float32, width*height)
+	field := make([]float32, width*height)
+	for y := 0; y < g.height; y++ {
+		dst := (y+bottom)*width + left
+		copy(cells[dst:dst+g.width], g.cells[y*g.width:(y+1)*g.width])
+	}
+
+	g.originX -= float64(left) * g.res
+	g.originY -= float64(bottom) * g.res
+	g.width, g.height = width, height
+	g.cells, g.field = cells, field
+	g.dirty = true
+	return nil
+}
+
+// ExpansionConfig controls opt-in dense-grid growth. MaxCells bounds final area,
+// not peak process memory. MaxRangeMetres bounds growth triggers only; it does
+// not change which returns the existing matcher/integrator accepts.
+type ExpansionConfig struct {
+	Enabled        bool    `json:"enabled"`
+	MarginMetres   float64 `json:"marginMetres"`
+	BlockMetres    float64 `json:"blockMetres"`
+	MaxCells       int     `json:"maxCells"`
+	MaxRangeMetres float64 `json:"maxRangeMetres"`
+}
+
+// expandForScan includes the scanner and finite valid endpoints within the
+// configured growth range. Called with the accepted pose, under the map lock.
+func (g *grid) expandForScan(p pose, angles, distances []float64, valid []bool, cfg ExpansionConfig) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	finite := func(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+	if !finite(cfg.MarginMetres) || cfg.MarginMetres < 0 ||
+		!finite(cfg.BlockMetres) || cfg.BlockMetres <= 0 ||
+		!finite(cfg.MaxRangeMetres) || cfg.MaxRangeMetres <= 0 || cfg.MaxCells <= 0 {
+		return fmt.Errorf("invalid map expansion configuration")
+	}
+	if !finite(p.x) || !finite(p.y) || !finite(p.theta) {
+		return fmt.Errorf("non-finite scan pose cannot trigger growth")
+	}
+	minX, maxX, minY, maxY := p.x, p.x, p.y, p.y
+	accepted := false
+	for i, a := range angles {
+		if i >= len(distances) || i >= len(valid) || !valid[i] || !finite(a) {
+			continue
+		}
+		d := distances[i]
+		if !finite(d) || d <= 0 || d > cfg.MaxRangeMetres {
+			continue
+		}
+		x, y := project(p, a, d)
+		if !finite(x) || !finite(y) {
+			continue
+		}
+		accepted = true
+		minX, maxX = math.Min(minX, x), math.Max(maxX, x)
+		minY, maxY = math.Min(minY, y), math.Max(maxY, y)
+	}
+	if !accepted {
+		return nil
+	}
+	block := math.Ceil(cfg.BlockMetres / g.res)
+	// Round in floating point, then check against a safe int bound before
+	// conversion. This also refuses absurd poses/settings without allocation.
+	round := func(cells float64) (int, error) {
+		if cells <= 0 {
+			return 0, nil
+		}
+		n := math.Ceil(cells/block) * block
+		if !finite(n) || n >= float64(cfg.MaxCells) {
+			return 0, fmt.Errorf("requested map growth exceeds cell budget")
+		}
+		return int(n), nil
+	}
+	needs := []float64{
+		math.Ceil((g.originX - (minX - cfg.MarginMetres)) / g.res),
+		math.Floor((maxX+cfg.MarginMetres-g.originX)/g.res) + 1 - float64(g.width),
+		math.Ceil((g.originY - (minY - cfg.MarginMetres)) / g.res),
+		math.Floor((maxY+cfg.MarginMetres-g.originY)/g.res) + 1 - float64(g.height),
+	}
+	var extra [4]int
+	for i, n := range needs {
+		var err error
+		extra[i], err = round(n)
+		if err != nil {
+			return err
+		}
+	}
+	return g.grow(extra[0], extra[1], extra[2], extra[3], cfg.MaxCells)
+}
+
 func (g *grid) cellOf(x, y float64) (int, int, bool) {
 	cx := int(math.Floor((x - g.originX) / g.res))
 	cy := int(math.Floor((y - g.originY) / g.res))
