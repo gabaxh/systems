@@ -115,4 +115,14 @@ through without a single test noticing.
 | `updateRate` | 8 | command 66, the sensor's own enumeration; see above |
 | `scanDelay` | 5 | command 85, the delay between scan positions, 5–2000 |
 | `sweepHz`, `pointsPerSweep` | 5, 160 | the simulator only |
+| `maxRangeMetres` | 50 | returns beyond this are points that did not come back |
+| `spikeJumpMetres` | 0.5 | a return this much further than both neighbours is dropped as a bounced beam; negative turns it off |
+
+A beam that reflects off one surface on its way to another comes back late, and
+the sensor reports a point behind the real wall: a ghost on the map. A single
+point standing well behind both of its neighbours is that shape, and it is kept
+as a point that did not come back rather than shortened. A consumer that marks
+the beam as free space would otherwise carve a hole through the real wall on
+its way to the ghost. Ghosts more than one point wide get through; lowering
+`maxRangeMetres` to the size of the place being mapped removes the far ones.
 

@@ -139,6 +139,64 @@ func TestScanServiceProducesACheckableForm(t *testing.T) {
 	}
 }
 
+// A bounced beam reports a point behind the wall its neighbours agree on. It
+// must leave the sweep as a non-return, and nothing that looks like a real
+// thing may go with it.
+func TestRejectSpikes(t *testing.T) {
+	cases := []struct {
+		name      string
+		distances []float64
+		valid     []bool
+		jump      float64
+		want      []bool
+	}{
+		{"a ghost behind a wall is dropped",
+			[]float64{2, 2, 5, 2, 2}, []bool{true, true, true, true, true}, 0.5,
+			[]bool{true, true, false, true, true}},
+		{"a post in front of a wall is kept",
+			[]float64{4, 4, 1, 4, 4}, []bool{true, true, true, true, true}, 0.5,
+			[]bool{true, true, true, true, true}},
+		{"the ends of the sweep are kept",
+			[]float64{6, 2, 2, 2, 6}, []bool{true, true, true, true, true}, 0.5,
+			[]bool{true, true, true, true, true}},
+		{"a point beside a non-return is kept",
+			[]float64{2, 0, 5, 2, 2}, []bool{true, false, true, true, true}, 0.5,
+			[]bool{true, false, true, true, true}},
+		{"a two-point ghost gets through, a known limit",
+			[]float64{2, 5, 5, 2}, []bool{true, true, true, true}, 0.5,
+			[]bool{true, true, true, true}},
+		{"a small step is a surface, not a ghost",
+			[]float64{2, 2, 2.3, 2, 2}, []bool{true, true, true, true, true}, 0.5,
+			[]bool{true, true, true, true, true}},
+		{"a negative jump turns the filter off",
+			[]float64{2, 2, 5, 2, 2}, []bool{true, true, true, true, true}, -1,
+			[]bool{true, true, true, true, true}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			angles := make([]float64, len(c.distances))
+			for i := range angles {
+				angles[i] = float64(i)
+			}
+			in := freshSweep(angles, c.distances, c.valid)
+			before := append([]bool(nil), in.valid...)
+
+			out := rejectSpikes(in, c.jump)
+			for i := range c.want {
+				if out.valid[i] != c.want[i] {
+					t.Errorf("valid = %v, want %v", out.valid, c.want)
+					break
+				}
+			}
+			for i := range before {
+				if in.valid[i] != before[i] {
+					t.Fatalf("the sweep handed in was modified: %v, was %v", in.valid, before)
+				}
+			}
+		})
+	}
+}
+
 // The simulator has to produce a corridor a person would recognize, or it is
 // not a stand-in for the sensor.
 func TestSimulatorDrawsTheCorridor(t *testing.T) {

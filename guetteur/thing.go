@@ -55,6 +55,13 @@ type GuetteurConfig struct {
 	SectorDegrees float64 `json:"sectorDegrees"`
 	MaxRange      float64 `json:"maxRangeMetres"`
 
+	// SpikeJumpMetres is how much further than both its neighbours a return
+	// may be before it is taken for a bounced one and dropped. A beam that
+	// reflects off one surface on its way to another comes back late, and the
+	// sensor reports a point behind the real wall. Zero takes the default; a
+	// negative value turns the filter off.
+	SpikeJumpMetres float64 `json:"spikeJumpMetres"`
+
 	// ForwardSectorDegrees is the arc, centred straight ahead, that clearance
 	// reduces to a single number.
 	ForwardSectorDegrees float64 `json:"forwardSectorDegrees"`
@@ -153,6 +160,7 @@ func initTemplate() *components.UnitAsset {
 			ScanDelay:            5,
 			SectorDegrees:        160,
 			MaxRange:             50,
+			SpikeJumpMetres:      0.5,
 			ForwardSectorDegrees: 40,
 			StaleAfterMs:         1500,
 		},
@@ -234,6 +242,9 @@ func applyDefaults(cfg *GuetteurConfig) {
 	if cfg.MaxRange <= 0 {
 		cfg.MaxRange = 50
 	}
+	if cfg.SpikeJumpMetres == 0 {
+		cfg.SpikeJumpMetres = 0.5
+	}
 	if cfg.ForwardSectorDegrees <= 0 {
 		cfg.ForwardSectorDegrees = 40
 	}
@@ -256,7 +267,7 @@ func (t *Traits) collect(ctx context.Context, ch <-chan sweep) {
 				return
 			}
 			t.mu.Lock()
-			t.latest = sw
+			t.latest = rejectSpikes(sw, t.cfg.SpikeJumpMetres)
 			t.got = true
 			t.mu.Unlock()
 		}
@@ -274,6 +285,42 @@ func (t *Traits) current() (sweep, bool) {
 		return t.latest, false
 	}
 	return t.latest, true
+}
+
+// rejectSpikes marks as no return every point that lies more than jump further
+// than both of its neighbours.
+//
+// That is the shape a bounced beam leaves in a sweep: one point well behind the
+// surface its neighbours agree on. It is made invalid rather than shortened,
+// because a consumer that maps the beam as free space out to its end would
+// otherwise carve a hole through the real wall on its way to the ghost.
+//
+// Only further-than-both is rejected. A point nearer than both is a thin real
+// thing, a chair leg or a post, and the first and last points, and any point
+// beside a non-return, have nothing to be compared with and are kept. Every
+// point is judged against the sweep as it arrived, so one rejection cannot
+// make its neighbour look like a spike.
+func rejectSpikes(sw sweep, jump float64) sweep {
+	if jump <= 0 {
+		return sw
+	}
+	n := len(sw.valid)
+	if len(sw.distances) < n {
+		n = len(sw.distances)
+	}
+	valid := make([]bool, len(sw.valid))
+	copy(valid, sw.valid)
+	for i := 1; i < n-1; i++ {
+		if !sw.valid[i-1] || !sw.valid[i] || !sw.valid[i+1] {
+			continue
+		}
+		d := sw.distances
+		if d[i]-d[i-1] > jump && d[i]-d[i+1] > jump {
+			valid[i] = false
+		}
+	}
+	sw.valid = valid
+	return sw
 }
 
 //-------------------------------------The services
