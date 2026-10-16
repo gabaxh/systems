@@ -230,6 +230,32 @@ func TestTheWaistSettlesAfterAReversal(t *testing.T) {
 	}
 }
 
+// Full stick, from straight, either way: the effort sits at the ceiling for
+// most of the way, and the joint stops at the target the loop aims for, inside
+// the limit, rather than being carried through it.
+func TestFullLockStaysInsideTheLimit(t *testing.T) {
+	cfg := artitraxWaist()
+	lock := cfg.targetLimitDegrees()
+	for _, side := range []float64{1, -1} {
+		w := newSimWaist(cfg)
+		trace := steerTo(t, w, side*(cfg.LimitDegrees+10), 12)
+		furthest := 0.0
+		for _, deg := range trace {
+			furthest = math.Max(furthest, side*deg)
+		}
+		worst, crossings := swing(trace, side*lock, 6*50)
+		t.Logf("full lock to the %s: furthest %.2f°, then within %.2f° of %.0f°, crossing it %d times",
+			sideName(int(side)), furthest, worst, side*lock, crossings)
+		if furthest >= cfg.LimitDegrees {
+			t.Errorf("full lock to the %s reached %.2f°, past the %.0f° limit", sideName(int(side)), furthest, cfg.LimitDegrees)
+		}
+		if worst > 1 || crossings > 2 {
+			t.Errorf("full lock to the %s: within %.2f° of %.0f°, crossing %d times; want within 1° and settled",
+				sideName(int(side)), worst, side*lock, crossings)
+		}
+	}
+}
+
 // The integral finds the breakaway the P loop needed a measured minimum
 // effort for: 22%, as on the vehicle on 1 October 2026, is more than the gain
 // asks for a few degrees from the target.

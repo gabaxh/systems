@@ -298,7 +298,7 @@ near its target, and does nothing there.
 holding:  effort 0, integral 0
           → moving, once the joint would rest more than holdDegrees from the target
 moving:   effort = kp·e + ki·∫e dt, one way only, up to the ceiling,
-          the integral starting from 0.9·breakawayPercent
+          the integral starting from 0.9·breakawayPercent, frozen at the ceiling
           → holding, once the joint would rest within settleDegrees of the target, or past it
 ```
 
@@ -317,13 +317,20 @@ filter the wheels use ([the wheels follow the joint](#the-wheels-follow-the-join
   was two seconds, which felt like steering through treacle.
 - **A move pushes one way only.** A push that turned into a push the other way
   would take up the slack both ways.
+- **At the ceiling the integral is frozen.** While the effort is at
+  `maxEffortPercent` the integral neither learns nor is discarded, even when
+  the gain alone is past the ceiling. Until 16 October 2026 it was clamped to
+  the headroom instead: it grew into whatever the gain left as the joint
+  closed in, and a big step threw it away.
 - **A move ends before the joint gets there.** The motor and the joint coast
   once let go, and the loop lets go `coastSeconds` of their rate early.
 
 **The loop aims inside the limit.** The target is never past
 `limitDegrees − limitMarginDegrees`, so at full stick the guard never cuts the
 loop off. `curvatureLimit`, and the tightest turn in the start-up log, are for
-that angle. Set the gamer's `maxCurvature` to it.
+that angle. Set the gamer's `maxCurvature` to it. Should the joint pass
+`limitDegrees` all the same, either way, the integral is zeroed as it gets
+there (`waist reached its limit on the left: integral reset`).
 
 Every start and end of a move is logged (`waist moving left: …`,
 `waist holding: …`). A loop that has settled says nothing, and one that

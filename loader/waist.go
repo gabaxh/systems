@@ -36,7 +36,8 @@ import (
 //   - no fresh reading from the waist sensor, no steering at all;
 //   - beyond the limit, no effort that pushes further out, and none until the
 //     joint is back inside by a margin; effort back towards straight is always
-//     allowed;
+//     allowed; and the angle loop's integral is forgotten as the limit is
+//     reached;
 //   - while nobody has said which way the motor turns the joint, no effort at
 //     all beyond the limit, since "back" is not known;
 //   - a watchdog on the effort and the angle together: effort held and the
@@ -319,7 +320,7 @@ type waistState struct {
 
 	// held is the side whose limit the joint has reached, 1 left or -1 right,
 	// and 0 once it is back inside by the margin. Outward effort on that side
-	// is refused until then.
+	// is refused until then. Set, it zeroes the angle loop's integral.
 	held int
 
 	// The angle loop: the way it is moving the joint, 1 left or -1 right, and
@@ -380,9 +381,13 @@ func (s *waistState) guard(effort float64, raw int, fresh bool) (float64, string
 }
 
 // latch notes the side whose limit the joint has passed, and lets go only once
-// the joint is back inside it by the margin.
+// the joint is back inside it by the margin. Reaching the limit also forgets
+// the angle loop's integral: what it learned was a push to here.
 func (s *waistState) latch(raw int) {
 	if side := s.cfg.beyond(raw); side != 0 {
+		if side != s.held {
+			s.integral = 0
+		}
 		s.held = side
 		return
 	}
@@ -465,6 +470,12 @@ const settleWait = time.Second
 // centred: the integral wound up to the breakaway, a motor that has broken away
 // keeps turning on less, so the joint lurched past its target, and the
 // integral, still loaded, carried it on.
+//
+// At the ceiling the integral is frozen. Until 16 October 2026 it was clamped
+// to the ceiling's headroom instead: as the joint closed in and the gain's share
+// fell, the integral grew into what the gain left, and kept the effort at the
+// ceiling for as long as it could keep up; and a target far enough off for the
+// gain alone to reach the ceiling discarded it altogether.
 func (s *waistState) anglePI(target, measured float64, at time.Time) float64 {
 	c := s.cfg
 	dt := 0.0
@@ -507,7 +518,13 @@ func (s *waistState) anglePI(target, measured float64, at time.Time) float64 {
 		s.moving, s.integral, s.letGo = 0, 0, at
 		return 0
 	}
-	pushing := math.Max(0, math.Min(c.MaxEffortPercent-dir*p, dir*s.integral+c.IntegralPercentPerDegreeSecond*dir*err*dt))
+	pushing := dir * s.integral
+	if dir*p+pushing < c.MaxEffortPercent {
+		// Below the ceiling: learn, but no further than the ceiling.
+		pushing = math.Min(c.MaxEffortPercent-dir*p, pushing+c.IntegralPercentPerDegreeSecond*dir*err*dt)
+	}
+	// At the ceiling the integral is frozen: neither learned nor discarded.
+	pushing = math.Max(0, pushing)
 	s.integral = dir * pushing
 	return dir * math.Max(0, math.Min(c.MaxEffortPercent, dir*p+pushing))
 }
