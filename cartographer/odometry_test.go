@@ -288,3 +288,36 @@ func TestTheWheelsCarryTheMapDownACorridor(t *testing.T) {
 	t.Logf("with wheels: x=%.3f (driven %.3f); without: x=%.3f, %d sweeps refused",
 		got.x, driven, blind.at.x, blind.degenerate)
 }
+
+// A right wheel that reports a little short makes the wheels believe in a
+// steady right turn: on the Artitrax five millimetres of tyre was a third of a
+// degree every metre. Down a corridor the walls know better, and with
+// headingFromWalls the map must keep its heading while the wheels drift.
+func TestWallsHoldTheHeadingAgainstUnevenWheels(t *testing.T) {
+	drive := func(fromWalls bool) float64 {
+		const step = 0.07
+		var left, right float64 = 57.3, 57.3
+		tr := mappingTraits(func() (wheelSample, wheelSample, error) {
+			now := time.Now()
+			return wheelSample{left, now}, wheelSample{right, now}, nil
+		})
+		tr.cfg.HeadingFromWalls = &fromWalls
+		truth := pose{x: 2}
+		start := time.Now()
+		for i := 0; i <= 30; i++ {
+			tr.consume(scanAt(truth, start.Add(time.Duration(i)*200*time.Millisecond)))
+			truth.x += step
+			left += step
+			right += step * 0.98 // the right wheel reports 2 % short
+		}
+		return math.Abs(wrapAngle(tr.at.theta)) * 180 / math.Pi
+	}
+	on, off := drive(true), drive(false)
+	t.Logf("heading error after 2.1 m: %.2f° from the walls, %.2f° from the wheels alone", on, off)
+	if on > 1 {
+		t.Errorf("with the walls the heading drifted %.2f°, want <= 1", on)
+	}
+	if off < on+1 {
+		t.Errorf("without the walls the heading drifted only %.2f°; the test does not exercise the fix", off)
+	}
+}
