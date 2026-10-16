@@ -63,9 +63,18 @@ type CartographerConfig struct {
 
 	Search SearchConfig `json:"search"`
 
+	// HeadingFromWalls lets the walls set the heading where they fix it but
+	// not the position, as down a corridor; the wheels then supply only how
+	// far the vehicle went. Absent means on. Off is there to compare maps.
+	HeadingFromWalls *bool `json:"headingFromWalls,omitempty"`
+
 	// Odometry is the loader's wheel encoders, turned into motion between
 	// sweeps. See odometry.go.
 	Odometry OdometryConfig `json:"odometry"`
+}
+
+func (c CartographerConfig) headingFromWalls() bool {
+	return c.HeadingFromWalls == nil || *c.HeadingFromWalls
 }
 
 // Traits holds the map and everything that changes it.
@@ -98,6 +107,7 @@ type Traits struct {
 	lastSweep      time.Time
 	integrated     int
 	degenerate     int
+	wallHeadings   int // sweeps whose heading came from the walls, position from the wheels
 	failures       int
 	usingOdometry  bool
 }
@@ -162,6 +172,7 @@ func initTemplate() *components.UnitAsset {
 			PGMPath:          "map.pgm",
 			PGMIntervalS:     10,
 			Search:           defaultSearch(),
+			HeadingFromWalls: &on,
 			Odometry:         defaultOdometry(),
 		},
 	}
@@ -480,8 +491,25 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 				// The view cannot pin the vehicle down, so the matcher cannot
 				// improve on odometry and trying makes it worse: it would slide
 				// the pose along whichever direction the map is indifferent to.
-				// Take the odometry and leave it alone.
+				// Take the odometry's position and leave it alone.
 				at = prior
+				// The heading is another matter. Parallel walls say nothing
+				// about how far along them the vehicle is, but exactly which
+				// way it faces, and the wheels are worst at precisely that: a
+				// few millimetres of tyre or a moment of slip is a turn that
+				// never happened, and it bends every wall drawn after it. So
+				// where the walls fix the heading they set it, and the wheels
+				// keep only what the walls cannot see.
+				if m.headingSharp && t.cfg.headingFromWalls() {
+					at.theta = m.at.theta
+					t.mu.Lock()
+					t.wallHeadings++
+					n := t.wallHeadings
+					t.mu.Unlock()
+					if n == 1 || n%500 == 0 {
+						log.Printf("cartographer: in a corridor — heading from the walls, position from the wheels (%d sweeps)", n)
+					}
+				}
 			} else {
 				// Nothing to fall back on. Refusing to map is the honest
 				// answer: a corridor mapped from a pose that cannot be known

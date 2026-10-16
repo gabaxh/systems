@@ -137,6 +137,41 @@ func TestMatcherTracksWithOdometry(t *testing.T) {
 	}
 }
 
+// A corridor cannot say how far along it a sweep was taken, but it says
+// exactly which way the sensor faced. The matcher must report the two apart,
+// and get the heading right from a prior that is wrong by two degrees.
+func TestCorridorFixesTheHeading(t *testing.T) {
+	g := newGrid(40, 40, 0.05)
+	g.matchRange = 10
+	truth := pose{x: 2}
+	a, d, v := sweepFrom(truth, 200, 200)
+	g.integrate(truth, a, d, v)
+
+	truth.x += 0.07
+	a, d, v = sweepFrom(truth, 200, 200)
+	m := g.match(pose{2.07, 0, 2 * math.Pi / 180}, a, d, v, defaultSearch())
+
+	if m.sharp {
+		t.Error("the corridor was called a full fix; it cannot say how far along it the sweep was taken")
+	}
+	if !m.headingSharp {
+		t.Fatal("the corridor's walls were not trusted for the heading")
+	}
+	if e := math.Abs(wrapAngle(m.at.theta-truth.theta)) * 180 / math.Pi; e > 0.5 {
+		t.Errorf("heading error %.2f° from a prior 2° off, want <= 0.5", e)
+	}
+}
+
+// With nothing on the map there is nothing to be sure of, heading included.
+func TestAnEmptyMapFixesNothing(t *testing.T) {
+	g := newGrid(40, 40, 0.05)
+	a, d, v := sweepFrom(pose{x: 2}, 200, 200)
+	m := g.match(pose{x: 2}, a, d, v, defaultSearch())
+	if m.sharp || m.headingSharp {
+		t.Errorf("an empty map reported sharp=%v headingSharp=%v", m.sharp, m.headingSharp)
+	}
+}
+
 // A turn is constrained by the walls even in a corridor, so the matcher must
 // get it right on its own.
 func TestScanMatcherFollowsATurn(t *testing.T) {
