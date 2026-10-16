@@ -92,8 +92,14 @@ and it is a property of the geometry, not a defect to be tuned away.
 So the matcher probes its own answer: it nudges the winning pose and asks
 whether the score actually falls. A flat peak is reported as flat, and then:
 
-- **with odometry**, the odometry is taken as the pose and the matcher is not
-  allowed to slide it along the direction the map is indifferent to;
+- **with odometry**, the odometry's position is taken and the matcher is not
+  allowed to slide it along the direction the map is indifferent to. The
+  **heading** is a separate question: parallel walls fix it even when they
+  cannot fix the position, so where the turning probes show a clear peak the
+  walls set the heading and the wheels supply only how far the vehicle went.
+  The wheels are worst at heading — a few millimetres of tyre or a moment of
+  slip is a turn that never happened — and left to them it bends every wall
+  drawn after it. `"headingFromWalls": false` turns this off, to compare maps;
 - **without odometry**, the sweep is *not* integrated at all, and the system
   says so. A corridor mapped from a pose that cannot be known comes out the
   wrong length and looks entirely convincing.

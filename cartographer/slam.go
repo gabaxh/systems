@@ -301,6 +301,13 @@ type matchResult struct {
 	at    pose
 	score float64
 	sharp bool
+
+	// headingSharp is the heading alone. In a corridor the walls cannot say
+	// how far along it the sweep was taken, but they say exactly which way the
+	// sensor was facing: turn it a few degrees and the long walls no longer
+	// line up. Sliding along parallel walls does not change their angle, so
+	// the heading of a match that slid is still the heading.
+	headingSharp bool
 }
 
 // probeDistance and probeAngle are how far the peak is nudged to see whether it
@@ -343,36 +350,37 @@ func (g *grid) match(prior pose, angles, distances []float64, valid []bool, cfg 
 	coarse, _ := search(prior, cfg.CoarseStep, cfg.SearchRange, cfg.CoarseAngle, cfg.AngleRange, cfg.CoarseStride)
 	best, bestScore := search(coarse, cfg.FineStep, cfg.CoarseStep, cfg.FineAngle, cfg.CoarseAngle, 1)
 
-	return matchResult{at: best, score: bestScore, sharp: g.isSharp(best, bestScore, angles, distances, valid)}
+	position, heading := g.sharpness(best, bestScore, angles, distances, valid)
+	return matchResult{at: best, score: bestScore, sharp: position && heading, headingSharp: heading}
 }
 
-// isSharp nudges the winning pose in six directions and asks whether the score
-// actually falls. If the map is happy to put the sweep a hand's breadth away in
-// some direction, then it does not know where the sweep was taken from in that
+// sharpness nudges the winning pose in six directions and asks whether the
+// score actually falls: four nudges in position and two in heading, answered
+// apart. If the map is happy to put the sweep a hand's breadth away in some
+// direction, then it does not know where the sweep was taken from in that
 // direction, whatever the best score says.
 //
 // This is the aperture problem, and it is not a defect to be tuned away: two
 // parallel walls genuinely say nothing about how far along them you are. The
 // answer is odometry, which is why this system consumes a pose service when one
-// exists. What it must never do is invent the missing degree of freedom.
-func (g *grid) isSharp(best pose, bestScore float64, angles, distances []float64, valid []bool) bool {
+// exists. What it must never do is invent the missing degree of freedom. Nor,
+// though, should it throw away the one the walls do fix: in that same corridor
+// a turn of three degrees takes every wall off the map, and the heading is
+// known even where the position is not.
+func (g *grid) sharpness(best pose, bestScore float64, angles, distances []float64, valid []bool) (position, heading bool) {
 	if bestScore <= 0 {
-		return false
+		return false, false
 	}
-	probes := []pose{
-		{best.x + probeDistance, best.y, best.theta},
-		{best.x - probeDistance, best.y, best.theta},
-		{best.x, best.y + probeDistance, best.theta},
-		{best.x, best.y - probeDistance, best.theta},
-		{best.x, best.y, best.theta + probeAngle},
-		{best.x, best.y, best.theta - probeAngle},
+	drops := func(p pose) bool {
+		return g.score(p, angles, distances, valid, 1) < sharpRatio*bestScore
 	}
-	for _, p := range probes {
-		if g.score(p, angles, distances, valid, 1) >= sharpRatio*bestScore {
-			return false
-		}
-	}
-	return true
+	position = drops(pose{best.x + probeDistance, best.y, best.theta}) &&
+		drops(pose{best.x - probeDistance, best.y, best.theta}) &&
+		drops(pose{best.x, best.y + probeDistance, best.theta}) &&
+		drops(pose{best.x, best.y - probeDistance, best.theta})
+	heading = drops(pose{best.x, best.y, best.theta + probeAngle}) &&
+		drops(pose{best.x, best.y, best.theta - probeAngle})
+	return position, heading
 }
 
 // SearchConfig is the scan matcher's window, exposed because the right values
