@@ -12,6 +12,7 @@
  *
  * Contributors:
  *   Jan A. van Deventer, Luleå - initial implementation
+ *   Simon Pergel, Luleå - one circumference per wheel
  ***************************************************************************SDG*/
 
 package main
@@ -55,10 +56,10 @@ type Geometry struct {
 	WheelCircumference float64 `json:"wheelCircumferenceMetres"`
 
 	// PerWheel is each wheel's own rolling circumference, where it differs
-	// from WheelCircumference. Tyres that look alike are not: on the Artitrax
-	// they measured 1.335 to 1.345 m. Five millimetres between the two front
+	// from WheelCircumference. Tires that look alike are not: on the Artitrax
+	// they measured 1.335 to 1.345 m. Five millimeters between the two front
 	// wheels is read by the cartographer as a third of a degree of turn every
-	// metre, which bends a straight wall. A wheel left out, or zero, takes
+	// meter, which bends a straight wall. A wheel left out, or zero, takes
 	// WheelCircumference.
 	PerWheel *WheelCircumferences `json:"perWheelCircumferenceMetres,omitempty"`
 }
@@ -90,19 +91,19 @@ func (g Geometry) circumferenceAt(pos int) float64 {
 }
 
 // maxCircumferenceSpread is how far a wheel's own circumference may be from
-// the shared one. Real tyres differ by a percent or so; a value ten percent
-// out is a typing error, most likely centimetres for metres, and would set
+// the shared one. Real tires differ by a percent or so; a value ten percent
+// out is a typing error, most likely centimeters for meters, and would set
 // that wheel's speed a hundred times wrong.
 const maxCircumferenceSpread = 0.10
 
-// checkCircumferences refuses per-wheel circumferences that cannot be a tyre.
+// checkCircumferences refuses per-wheel circumferences that cannot be a tire.
 func (g Geometry) checkCircumferences() error {
 	names := [4]string{frontLeft: "frontLeft", frontRight: "frontRight", backLeft: "backLeft", backRight: "backRight"}
 	for pos, name := range names {
 		c := g.circumferenceAt(pos)
 		if math.Abs(c-g.WheelCircumference) > maxCircumferenceSpread*g.WheelCircumference {
 			return fmt.Errorf("geometry.perWheelCircumferenceMetres.%s is %v m, more than %.0f%% from "+
-				"wheelCircumferenceMetres (%v m); circumferences are in metres",
+				"wheelCircumferenceMetres (%v m); circumferences are in meters",
 				name, c, maxCircumferenceSpread*100, g.WheelCircumference)
 		}
 	}

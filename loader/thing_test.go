@@ -391,7 +391,6 @@ func TestWhatIsNotAStall(t *testing.T) {
 		}
 	}
 }
-
 // The encoders are numbered by motor node and the kinematics by axle and side.
 // A wheel's circumference must follow the motor list, not assume they agree.
 func TestCircumferenceOfNodeFollowsTheMotorList(t *testing.T) {

@@ -488,6 +488,12 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 			log.Printf("loader: waist.%s is gone and ignored — see the README's angle loop%s", k, hint)
 		}
 	}
+	if err := cfg.Geometry.checkCircumferences(); err != nil {
+		log.Fatalf("loader: %v", err)
+	}
+	log.Printf("loader: wheel circumferences %.4f / %.4f m front, %.4f / %.4f m back (left / right)",
+		cfg.Geometry.circumferenceAt(frontLeft), cfg.Geometry.circumferenceAt(frontRight),
+		cfg.Geometry.circumferenceAt(backLeft), cfg.Geometry.circumferenceAt(backRight))
 
 	fd, err := openCAN(cfg.Interface)
 	if err != nil {
@@ -1380,4 +1386,26 @@ func (t *Traits) waistService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	usecases.HTTPProcessGetRequest(w, r, waistForm(raw, at))
+}
+
+func (t *Traits) vehicleTravel(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method is not supported.", http.StatusNotFound)
+		return
+	}
+	var readingsum wheelReading
+	for i := 0; i <= 3; i++ {
+		reading, fresh := t.dt.fb.wheel(i)
+		readingsum.rpm = readingsum.rpm + reading.rpm
+		readingsum.revolutions = readingsum.revolutions + reading.revolutions
+		readingsum.at = reading.at
+
+		if !fresh {
+			http.Error(w, "no recent encoder frame for one of the wheels", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	readingsum.rpm = readingsum.rpm / 4
+	readingsum.revolutions = readingsum.revolutions / 4
+	usecases.HTTPProcessGetRequest(w, r, travelForm(readingsum))
 }
