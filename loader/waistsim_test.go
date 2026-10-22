@@ -230,6 +230,48 @@ func TestTheWaistSettlesAfterAReversal(t *testing.T) {
 	}
 }
 
+// The pad on 22 October 2026: the stick to the left, and swept across to the
+// right while the joint is still swinging left. The push to the right starts
+// as the sweep does, not a second later once the joint has come to rest, and
+// the joint settles on the new side.
+func TestASweptStickIsFollowedAtOnce(t *testing.T) {
+	const sweepFrom, sweepFor = 0.8, 0.4 // seconds
+	w := newSimWaist(artitraxWaist())
+	trace, efforts := steerThrough(t, w, func(s float64) float64 {
+		switch {
+		case s < sweepFrom:
+			return 40
+		case s < sweepFrom+sweepFor:
+			return 40 - 80*(s-sweepFrom)/sweepFor
+		}
+		return -40
+	}, 10)
+	start := int(sweepFrom * 50)
+	if trace[start] < 10 || efforts[start-1] <= 0 {
+		t.Fatalf("at the sweep the joint is at %.1f° with effort %.0f%%; want it swinging left", trace[start], efforts[start-1])
+	}
+	right := -1
+	for i := start; i < len(efforts); i++ {
+		if efforts[i] < 0 {
+			right = i
+			break
+		}
+	}
+	if right < 0 {
+		t.Fatal("never pushed to the right")
+	}
+	after := float64(right-start) / 50
+	worst, crossings := swing(trace, -40, 6*50)
+	t.Logf("pushing right %.2f s into the sweep; then within %.2f° of -40°, crossing it %d times", after, worst, crossings)
+	if after > sweepFor {
+		t.Errorf("the push to the right began %.2f s into a %.1f s sweep; want during it", after, sweepFor)
+	}
+	if worst > 1 || crossings > 2 {
+		t.Errorf("after the sweep the joint wandered %.2f° from -40° and crossed it %d times; want within 1° and settled",
+			worst, crossings)
+	}
+}
+
 // Full stick, from straight, either way: the effort sits at the ceiling for
 // most of the way, and the joint stops at the target the loop aims for, inside
 // the limit, rather than being carried through it.

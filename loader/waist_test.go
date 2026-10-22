@@ -385,6 +385,26 @@ func TestTheLimitResetsTheIntegral(t *testing.T) {
 	}
 }
 
+// Just let go and still coasting, the joint is left to come to rest, for the
+// target it was let go at; a target that has moved since ends the wait at once.
+func TestANewTargetEndsTheSettleWait(t *testing.T) {
+	s := newWaistState(calibrated())
+	at := time.Unix(1_000_000, 0)
+	ms := func(n int) time.Time { return at.Add(time.Duration(n) * time.Millisecond) }
+	// Let go at 25°, swinging left at 30°/s, the target having fallen behind it.
+	s.joint = jointEstimate{ok: true, at: at, deg: 25, rateDeg: 30}
+	s.letGo, s.letGoTarget = at, 15.7
+	if e := s.anglePI(15.7, 25, ms(20)); e != 0 {
+		t.Errorf("coasting, the target where it was let go: effort %v; want 0, waiting", e)
+	}
+	if e := s.anglePI(15.7+0.5*s.cfg.HoldDegrees, 25, ms(40)); e != 0 {
+		t.Errorf("coasting, the target moved by half holdDegrees: effort %v; want 0, still waiting", e)
+	}
+	if e := s.anglePI(-48, 25, ms(60)); e >= 0 {
+		t.Errorf("the stick to full right while coasting left: effort %v; want a push to the right now", e)
+	}
+}
+
 // A refusal by the guard resets the integral: it must not wind up against it.
 func TestARefusalResetsTheAngleLoop(t *testing.T) {
 	d, _, _ := drivingDrivetrain(t, calibrated())

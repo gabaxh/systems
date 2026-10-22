@@ -326,11 +326,13 @@ type waistState struct {
 	// The angle loop: the way it is moving the joint, 1 left or -1 right, and
 	// 0 while it holds; its integral, in percent of effort; and the time of the
 	// reading it last learned from: it learns once per reading, not per cycle.
-	// letGo is when it last let go, until the joint has come to rest.
-	moving   int
-	integral float64
-	piAt     time.Time
-	letGo    time.Time
+	// letGo is when it last let go, until the joint has come to rest, and
+	// letGoTarget the target it was then.
+	moving      int
+	integral    float64
+	piAt        time.Time
+	letGo       time.Time
+	letGoTarget float64
 
 	// joint is the angle and rate the wheels are set from.
 	joint jointEstimate
@@ -441,6 +443,13 @@ const breakawayPreload = 0.9
 // settleWait is the longest the angle loop waits, after letting go, for the
 // joint to come to rest: a joint still moving after that is being moved by
 // something else, the tyres or the wheels, and the loop takes it on.
+//
+// The wait is for the target the loop let go at. A target that has since moved
+// by more than HoldDegrees ends it: on 22 October 2026, swinging the stick from
+// one side to the other standing on the ground, every reversal waited the full
+// second — the joint, just let go at 30°/s, was still coasting — with the
+// target already 70° away on the other side, and the waist answered the stick
+// a second and a half late.
 const settleWait = time.Second
 
 // anglePI is the angle loop: the effort, in percent with positive to the
@@ -494,9 +503,10 @@ func (s *waistState) anglePI(target, measured float64, at time.Time) float64 {
 	if s.moving == 0 {
 		// Just let go, the joint is left to come to rest before it is judged:
 		// coasting, it is neither where it will stop nor anything the loop can
-		// help, and a push back would only take up the chain's slack.
+		// help, and a push back would only take up the chain's slack. Unless
+		// the pilot has asked for somewhere else since.
 		if !s.letGo.IsZero() {
-			if rate != 0 && at.Sub(s.letGo) < settleWait {
+			if rate != 0 && at.Sub(s.letGo) < settleWait && math.Abs(target-s.letGoTarget) <= c.HoldDegrees {
 				return 0
 			}
 			s.letGo = time.Time{}
@@ -515,7 +525,7 @@ func (s *waistState) anglePI(target, measured float64, at time.Time) float64 {
 	// joint will come to rest if let go now, CoastSeconds of its rate on.
 	dir := float64(s.moving)
 	if dir*(err-rate*c.CoastSeconds) <= c.SettleDegrees {
-		s.moving, s.integral, s.letGo = 0, 0, at
+		s.moving, s.integral, s.letGo, s.letGoTarget = 0, 0, at, target
 		return 0
 	}
 	pushing := dir * s.integral
