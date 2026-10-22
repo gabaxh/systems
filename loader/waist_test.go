@@ -339,6 +339,52 @@ func TestAngleLoopIntegral(t *testing.T) {
 	}
 }
 
+// At the ceiling the integral is frozen: it neither learns nor is discarded,
+// and learns again once the effort is back below the ceiling.
+func TestAngleLoopFreezesAtTheCeiling(t *testing.T) {
+	s := newWaistState(calibrated()) // kp 4, ki 4, ceiling 50%, no breakaway set
+	at := time.Unix(1_000_000, 0)
+	ms := func(n int) time.Time { return at.Add(time.Duration(n) * time.Millisecond) }
+	s.anglePI(5, 0, at)
+	s.integral = 30
+	if e := s.anglePI(5, 0, ms(20)); e != 50 || s.integral != 30 {
+		t.Errorf("5° off with 30 learned, at the ceiling: effort %v, integral %v; want 50 and 30, frozen", e, s.integral)
+	}
+	if e := s.anglePI(20, 0, ms(40)); e != 50 || s.integral != 30 {
+		t.Errorf("the target 20° off, the gain alone past the ceiling: effort %v, integral %v; want 50 and 30, not discarded", e, s.integral)
+	}
+	e := s.anglePI(20, 17, ms(60))
+	if want := 30 + 4*3*0.02; math.Abs(s.integral-want) > 1e-9 || math.Abs(e-(12+want)) > 1e-9 {
+		t.Errorf("3° off, below the ceiling: effort %v, integral %v; want %v and %v, learning again", e, s.integral, 12+want, want)
+	}
+}
+
+// Reaching the limit, on either side, forgets the integral: once, as the limit
+// is reached, not on every reading past it.
+func TestTheLimitResetsTheIntegral(t *testing.T) {
+	s := newWaistState(calibrated())
+	const pastLeft, pastRight = 40, 860
+	s.moving, s.integral = 1, 20
+	s.guard(0, 450, true)
+	if s.integral != 20 {
+		t.Fatalf("inside the limit the integral went to %v", s.integral)
+	}
+	s.guard(0, pastLeft, true)
+	if s.integral != 0 {
+		t.Errorf("reaching the left limit left the integral at %v", s.integral)
+	}
+	s.integral = 5
+	s.guard(0, pastLeft, true)
+	if s.integral != 5 {
+		t.Errorf("a second reading past the left limit reset the integral again, to %v", s.integral)
+	}
+	s.moving, s.integral = -1, -20
+	s.guard(0, pastRight, true)
+	if s.integral != 0 {
+		t.Errorf("reaching the right limit left the integral at %v", s.integral)
+	}
+}
+
 // A refusal by the guard resets the integral: it must not wind up against it.
 func TestARefusalResetsTheAngleLoop(t *testing.T) {
 	d, _, _ := drivingDrivetrain(t, calibrated())

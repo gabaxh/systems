@@ -895,7 +895,13 @@ func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh
 	} else {
 		d.waist.resetPI()
 	}
+	wasHeld := d.waist.held
 	allowed, why := d.waist.guard(effort, raw, fresh)
+	if held := d.waist.held; held != 0 && held != wasHeld {
+		if msg := "waist reached its limit on the " + sideName(held) + ": integral reset"; d.waist.every(msg, 2*time.Second, now) {
+			log.Printf("loader: %s", msg)
+		}
+	}
 	if allowed != effort {
 		d.last[m.NodeID] = 0
 		d.waist.resetPI()
