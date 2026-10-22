@@ -500,6 +500,11 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		log.Fatalf("loader: cannot open %s: %v", cfg.Interface, err)
 	}
 	log.Printf("loader: opened %s", cfg.Interface)
+	// The command socket only writes. Unfiltered, the kernel would queue every
+	// frame on the bus for it, and nobody would ever read them.
+	if err := filterCAN(fd); err != nil {
+		log.Printf("loader: cannot filter the command socket on %s: %v", cfg.Interface, err)
+	}
 
 	configured := usecases.MakeServiceMap(configuredAsset.Services)
 	for _, name := range vehicleServices {
@@ -539,6 +544,15 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		closeCAN(fd)
 		log.Fatalf("loader: cannot open %s for encoder feedback: %v", cfg.Interface, err)
 	}
+	// Only the encoders' frames, not the motor commands the other socket sends,
+	// which the kernel loops back to this one five hundred times a second.
+	encoderIDs := make([]uint32, encoderCount)
+	for i := range encoderIDs {
+		encoderIDs[i] = uint32(encoderBaseID + i)
+	}
+	if err := filterCAN(encFd, encoderIDs...); err != nil {
+		log.Printf("loader: cannot filter the encoder socket on %s: %v", cfg.Interface, err)
+	}
 	configureEncoders(encFd, true)
 	go dt.fb.listenEncoders(sys.Ctx, encFd)
 	go dt.fb.superviseEncoders(sys.Ctx, encFd)
@@ -550,6 +564,11 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 			log.Printf("loader: no waist angle sensor on %s (%v) — the waist service will report unavailable", cfg.SensorInterface, err)
 			waistFd = -1
 		} else {
+			// Only the sensor's answers; pollOnce discards anything else that
+			// gets through, but a frame that never queues costs nothing.
+			if err := filterCAN(waistFd, waistReplyID); err != nil {
+				log.Printf("loader: cannot filter the waist sensor socket on %s: %v", cfg.SensorInterface, err)
+			}
 			go dt.fb.pollWaist(sys.Ctx, waistFd, time.Second/time.Duration(cfg.WaistPollHz))
 		}
 	}

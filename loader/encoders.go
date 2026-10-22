@@ -27,6 +27,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -251,40 +252,89 @@ func (fb *feedback) unwrapLocked(i int, r wheelReading) wheelReading {
 	return r
 }
 
+// waistReplyTimeout is how long a poll waits for the sensor's answer.
+const waistReplyTimeout = 200 * time.Millisecond
+
 // pollWaist asks the articulation sensor for its angle and records the answer.
 func (fb *feedback) pollWaist(ctx context.Context, fd int, period time.Duration) {
 	tick := time.NewTicker(period)
 	defer tick.Stop()
+	var reported time.Time
+	discarded := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
 		}
-		if err := sendCAN(fd, waistPollID, nil); err != nil {
-			log.Printf("loader: cannot poll the waist sensor: %v", err)
-			continue
+		raw, at, n, err := pollOnce(
+			func() error { return sendCAN(fd, waistPollID, nil) },
+			func(timeout time.Duration) (canFrame, error) { return recvCAN(fd, timeout) },
+			func() int { return drainCAN(fd) },
+			waistReplyTimeout)
+		// Said at once the first time, then at most every five seconds: frames
+		// to discard mean something else is talking on can1, or the sensor
+		// answers late or more than once, and either is worth knowing.
+		if discarded += n; discarded > 0 && time.Since(reported) >= 5*time.Second {
+			log.Printf("loader: waist sensor: discarded %d stale or stray frame(s) around its polls", discarded)
+			reported, discarded = time.Now(), 0
 		}
-		f, err := recvCAN(fd, 200*time.Millisecond)
 		if err != nil {
 			if !errors.Is(err, errCANTimeout) {
-				log.Printf("loader: waist sensor read failed: %v", err)
+				log.Printf("loader: waist sensor: %v", err)
 			}
 			fb.mu.Lock()
 			fb.waistFresh = false
 			fb.mu.Unlock()
 			continue
 		}
-		if f.ID != waistReplyID || f.DLC < 2 {
-			continue
-		}
-		raw, at := int(f.Data[0]&0x03)<<8|int(f.Data[1]), time.Now()
 		fb.mu.Lock()
 		fb.waistRaw, fb.waistAt, fb.waistFresh = raw, at, true
 		fb.mu.Unlock()
 		if fb.onWaist != nil {
 			fb.onWaist(raw, at)
 		}
+	}
+}
+
+// pollOnce is one question to the waist sensor and its answer: the raw count,
+// when it arrived, and how many other frames were thrown away on the way.
+//
+// The socket is a queue, and until 21 October 2026 each poll took whatever was
+// at its head. One frame more than one per poll — an answer that came after
+// the timeout, a frame the sensor sent unasked, a second poller on the bus —
+// stayed in the queue for good, and every poll after it read an older answer
+// than the one it had asked for. Nothing drained it, so the lag only grew, a
+// poll period per extra frame, until the socket's buffer was full; and each
+// old answer was stamped with the time it was read, so it passed every test
+// of freshness. The steering followed an angle seconds old, and the wheels,
+// set from the same angle, held the joint where it had been.
+//
+// So the queue is emptied before asking, and only an answer, received after
+// asking and within timeout of it, is taken as one. An answer to the previous
+// poll arriving between the drain and the poll can still be taken for this
+// one, which is a period old at worst and does not accumulate.
+func pollOnce(send func() error, recv func(time.Duration) (canFrame, error), drain func() int,
+	timeout time.Duration) (raw int, at time.Time, discarded int, err error) {
+	discarded = drain()
+	if err := send(); err != nil {
+		return 0, time.Time{}, discarded, fmt.Errorf("cannot poll: %w", err)
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, time.Time{}, discarded, errCANTimeout
+		}
+		f, err := recv(remaining)
+		if err != nil {
+			return 0, time.Time{}, discarded, err
+		}
+		if f.ID != waistReplyID || f.DLC < 2 {
+			discarded++
+			continue
+		}
+		return int(f.Data[0]&0x03)<<8 | int(f.Data[1]), time.Now(), discarded, nil
 	}
 }
 
