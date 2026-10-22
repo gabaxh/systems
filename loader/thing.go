@@ -171,6 +171,11 @@ type drivetrain struct {
 	// turning, and the fault it raised, cleared by taking control again.
 	stallSince map[int]time.Time
 	wheelFault string
+
+	// Why the steering was asked for no effort this cycle, if it was not, and
+	// the reversal being followed; see reversal.go.
+	steerWhy string
+	reversal reversalTrace
 }
 
 // Traits is one motor, and what a service handler is given.
@@ -843,6 +848,15 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 			targets[node] = 0
 		}
 	}
+	if hasSteering {
+		wheels := "open loop"
+		if closed {
+			wheels = mode.String()
+		}
+		if line := d.reversal.observe(d.reversalCycleLocked(now, steer, targets, raw, fresh, wheels)); line != "" {
+			log.Printf("loader: %s", line)
+		}
+	}
 	fd := d.fd
 	d.mu.Unlock()
 
@@ -874,8 +888,13 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 // loop that has settled says nothing, and one that hunts says it every second.
 func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh bool, now time.Time) int16 {
 	effort := d.setpoint[m.NodeID]
+	d.steerWhy = ""
+	if effort == 0 && !d.byAngle {
+		d.steerWhy = "no steering setpoint"
+	}
 	if d.byAngle {
 		effort = 0
+		d.steerWhy = "no fresh, calibrated waist reading"
 		if deg, ok := d.articulationLocked(raw, fresh); ok {
 			limit := d.cfg.Waist.targetLimitDegrees() * math.Pi / 180
 			target := d.cfg.Geometry.articulationFor(d.curvature, limit) * 180 / math.Pi
@@ -888,6 +907,14 @@ func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh
 				} else {
 					log.Printf("loader: waist holding: target %.1f°, at %.1f°, %.1f°/s", target, deg, d.waist.joint.rate())
 				}
+			}
+			switch {
+			case effort != 0:
+				d.steerWhy = ""
+			case !d.waist.letGo.IsZero():
+				d.steerWhy = "settling after the last move"
+			default:
+				d.steerWhy = "holding, within holdDegrees of the target"
 			}
 		} else {
 			d.waist.resetPI()
@@ -903,6 +930,7 @@ func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh
 		}
 	}
 	if allowed != effort {
+		d.steerWhy = why
 		d.last[m.NodeID] = 0
 		d.waist.resetPI()
 		if why != "" && d.waist.every(why, 2*time.Second, now) {
@@ -910,6 +938,37 @@ func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh
 		}
 	}
 	return clampToScale(allowed / 100 * fullScale * d.waist.rawEffortSign())
+}
+
+// reversalCycleLocked is this cycle as the reversal trace sees it: the side
+// the pilot asks for, the steering effort actually sent, and the wheels. Caller
+// holds the lock.
+func (d *drivetrain) reversalCycleLocked(now time.Time, steer MotorSpec, sent map[int]int16, raw int, fresh bool,
+	wheels string) reversalCycle {
+	demand := sign(d.setpoint[steer.NodeID])
+	if d.byAngle {
+		demand = sign(d.curvature)
+	}
+	if d.helm.stopped {
+		demand = 0
+	}
+	c := reversalCycle{
+		now:      now,
+		demand:   demand,
+		effort:   float64(sent[steer.NodeID]) / fullScale * 100 * d.waist.rawEffortSign(),
+		held:     d.steerWhy,
+		raw:      raw,
+		fresh:    fresh,
+		leftward: d.cfg.Waist.leftward(),
+		counts:   d.cfg.Waist.StallCounts,
+		wheels:   wheels,
+	}
+	for _, m := range d.cfg.Motors {
+		if m.Kind == "wheel" {
+			c.wheelPercent = math.Max(c.wheelPercent, math.Abs(float64(sent[m.NodeID]))/fullScale*100)
+		}
+	}
+	return c
 }
 
 // Thresholds of the wheels' watchdog that are not worth configuring: a wheel
