@@ -13,11 +13,12 @@ package main
 // The Livox MID-360 over Ethernet, in pure Go, without the C++ SDK.
 //
 // Written from the Livox SDK2 header livox_lidar_def.h and the MID-360
-// Ethernet protocol page of the Livox wiki, and NOT YET CHECKED AGAINST THE
-// DEVICE. A packet capture settles each point below; until then, a test built
-// from the same reading of the documents cannot catch a misreading of them.
+// Ethernet protocol page of the Livox wiki. A capture of a MID-360 on
+// 2026-10-23, configured by this system, confirmed the points below except
+// where marked; a test built from the same reading of the documents cannot
+// catch a misreading of them, so check any new point against a capture too.
 //
-// From the documents:
+// From the documents, and confirmed on the capture:
 //   - a data packet (points or IMU) has a 36-byte little-endian header:
 //     version u8, length u16, time_interval u16 (0.1 µs), dot_num u16,
 //     udp_cnt u16, frame_cnt u8, data_type u8, time_type u8, 12 reserved
@@ -27,7 +28,7 @@ package main
 //   - time_type 0 is nanoseconds since the device powered on, 1 PTP, 2 GPS;
 //   - a control frame is 0xAA, version 0, length u16 of the whole frame,
 //     seq u32, cmd_id u16, cmd_type u8 (0 request, 1 acknowledgement),
-//     sender_type u8 (0 host), 6 reserved bytes, a CRC-16/CCITT-FALSE of the
+//     sender_type u8 (0 host, 1 the device), 6 reserved bytes, a CRC-16/CCITT-FALSE of the
 //     18 bytes before it, a CRC-32 of the data (0 when there is none), then
 //     the data;
 //   - 0x0100 sets parameters, given as key_num u16, 2 reserved bytes, and
@@ -35,17 +36,18 @@ package main
 //   - key 0x0007 is where the IMU is sent: this computer's IPv4 address, its
 //     port, and the device's own sending port; 0x001C switches the IMU stream
 //     on; 0x001A is the work mode, 0x01 sampling and 0x02 idle;
-//   - the device listens for commands on 56100 and discovery on 56000, and
-//     sends the IMU from 56400.
-//
-// Assumed, and to check on the capture:
+//   - the device listens for commands on 56100 and discovery on 56000 (not
+//     yet seen on a capture), and sends the IMU from 56400;
 //   - an acknowledgement of 0x0100 carries ret_code u8 (0 is success) and the
-//     failing key u16;
+//     failing key u16, 0 when none failed;
+//   - one IMU sample per 60-byte packet, dot_num 1 and time_interval 0, at
+//     200 Hz. Several are still handled, spread over time_interval, in case
+//     dot_num says so.
+//
+// Assumed, and to check on a capture:
 //   - an acknowledgement of discovery carries ret_code u8, dev_type u8, the
 //     serial number in 16 bytes, the device's IPv4 address and its command
 //     port; when it is shorter, the sender's address is used;
-//   - one IMU sample per packet. Several are handled, spread over
-//     time_interval, in case dot_num says so;
 //   - whether the IMU flows when the device is idle (the workMode setting).
 
 import (
@@ -511,10 +513,12 @@ func (s *livoxSource) keepConfigured(ctx context.Context) {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	var lastTry, lastLog time.Time
-	tries := 0 // since the last packet
+	tries := 0    // since the last packet
+	start := true // configure once even if a stream left by an earlier run is already flowing
 	for {
 		since := time.Since(time.Unix(0, s.lastPacket.Load()))
-		if since > quiet && time.Since(lastTry) > retry {
+		if (start || since > quiet) && time.Since(lastTry) > retry {
+			start = false
 			lastTry = time.Now()
 			tries++
 			host, err := s.dev.configure(s.cfg)
