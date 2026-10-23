@@ -177,7 +177,15 @@ Then the acceptance test: turn the vehicle by hand through 360° on the spot.
 | `rateWindowMs` | 50 | what `yawRate` averages over |
 | `staleAfterMs` | 100 | how old the newest sample may be |
 | `maxGapMs` | 50 | the longest hole integrated across |
+| `recordDir` | empty | where to write every raw sample as CSV, one new file per start; empty means off. About 58 MB an hour |
 | `simBiasDegPerSec`, `simNoiseDegPerSec`, `simTiltDegrees` | 0.5, 0.05, 30 | the simulator only |
+| `simScript` | `cycle` | the simulator only: `cycle` turns, rocks and turns back every 27 s; `still` never moves |
+
+The standstill settings above are placeholders. Measure them on the vehicle,
+together with `upVector`, the gyro's noise and its scale, as
+[`gyro_characterization_guide_2026-10-23.md`](gyro_characterization_guide_2026-10-23.md)
+describes. That is step 2 of the gyrodometry proposal. `recordDir` exists for
+it.
 
 Every 30 seconds the system logs how the stream is doing:
 

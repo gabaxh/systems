@@ -93,17 +93,24 @@ type LidarConfig struct {
 	StaleAfterMs int `json:"staleAfterMs"`
 	MaxGapMs     int `json:"maxGapMs"`
 
-	// The simulator only: the gyro's bias on every axis, its noise per sample
-	// and how far the sensor is tilted forward.
+	// RecordDir, when set, is where every raw sample is written as CSV, one
+	// new file per start, for characterizing the gyro. About 58 MB an hour.
+	RecordDir string `json:"recordDir"`
+
+	// The simulator only: the gyro's bias on every axis, its noise per sample,
+	// how far the sensor is tilted forward, and what the vehicle does:
+	// "cycle" turns, rocks and turns back every 27 s; "still" never moves.
 	SimBiasDegPerSec  float64 `json:"simBiasDegPerSec"`
 	SimNoiseDegPerSec float64 `json:"simNoiseDegPerSec"`
 	SimTiltDegrees    float64 `json:"simTiltDegrees"`
+	SimScript         string  `json:"simScript"`
 }
 
 // Traits is the sensor, and what a service handler is given.
 type Traits struct {
 	cfg LidarConfig
 	src source
+	rec *recorder // nil unless recording; collect's own
 
 	mu  sync.RWMutex
 	est *estimator
@@ -182,6 +189,7 @@ func initTemplate() *components.UnitAsset {
 			SimBiasDegPerSec:           0.5,
 			SimNoiseDegPerSec:          0.05,
 			SimTiltDegrees:             30,
+			SimScript:                  "cycle",
 		},
 	}
 }
@@ -210,6 +218,12 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 	}
 
 	t := &Traits{cfg: cfg, src: src, est: est}
+	if cfg.RecordDir != "" {
+		if t.rec, err = newRecorder(cfg.RecordDir, time.Now()); err != nil {
+			log.Fatalf("%s: cannot record: %v", systemName, err)
+		}
+		logf("recording every raw sample to %s", t.rec.path)
+	}
 
 	ch, err := src.samples(sys.Ctx)
 	if err != nil {
@@ -301,14 +315,21 @@ func applyDefaults(cfg *LidarConfig) {
 	if cfg.SimTiltDegrees == 0 {
 		cfg.SimTiltDegrees = 30
 	}
+	if cfg.SimScript == "" {
+		cfg.SimScript = "cycle"
+	}
 }
 
-// collect feeds every sample to the estimator, in order, and says every
-// statusEvery how the stream is doing. Unlike the guetteur's newest sweep,
-// nothing may be skipped here: every sample is part of the integral.
+// collect feeds every sample to the estimator, in order, and to the recorder
+// when there is one, and says every statusEvery how the stream is doing.
+// Unlike the guetteur's newest sweep, nothing may be skipped here: every
+// sample is part of the integral.
 func (t *Traits) collect(ctx context.Context, ch <-chan imuSample) {
 	report := time.NewTicker(statusEvery)
 	defer report.Stop()
+	flush := time.NewTicker(time.Second)
+	defer flush.Stop()
+	defer t.stopRecording(nil)
 	for {
 		select {
 		case <-ctx.Done():
@@ -321,6 +342,17 @@ func (t *Traits) collect(ctx context.Context, ch <-chan imuSample) {
 			t.mu.Lock()
 			t.est.add(s)
 			t.mu.Unlock()
+			if t.rec != nil {
+				if err := t.rec.write(s); err != nil {
+					t.stopRecording(err)
+				}
+			}
+		case <-flush.C:
+			if t.rec != nil {
+				if err := t.rec.flush(); err != nil {
+					t.stopRecording(err)
+				}
+			}
 		case <-report.C:
 			t.mu.RLock()
 			r, e := t.est.reading(), *t.est
@@ -333,6 +365,24 @@ func (t *Traits) collect(ctx context.Context, ch <-chan imuSample) {
 				t.src.status(), state, e.samples, e.stills, e.offBias, e.gaps)
 		}
 	}
+}
+
+// stopRecording closes the recording, saying why if it failed. A full disk
+// ends the recording, never the system.
+func (t *Traits) stopRecording(cause error) {
+	if t.rec == nil {
+		return
+	}
+	err := t.rec.close()
+	if cause != nil {
+		err = cause
+	}
+	if err != nil {
+		logf("recording stopped: %v", err)
+	} else {
+		logf("recording closed: %s", t.rec.path)
+	}
+	t.rec = nil
 }
 
 // current returns the newest reading, or why it must not be used.

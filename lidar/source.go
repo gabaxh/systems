@@ -66,10 +66,18 @@ type simulatedSource struct {
 	out    chan imuSample
 }
 
+// stillScript never moves: a recording of it has a known Allan deviation,
+// white noise only, which tests the analysis end to end.
+var stillScript = []motion{{seconds: 3600}}
+
 func newSimulatedSource(cfg LidarConfig) *simulatedSource {
 	b := radians(cfg.SimBiasDegPerSec)
+	script := defaultScript
+	if cfg.SimScript == "still" {
+		script = stillScript
+	}
 	return &simulatedSource{
-		script: defaultScript,
+		script: script,
 		period: 5 * time.Millisecond, // the MID-360's 200 Hz
 		tilt:   radians(cfg.SimTiltDegrees),
 		bias:   [3]float64{b, -b, b},
@@ -162,6 +170,9 @@ func pitch(v [3]float64, a float64) [3]float64 {
 func newSource(cfg LidarConfig) (source, error) {
 	switch cfg.Source {
 	case "simulated", "":
+		if cfg.SimScript != "cycle" && cfg.SimScript != "still" {
+			return nil, fmt.Errorf("unknown simScript %q: expected \"cycle\" or \"still\"", cfg.SimScript)
+		}
 		return newSimulatedSource(cfg), nil
 	case "livox":
 		return newLivoxSource(cfg)
