@@ -38,6 +38,7 @@ import (
 )
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
