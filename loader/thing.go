@@ -171,6 +171,11 @@ type drivetrain struct {
 	// turning, and the fault it raised, cleared by taking control again.
 	stallSince map[int]time.Time
 	wheelFault string
+
+	// Why the steering was asked for no effort this cycle, if it was not, and
+	// the reversal being followed; see reversal.go.
+	steerWhy string
+	reversal reversalTrace
 }
 
 // Traits is one motor, and what a service handler is given.
@@ -500,6 +505,11 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		log.Fatalf("loader: cannot open %s: %v", cfg.Interface, err)
 	}
 	log.Printf("loader: opened %s", cfg.Interface)
+	// The command socket only writes. Unfiltered, the kernel would queue every
+	// frame on the bus for it, and nobody would ever read them.
+	if err := filterCAN(fd); err != nil {
+		log.Printf("loader: cannot filter the command socket on %s: %v", cfg.Interface, err)
+	}
 
 	configured := usecases.MakeServiceMap(configuredAsset.Services)
 	for _, name := range vehicleServices {
@@ -539,6 +549,15 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		closeCAN(fd)
 		log.Fatalf("loader: cannot open %s for encoder feedback: %v", cfg.Interface, err)
 	}
+	// Only the encoders' frames, not the motor commands the other socket sends,
+	// which the kernel loops back to this one five hundred times a second.
+	encoderIDs := make([]uint32, encoderCount)
+	for i := range encoderIDs {
+		encoderIDs[i] = uint32(encoderBaseID + i)
+	}
+	if err := filterCAN(encFd, encoderIDs...); err != nil {
+		log.Printf("loader: cannot filter the encoder socket on %s: %v", cfg.Interface, err)
+	}
 	configureEncoders(encFd, true)
 	go dt.fb.listenEncoders(sys.Ctx, encFd)
 	go dt.fb.superviseEncoders(sys.Ctx, encFd)
@@ -550,6 +569,11 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 			log.Printf("loader: no waist angle sensor on %s (%v) — the waist service will report unavailable", cfg.SensorInterface, err)
 			waistFd = -1
 		} else {
+			// Only the sensor's answers; pollOnce discards anything else that
+			// gets through, but a frame that never queues costs nothing.
+			if err := filterCAN(waistFd, waistReplyID); err != nil {
+				log.Printf("loader: cannot filter the waist sensor socket on %s: %v", cfg.SensorInterface, err)
+			}
 			go dt.fb.pollWaist(sys.Ctx, waistFd, time.Second/time.Duration(cfg.WaistPollHz))
 		}
 	}
@@ -824,6 +848,15 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 			targets[node] = 0
 		}
 	}
+	if hasSteering {
+		wheels := "open loop"
+		if closed {
+			wheels = mode.String()
+		}
+		if line := d.reversal.observe(d.reversalCycleLocked(now, steer, targets, raw, fresh, wheels)); line != "" {
+			log.Printf("loader: %s", line)
+		}
+	}
 	fd := d.fd
 	d.mu.Unlock()
 
@@ -855,8 +888,13 @@ func (d *drivetrain) writeCycleAt(now time.Time) {
 // loop that has settled says nothing, and one that hunts says it every second.
 func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh bool, now time.Time) int16 {
 	effort := d.setpoint[m.NodeID]
+	d.steerWhy = ""
+	if effort == 0 && !d.byAngle {
+		d.steerWhy = "no steering setpoint"
+	}
 	if d.byAngle {
 		effort = 0
+		d.steerWhy = "no fresh, calibrated waist reading"
 		if deg, ok := d.articulationLocked(raw, fresh); ok {
 			limit := d.cfg.Waist.targetLimitDegrees() * math.Pi / 180
 			target := d.cfg.Geometry.articulationFor(d.curvature, limit) * 180 / math.Pi
@@ -870,14 +908,29 @@ func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh
 					log.Printf("loader: waist holding: target %.1f°, at %.1f°, %.1f°/s", target, deg, d.waist.joint.rate())
 				}
 			}
+			switch {
+			case effort != 0:
+				d.steerWhy = ""
+			case !d.waist.letGo.IsZero():
+				d.steerWhy = "settling after the last move"
+			default:
+				d.steerWhy = "holding, within holdDegrees of the target"
+			}
 		} else {
 			d.waist.resetPI()
 		}
 	} else {
 		d.waist.resetPI()
 	}
+	wasHeld := d.waist.held
 	allowed, why := d.waist.guard(effort, raw, fresh)
+	if held := d.waist.held; held != 0 && held != wasHeld {
+		if msg := "waist reached its limit on the " + sideName(held) + ": integral reset"; d.waist.every(msg, 2*time.Second, now) {
+			log.Printf("loader: %s", msg)
+		}
+	}
 	if allowed != effort {
+		d.steerWhy = why
 		d.last[m.NodeID] = 0
 		d.waist.resetPI()
 		if why != "" && d.waist.every(why, 2*time.Second, now) {
@@ -885,6 +938,37 @@ func (d *drivetrain) steeringRawLocked(m MotorSpec, raw int, at time.Time, fresh
 		}
 	}
 	return clampToScale(allowed / 100 * fullScale * d.waist.rawEffortSign())
+}
+
+// reversalCycleLocked is this cycle as the reversal trace sees it: the side
+// the pilot asks for, the steering effort actually sent, and the wheels. Caller
+// holds the lock.
+func (d *drivetrain) reversalCycleLocked(now time.Time, steer MotorSpec, sent map[int]int16, raw int, fresh bool,
+	wheels string) reversalCycle {
+	demand := sign(d.setpoint[steer.NodeID])
+	if d.byAngle {
+		demand = sign(d.curvature)
+	}
+	if d.helm.stopped {
+		demand = 0
+	}
+	c := reversalCycle{
+		now:      now,
+		demand:   demand,
+		effort:   float64(sent[steer.NodeID]) / fullScale * 100 * d.waist.rawEffortSign(),
+		held:     d.steerWhy,
+		raw:      raw,
+		fresh:    fresh,
+		leftward: d.cfg.Waist.leftward(),
+		counts:   d.cfg.Waist.StallCounts,
+		wheels:   wheels,
+	}
+	for _, m := range d.cfg.Motors {
+		if m.Kind == "wheel" {
+			c.wheelPercent = math.Max(c.wheelPercent, math.Abs(float64(sent[m.NodeID]))/fullScale*100)
+		}
+	}
+	return c
 }
 
 // Thresholds of the wheels' watchdog that are not worth configuring: a wheel

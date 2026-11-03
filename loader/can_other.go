@@ -43,6 +43,12 @@ func sendCAN(_ int, _ uint32, _ []byte) error {
 	return fmt.Errorf("SocketCAN is only supported on Linux")
 }
 
+func drainCAN(_ int) int { return 0 }
+
+func filterCAN(_ int, _ ...uint32) error {
+	return fmt.Errorf("SocketCAN is only supported on Linux")
+}
+
 func recvCAN(_ int, _ time.Duration) (canFrame, error) {
 	return canFrame{}, fmt.Errorf("SocketCAN is only supported on Linux")
 }

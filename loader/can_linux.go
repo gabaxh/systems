@@ -111,6 +111,64 @@ func recvCAN(fd int, timeout time.Duration) (canFrame, error) {
 	return f, nil
 }
 
+// drainCAN throws away every frame already waiting on the socket, without
+// waiting for more, and says how many there were.
+//
+// recvfrom is called directly rather than through syscall.Recvfrom, which
+// converts the sender's address and fails with EAFNOSUPPORT for AF_CAN — after
+// the frame has been taken off the queue.
+func drainCAN(fd int) int {
+	var f canFrame
+	buf := unsafe.Slice((*byte)(unsafe.Pointer(&f)), unsafe.Sizeof(f))
+	n := 0
+	for {
+		_, _, errno := syscall.Syscall6(syscall.SYS_RECVFROM, uintptr(fd),
+			uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), syscall.MSG_DONTWAIT, 0, 0)
+		switch errno {
+		case 0:
+			n++
+		case syscall.EINTR: // as in recvCAN
+		default:
+			return n // EAGAIN: the queue is empty
+		}
+	}
+}
+
+// The socket option that sets a CAN_RAW socket's receive filter, and the mask
+// that matches one standard data frame exactly: its eleven bits, and the flags
+// that would otherwise let an extended or remote frame of the same ID through.
+const (
+	solCANRaw    = 101 // SOL_CAN_BASE + CAN_RAW
+	canRawFilter = 1
+	canExactSFF  = 0x7FF | 0x80000000 | 0x40000000 // CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG
+)
+
+type canFilter struct {
+	ID   uint32
+	Mask uint32
+}
+
+// filterCAN has the kernel deliver only frames with the given IDs to this
+// socket; with none, it delivers nothing, which is right for a socket that only
+// writes. Sending is not affected.
+func filterCAN(fd int, ids ...uint32) error {
+	filters := make([]canFilter, len(ids))
+	for i, id := range ids {
+		filters[i] = canFilter{ID: id, Mask: canExactSFF}
+	}
+	var ptr unsafe.Pointer
+	if len(filters) > 0 {
+		ptr = unsafe.Pointer(&filters[0])
+	}
+	size := uintptr(len(filters)) * unsafe.Sizeof(canFilter{})
+	_, _, errno := syscall.Syscall6(syscall.SYS_SETSOCKOPT, uintptr(fd), solCANRaw, canRawFilter,
+		uintptr(ptr), size, 0)
+	if errno != 0 {
+		return fmt.Errorf("CAN_RAW_FILTER: %w", errno)
+	}
+	return nil
+}
+
 func closeCAN(fd int) {
 	if err := syscall.Close(fd); err != nil {
 		log.Printf("closeCAN: %v", err)
