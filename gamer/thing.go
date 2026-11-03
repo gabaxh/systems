@@ -347,11 +347,26 @@ func (t *Traits) run(ctx context.Context) {
 		// temporary Bluetooth radio outage. If raw HID reports have stopped arriving,
 		// treat the pad exactly like a disconnected controller. The existing pilot
 		// safety logic will then request a vehicle stop.
-		if !t.pad.hidFresh(time.Duration(t.cfg.HIDTimeoutMs) * time.Millisecond) {
+		lastHID := t.pad.lastHIDTime()
+		now := time.Now()
+		timeout := time.Duration(t.cfg.HIDTimeoutMs) * time.Millisecond
+
+		if lastHID.IsZero() || now.Sub(lastHID) > timeout {
+			if p.inControl {
+				if lastHID.IsZero() {
+					log.Println("gamer: HID source unavailable; no report timestamp")
+				} else {
+					log.Printf(
+						"gamer: HID stale: last report=%s, report age=%.3f ms",
+						lastHID.Format("15:04:05.000000"),
+						float64(now.Sub(lastHID))/float64(time.Millisecond),
+					)
+				}
+			}
 			s.connected = false
 		}
 
-		a := p.step(s, time.Now())
+		a := p.step(s, now)
 
 		t.mu.Lock()
 		t.inControl = p.inControl

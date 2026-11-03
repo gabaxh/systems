@@ -120,6 +120,14 @@ func (p *pad) hidFresh(maxAge time.Duration) bool {
 	return time.Since(p.lastHIDReport) <= maxAge
 }
 
+// lastHIDTime snapshots report timing under the reader's lock so the control
+// loop uses the same report timestamp for the timeout check and diagnostic.
+func (p *pad) lastHIDTime() time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastHIDReport
+}
+
 // run reads the device until the context ends, reopening it whenever it goes
 // away. A gamepad is unplugged, runs flat or walks out of Bluetooth range as a
 // matter of course, and the system must outlive that: the control loop reads a
