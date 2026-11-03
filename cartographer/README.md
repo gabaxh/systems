@@ -134,14 +134,6 @@ Then:
   **drift**, the turn they report per meter that never happened — two wheels of
   slightly different size do that every meter, the same way — and takes it out
   of every step after; see below;
-- **with odometry**, the odometry's position is taken and the matcher is not
-  allowed to slide it along the direction the map is indifferent to. The
-  **heading** is a separate question: parallel walls fix it even when they
-  cannot fix the position, so where the turning probes show a clear peak the
-  walls set the heading and the wheels supply only how far the vehicle went.
-  The wheels are worst at heading — a few millimetres of tyre or a moment of
-  slip is a turn that never happened — and left to them it bends every wall
-  drawn after it. `"headingFromWalls": false` turns this off, to compare maps;
 - **without odometry**, a sweep the match does not fix in every direction is
   *not* integrated at all, and the system says so. A corridor mapped from a
   pose that cannot be known comes out the wrong length and looks entirely
