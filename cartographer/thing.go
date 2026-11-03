@@ -63,18 +63,9 @@ type CartographerConfig struct {
 
 	Search SearchConfig `json:"search"`
 
-	// HeadingFromWalls lets the walls set the heading where they fix it but
-	// not the position, as down a corridor; the wheels then supply only how
-	// far the vehicle went. Absent means on. Off is there to compare maps.
-	HeadingFromWalls *bool `json:"headingFromWalls,omitempty"`
-
 	// Odometry is the loader's wheel encoders, turned into motion between
 	// sweeps. See odometry.go.
 	Odometry OdometryConfig `json:"odometry"`
-}
-
-func (c CartographerConfig) headingFromWalls() bool {
-	return c.HeadingFromWalls == nil || *c.HeadingFromWalls
 }
 
 // Traits holds the map and everything that changes it.
@@ -117,7 +108,6 @@ type Traits struct {
 	degenerate    int
 	failures      int
 	usingOdometry bool
-	wallHeadings   int // sweeps whose heading came from the walls, position from the wheels
 }
 
 //-------------------------------------Instantiate a unit asset template
@@ -180,7 +170,6 @@ func initTemplate() *components.UnitAsset {
 			PGMPath:          "map.pgm",
 			PGMIntervalS:     10,
 			Search:           defaultSearch(),
-			HeadingFromWalls: &on,
 			Odometry:         defaultOdometry(),
 		},
 	}
