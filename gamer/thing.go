@@ -56,10 +56,10 @@ type PadConfig struct {
 	Device    string `json:"device"`
 	CommandHz int    `json:"commandHz"`
 
-	// HIDWatchdogDevice is the raw HID device used only to check that Bluetooth
-	// reports are still arriving. The Linux joystick device can remain open and
-	// keep its last axis value when the Bluetooth link temporarily stalls.
-	HIDWatchdogDevice string `json:"hidWatchdogDevice"`
+	// HIDWatchdogName optionally requires an exact HID_NAME. If omitted,
+	// discover the name from the selected joystick's HID parent in sysfs.
+	// Legacy hidWatchdogDevice settings are ignored: a path proves no identity.
+	HIDWatchdogName string `json:"hidWatchdogName,omitempty"`
 
 	// HIDTimeoutMs is how long raw HID reports may be absent before the
 	// controller is treated as disconnected.
@@ -145,7 +145,6 @@ func initTemplate() *components.UnitAsset {
 		},
 		Traits: &PadConfig{
 			Device:             "/dev/input/js0",
-			HIDWatchdogDevice:  "/dev/hidraw1",
 			HIDTimeoutMs:       500,
 			CommandHz:          20,
 			MaxSpeed:           1.0,
@@ -225,7 +224,7 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		go s.run(sys.Ctx)
 	}
 	go t.pad.run(sys.Ctx)
-	go t.pad.watchHID(sys.Ctx, cfg.HIDWatchdogDevice)
+	go t.pad.watchHID(sys.Ctx, cfg.HIDWatchdogName)
 	go t.run(sys.Ctx)
 
 	return ua, func() {
@@ -236,12 +235,6 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 func applyDefaults(cfg *PadConfig) {
 	if cfg.Device == "" {
 		cfg.Device = "/dev/input/js0"
-	}
-	// Local DualSense watchdog defaults. The hidraw number may change after
-	// reconnect/reboot, so this path should eventually be discovered rather
-	// than assumed.
-	if cfg.HIDWatchdogDevice == "" {
-		cfg.HIDWatchdogDevice = "/dev/hidraw1"
 	}
 	if cfg.HIDTimeoutMs <= 0 {
 		cfg.HIDTimeoutMs = 500

@@ -173,54 +173,78 @@ func (p *pad) run(ctx context.Context) {
 //
 // Raw HID reports normally arrive continuously. Recording their arrival time
 // gives the control loop a watchdog independent of joystick axis changes.
-func (p *pad) watchHID(ctx context.Context, path string) {
+func (p *pad) watchHID(ctx context.Context, wantedName string) {
 	reported := false
-
 	for ctx.Err() == nil {
-		f, err := os.Open(path)
+		path, err := discoverHID("/sys", "/dev", p.path, wantedName)
+		var f *os.File
+		if err == nil {
+			f, err = os.Open(path)
+		}
 		if err != nil {
+			p.clearHID()
 			if !reported {
-				log.Printf("gamer: cannot open HID watchdog %s: %v — will keep trying", path, err)
+				log.Printf("gamer: HID watchdog unavailable: %v — will retry", err)
 				reported = true
 			}
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Second):
-			}
-			continue
-		}
-
-		reported = false
-		log.Printf("gamer: HID watchdog opened %s", path)
-
-		buf := make([]byte, 128)
-
-		for ctx.Err() == nil {
-			n, err := f.Read(buf)
-			if err != nil {
-				break
-			}
-
-			if n > 0 {
-				p.mu.Lock()
-				p.lastHIDReport = time.Now()
-				p.mu.Unlock()
-			}
-		}
-
-		f.Close()
-
-		// Do not leave an old timestamp looking healthy while the watchdog
-		// device is being reopened.
-		p.mu.Lock()
-		p.lastHIDReport = time.Time{}
-		p.mu.Unlock()
-
-		if ctx.Err() == nil {
+		} else {
+			reported = false
+			log.Printf("gamer: HID watchdog opened %s", path)
+			// Revalidate identity before crediting reports, including after a
+			// reconnect reuses a hidraw number. Failure never falls back to a path.
+			p.readHID(ctx, f, func() bool {
+				current, err := discoverHID("/sys", "/dev", p.path, wantedName)
+				if err != nil || current != path {
+					return false
+				}
+				opened, err := f.Stat()
+				if err != nil {
+					return false
+				}
+				node, err := os.Stat(current)
+				return err == nil && os.SameFile(opened, node)
+			})
 			log.Printf("gamer: HID watchdog %s stopped receiving", path)
 		}
+		// Rediscover every time; do not retry a cached device number.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
+}
+
+func (p *pad) clearHID() {
+	p.mu.Lock()
+	p.lastHIDReport = time.Time{}
+	p.mu.Unlock()
+}
+
+// readHID credits only validated non-empty reports. Closing on cancellation
+// unblocks reads; EOF, identity loss and read errors clear freshness immediately.
+func (p *pad) readHID(ctx context.Context, f *os.File, validate func() bool) {
+	p.clearHID()
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-done:
+		}
+		f.Close()
+	}()
+	defer close(done)
+	defer f.Close()
+	defer p.clearHID()
+	buf := make([]byte, 128)
+	for ctx.Err() == nil {
+		n, err := f.Read(buf)
+		if err != nil || n == 0 || ctx.Err() != nil || !validate() {
+			return
+		}
+		p.mu.Lock()
+		p.lastHIDReport = time.Now()
+		p.mu.Unlock()
 	}
 }
 func (p *pad) read(r io.Reader) {
