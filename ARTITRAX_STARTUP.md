@@ -104,8 +104,10 @@ Do this on a fresh checkout, or after deleting a `systemconfig.json`.
    and `::1` by default, and the generated configs use the laptop's real IP.
 
    ```bash
-   sed -i 's#//192\.168\.0\.101:#//127.0.0.1:#g' */systemconfig.json
+   sed -i 's#//[pc-IP-address]:#//127.0.0.1:#g' */systemconfig.json
    ```
+
+   - change [pc-IP-address] to the ip adress of the pc you are using.
 
    If the laptop has a different IP, use the one in the generated files. Change
    the address only: `http` and `https` must stay as they are. The `authorizer`
