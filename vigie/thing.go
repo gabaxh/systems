@@ -6,6 +6,8 @@
  *
  * Contributors:
  *   Jan A. van Deventer, Luleå - initial implementation
+ *   Gabriel Axheim Gustafsson, Luleå - the standstill settings, the bias
+ *     service, and the IMU on this host's clock
  ***************************************************************************SDG*/
 
 package main
@@ -16,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"sync"
@@ -31,6 +34,7 @@ const (
 	unitMetre    = "<http://qudt.org/vocab/unit/M>"
 	unitPct      = "<http://qudt.org/vocab/unit/PERCENT>"
 	unitRadPerS  = "<http://qudt.org/vocab/unit/RAD-PER-SEC>"
+	unitDegPerS  = "<http://qudt.org/vocab/unit/DEG-PER-SEC>"
 	qkLength     = "<http://qudt.org/vocab/quantitykind/Length>"
 	qkAngle      = "<http://qudt.org/vocab/quantitykind/Angle>"
 	qkAngularVel = "<http://qudt.org/vocab/quantitykind/AngularVelocity>"
@@ -63,18 +67,59 @@ type VigieConfig struct {
 	StaleAfterMs int `json:"staleAfterMs"`
 
 	// GyroZeroSeconds is how long the vehicle must stand still at start for
-	// the gyroscope's zero to be measured; see motion in process.go.
+	// the gyroscope's zero to be measured, and is the length of every window
+	// in which it is measured again; see motion in process.go.
 	GyroZeroSeconds float64 `json:"gyroZeroSeconds"`
+
+	// What a standstill may look like. A window is still when no axis of the
+	// gyroscope spreads more than StandstillGyroStd and the accelerometer
+	// reads 1 g within StandstillAccelTolerance. The first zero may be at most
+	// StandstillMaxRate about the vertical; a later one may differ from the
+	// last by MaxBiasStep plus BiasDrift for every minute since. The defaults
+	// were measured on the Artitrax (gyro characterization, October 2026).
+	StandstillGyroStdDegPerSec  float64 `json:"standstillGyroStdDegPerSec"`
+	StandstillAccelToleranceG   float64 `json:"standstillAccelToleranceG"`
+	StandstillMaxRateDegPerSec  float64 `json:"standstillMaxRateDegPerSec"`
+	MaxBiasStepDegPerSec        float64 `json:"maxBiasStepDegPerSec"`
+	BiasDriftDegPerSecPerMinute float64 `json:"biasDriftDegPerSecPerMinute"`
+
+	// MaxGapMs is the longest hole in the IMU stream integrated across; a
+	// longer one loses the turn made during it. IMUStaleAfterMs is how old the
+	// newest IMU sample may be before the motion services stop answering, and
+	// how long after a gap the heading is withheld. Both are far shorter than
+	// StaleAfterMs: a heading compared with the wheels every tenth of a second
+	// is no use a second late.
+	MaxGapMs        int `json:"maxGapMs"`
+	IMUStaleAfterMs int `json:"imuStaleAfterMs"`
+}
+
+// stillLimits are the standstill settings in the units motion works in.
+func (c VigieConfig) stillLimits() stillLimits {
+	rad := math.Pi / 180
+	return stillLimits{
+		gyroStd:  c.StandstillGyroStdDegPerSec * rad,
+		accel:    c.StandstillAccelToleranceG,
+		maxFirst: c.StandstillMaxRateDegPerSec * rad,
+		maxStep:  c.MaxBiasStepDegPerSec * rad,
+		drift:    c.BiasDriftDegPerSecPerMinute * rad,
+		maxGap:   time.Duration(c.MaxGapMs) * time.Millisecond,
+		recover:  time.Duration(c.IMUStaleAfterMs) * time.Millisecond,
+	}
 }
 
 // Traits is the lidar, and what a service handler is given.
 type Traits struct {
-	cfg  VigieConfig
-	rot  rotation
-	pts  *cloud
-	imu  *motion
-	rec  *recorder
-	stat stats
+	cfg   VigieConfig
+	rot   rotation
+	pts   *cloud
+	imu   *motion
+	clock *clockMap
+	rec   *recorder
+	stat  stats
+
+	// The IMU packets' counter, to count the ones lost; consume's alone.
+	imuCnt     uint16
+	haveIMUCnt bool
 
 	// saidUnchecked is which data types have been reported as arriving with
 	// an empty checksum; read and written by consume alone.
@@ -89,6 +134,7 @@ type stats struct {
 	refused   int
 	warnedCRC bool
 	lastWhy   string
+	imuLost   int // IMU packets the counter skipped
 }
 
 //-------------------------------------Instantiate a unit asset template
@@ -119,7 +165,8 @@ func initTemplate() *components.UnitAsset {
 	for _, s := range []*components.Service{
 		signal("clearance", unitMetre, qkLength, "the nearest return in the corridor ahead; unavailable rather than optimistic when nothing came back from it", 2),
 		signal("yawrate", unitRadPerS, qkAngularVel, "the vehicle's rate of turn about the vertical, positive to the left", 2),
-		signal("heading", unitDegree, qkAngle, "the yaw rate integrated since start: drifts, and never wraps", 2),
+		signal("heading", unitDegree, qkAngle, "the yaw rate integrated since the gyroscope's zero was known: never wraps; unavailable just after a gap in the stream", 2),
+		signal("bias", unitDegPerS, qkAngularVel, "the gyroscope's zero about the vertical, as last measured at a standstill", 5),
 		signal("pitch", unitDegree, qkAngle, "from gravity, positive nose down (ISO 8855)", 5),
 		signal("roll", unitDegree, qkAngle, "from gravity, positive right side down (ISO 8855)", 5),
 		signal("quality", unitPct, "", "the share of the last window's beams that came back", 5),
@@ -153,6 +200,14 @@ func defaultConfig() VigieConfig {
 		IMUAverageMs:    100,
 		GyroZeroSeconds: 3,
 		StaleAfterMs:    1000,
+
+		StandstillGyroStdDegPerSec:  0.2,
+		StandstillAccelToleranceG:   0.01,
+		StandstillMaxRateDegPerSec:  2.7,
+		MaxBiasStepDegPerSec:        0.035,
+		BiasDriftDegPerSecPerMinute: 0.08,
+		MaxGapMs:                    50,
+		IMUStaleAfterMs:             100,
 	}
 }
 
@@ -187,6 +242,27 @@ func applyDefaults(c *VigieConfig) {
 	if c.StaleAfterMs <= 0 {
 		c.StaleAfterMs = d.StaleAfterMs
 	}
+	if c.StandstillGyroStdDegPerSec <= 0 {
+		c.StandstillGyroStdDegPerSec = d.StandstillGyroStdDegPerSec
+	}
+	if c.StandstillAccelToleranceG <= 0 {
+		c.StandstillAccelToleranceG = d.StandstillAccelToleranceG
+	}
+	if c.StandstillMaxRateDegPerSec <= 0 {
+		c.StandstillMaxRateDegPerSec = d.StandstillMaxRateDegPerSec
+	}
+	if c.MaxBiasStepDegPerSec <= 0 {
+		c.MaxBiasStepDegPerSec = d.MaxBiasStepDegPerSec
+	}
+	if c.BiasDriftDegPerSecPerMinute <= 0 {
+		c.BiasDriftDegPerSecPerMinute = d.BiasDriftDegPerSecPerMinute
+	}
+	if c.MaxGapMs <= 0 {
+		c.MaxGapMs = d.MaxGapMs
+	}
+	if c.IMUStaleAfterMs <= 0 {
+		c.IMUStaleAfterMs = d.IMUStaleAfterMs
+	}
 }
 
 //-------------------------------------Instantiate the unit asset
@@ -205,7 +281,9 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System, recordP
 		rot: cfg.Mount.rotation(),
 		pts: &cloud{window: time.Duration(cfg.Slice.AccumulateMs) * time.Millisecond},
 		imu: &motion{window: time.Duration(cfg.IMUAverageMs) * time.Millisecond,
-			zeroFor: time.Duration(cfg.GyroZeroSeconds * float64(time.Second))},
+			zeroFor: time.Duration(cfg.GyroZeroSeconds * float64(time.Second)),
+			limits:  cfg.stillLimits(), rot: cfg.Mount.rotation(), mount: cfg.Mount},
+		clock: newClockMap(clockWindow),
 	}
 	if recordPath != "" {
 		rec, err := newRecorder(recordPath)
@@ -345,8 +423,10 @@ func (t *Traits) consume(ctx context.Context, in <-chan datagram) {
 					"they are checked for their structure only", p.dataType)
 			}
 			if p.dataType == dataIMU {
+				t.countIMU(p.udpCnt)
+				stamp := uint64(t.clock.toHost(int64(p.stamp), d.at).UnixNano())
 				for _, s := range p.imu {
-					t.imu.add(timedIMU{at: d.at, stamp: p.stamp, gyro: t.rot.apply(s.gyro), acc: t.rot.apply(s.acc)})
+					t.imu.add(timedIMU{at: d.at, stamp: stamp, gyro: t.rot.apply(s.gyro), acc: t.rot.apply(s.acc)})
 				}
 				continue
 			}
@@ -359,6 +439,19 @@ func (t *Traits) consume(ctx context.Context, in <-chan datagram) {
 			t.pts.add(d.at, pts, p.empty)
 		}
 	}
+}
+
+// countIMU counts the IMU packets the lidar's counter says were skipped. A jump
+// of a thousand or more is the lidar restarting, not a loss.
+func (t *Traits) countIMU(cnt uint16) {
+	if t.haveIMUCnt {
+		if missed := cnt - t.imuCnt - 1; missed > 0 && missed < 1000 {
+			t.stat.mu.Lock()
+			t.stat.imuLost += int(missed)
+			t.stat.mu.Unlock()
+		}
+	}
+	t.imuCnt, t.haveIMUCnt = cnt, true
 }
 
 // count keeps the tally and reports whether the packet is usable.
@@ -387,16 +480,20 @@ func (t *Traits) count(err error) bool {
 	return false
 }
 
-// report logs, every ten seconds, what arrived and what was refused.
+// report logs, every ten seconds, what arrived and what was refused, and every
+// thirty how the gyroscope's zero is being kept.
 func (t *Traits) report(ctx context.Context) {
 	tick := time.NewTicker(10 * time.Second)
 	defer tick.Stop()
 	var prev stats
-	for {
+	for n := 1; ; n++ {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
+			if n%3 == 0 {
+				t.reportIMU()
+			}
 			t.stat.mu.Lock()
 			ok, crc, bad, why := t.stat.ok-prev.ok, t.stat.crcFailed-prev.crcFailed, t.stat.refused-prev.refused, t.stat.lastWhy
 			prev.ok, prev.crcFailed, prev.refused = t.stat.ok, t.stat.crcFailed, t.stat.refused
@@ -413,6 +510,22 @@ func (t *Traits) report(ctx context.Context) {
 	}
 }
 
+// reportIMU says how the zero is being kept: a "still but off the zero" count
+// that climbs while the vehicle really stands is a zero that has stuck.
+func (t *Traits) reportIMU() {
+	s := t.imu.state()
+	t.stat.mu.Lock()
+	lost := t.stat.imuLost
+	t.stat.mu.Unlock()
+	if !s.zeroKnown {
+		log.Println("vigie: IMU — the gyroscope's zero is not known yet: the vehicle has not stood still")
+		return
+	}
+	log.Printf("vigie: IMU — zero %.3f°/s about the vertical, measured %.0f s ago; %d standstills, "+
+		"%d still but off the zero, %d gaps, %d packets lost",
+		s.zero, time.Since(s.zeroAt).Seconds(), s.stills, s.offZero, s.gaps, lost)
+}
+
 //-------------------------------------The services
 
 func serving(t *Traits, w http.ResponseWriter, r *http.Request, servicePath string) {
@@ -427,6 +540,8 @@ func serving(t *Traits, w http.ResponseWriter, r *http.Request, servicePath stri
 		t.clearanceService(w, r)
 	case "yawrate", "heading", "pitch", "roll":
 		t.motionService(w, r, servicePath)
+	case "bias":
+		t.biasService(w, r)
 	case "quality":
 		t.qualityService(w, r)
 	default:
@@ -474,27 +589,47 @@ func (t *Traits) clearanceService(w http.ResponseWriter, r *http.Request) {
 	t.signal(w, r, d, unitMetre, last)
 }
 
+// motionService answers from the IMU, stamped with when the newest sample was
+// taken, on this host's clock. The heading is withheld just after a gap: a
+// consumer differencing two readings across it would get a turn with a piece
+// missing, and must instead see that there was a hole.
 func (t *Traits) motionService(w http.ResponseWriter, r *http.Request, what string) {
 	gyro, acc, heading, at, ok := t.imu.averages()
-	if !ok || time.Since(at) > time.Duration(t.cfg.StaleAfterMs)*time.Millisecond {
+	if !ok || time.Since(at) > time.Duration(t.cfg.IMUStaleAfterMs)*time.Millisecond {
 		http.Error(w, "no IMU sample within the freshness window", http.StatusServiceUnavailable)
 		return
 	}
+	s := t.imu.state()
 	if (what == "yawrate" || what == "heading") && !t.imu.zeroKnown() {
 		http.Error(w, "the gyroscope's zero is still being measured: the vehicle must stand still", http.StatusServiceUnavailable)
+		return
+	}
+	if what == "heading" && s.recovering {
+		http.Error(w, "just after a gap in the IMU stream: the turn made during it is lost", http.StatusServiceUnavailable)
 		return
 	}
 	pitch, roll := tilt(acc)
 	switch what {
 	case "yawrate":
-		t.signal(w, r, gyro[2], unitRadPerS, at)
+		t.signal(w, r, gyro[2], unitRadPerS, s.taken)
 	case "heading":
-		t.signal(w, r, heading, unitDegree, at)
+		t.signal(w, r, heading, unitDegree, s.taken)
 	case "pitch":
-		t.signal(w, r, pitch, unitDegree, at)
+		t.signal(w, r, pitch, unitDegree, s.taken)
 	case "roll":
-		t.signal(w, r, roll, unitDegree, at)
+		t.signal(w, r, roll, unitDegree, s.taken)
 	}
+}
+
+// biasService is the zero about the vertical, stamped with when it was last
+// measured, so it answers even while the stream is stale.
+func (t *Traits) biasService(w http.ResponseWriter, r *http.Request) {
+	s := t.imu.state()
+	if !s.zeroKnown {
+		http.Error(w, "the gyroscope's zero is still being measured: the vehicle must stand still", http.StatusServiceUnavailable)
+		return
+	}
+	t.signal(w, r, s.zero, unitDegPerS, s.zeroAt)
 }
 
 // qualityService is the share of beams that came back in the last window.

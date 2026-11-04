@@ -6,6 +6,8 @@
  *
  * Contributors:
  *   Jan A. van Deventer, Luleå - initial implementation
+ *   Gabriel Axheim Gustafsson, Luleå - the zero measured at every standstill,
+ *     gaps, and the mount from gravity
  ***************************************************************************SDG*/
 
 package main
@@ -46,6 +48,17 @@ func (m Mount) rotation() rotation {
 		{sy * cp, sy*sp*sr + cy*cr, sy*sp*cr - cy*sr},
 		{-sp, cp * sr, cp * cr},
 	}
+}
+
+// transpose is the rotation back, from the vehicle to the lidar.
+func (r rotation) transpose() rotation {
+	var t rotation
+	for i := 0; i < 3; i++ {
+		for j := 0; j < 3; j++ {
+			t[i][j] = r[j][i]
+		}
+	}
+	return t
 }
 
 func (r rotation) apply(v [3]float64) [3]float64 {
@@ -232,27 +245,66 @@ func clearanceAhead(pts []timedPoint, cfg ClearanceConfig, body Box) (float64, b
 // sample after. If the samples spread more than a still vehicle's would, the
 // vehicle was moving; the measurement starts again, and the rate and heading
 // stay unavailable until it succeeds.
+//
+// The zero does not stay put. From a cold start the same Mid-360's zero about
+// the vertical moved 1.9°/s over its first hundred minutes, fastest by about
+// 0.055°/s a minute, as it warmed (two hours at rest, October 2026). So it is
+// not measured once: every window of zeroFor in which the vehicle stands still
+// measures it again. A steady slow turn spreads as little as a standstill
+// does, so a window is also judged by its mean. The first zero may be at most
+// maxFirst about the vertical, which is above the cold zero the vehicle has
+// shown; a later one may differ from the last by at most maxStep, plus drift
+// for every minute since that one was measured, since the zero moves with
+// time and not only with noise. A window further off than that is the vehicle
+// turning slowly, and counted, not taken.
 type motion struct {
 	mu      sync.Mutex
 	samples []timedIMU
 	window  time.Duration
+	limits  stillLimits
 
-	heading   float64 // degrees, integrated since the zero was known
-	lastStamp uint64  // the lidar's time of the previous sample, ns
-	got       bool
+	// The mount, to say which way up the lidar itself is: see sayMount.
+	rot   rotation
+	mount Mount
 
-	zeroFor  time.Duration
-	zero     [3]float64 // rad/s
-	known    bool
-	calStart uint64 // lidar time the current measurement began, ns
-	calN     float64
-	calSum   [3]float64
-	calSq    [3]float64
+	heading     float64 // degrees, integrated since the zero was known
+	lastStamp   uint64  // the previous sample's stamp, ns on this host's clock
+	lastRate    float64 // its rate about the vertical, zero removed, rad/s
+	got         bool
+	integrating bool
+	recoverTo   uint64 // the heading has just lost a gap until this stamp
+	gaps        int
+
+	zeroFor time.Duration
+	zero    [3]float64 // rad/s
+	known   bool
+	zeroAt  uint64 // stamp of the window that last measured it
+	stills  int    // windows taken as standing still
+	offZero int    // windows that were still but too far from the zero
+	win     stillWindow
 }
 
-// stillSpread is the most a still gyroscope's readings spread, one standard
-// deviation in rad/s: five times the noise measured on the vehicle.
-const stillSpread = 0.5 * math.Pi / 180
+// stillLimits is what a standstill may look like, in rad/s and g. The
+// defaults are what the gyro characterization measured on the vehicle, motors
+// on and holding, with a margin.
+type stillLimits struct {
+	gyroStd  float64 // the most any axis may spread in a window
+	accel    float64 // how far the accelerometer's magnitude may be from 1 g
+	maxFirst float64 // the largest first zero about the vertical
+	maxStep  float64 // how far a later zero may be from the last
+	drift    float64 // and further, per minute since the last
+	maxGap   time.Duration
+	recover  time.Duration // how long the heading is withheld after a gap
+}
+
+// stillWindow accumulates one window of raw samples.
+type stillWindow struct {
+	start          uint64
+	n              float64
+	sumG, sumG2    [3]float64
+	sumA           [3]float64
+	sumAccelLength float64
+}
 
 // zeroKnown is whether the gyroscope's zero has been measured.
 func (m *motion) zeroKnown() bool {
@@ -261,40 +313,109 @@ func (m *motion) zeroKnown() bool {
 	return m.known || m.zeroFor == 0
 }
 
-// measureZero takes one raw sample into the zero's measurement.
-func (m *motion) measureZero(s timedIMU) {
-	if m.calN == 0 {
-		m.calStart = s.stamp
+// observe takes one raw sample into the current window, and judges the window
+// once it is long enough. Windows do not overlap: one that saw the vehicle
+// start to move is thrown away whole.
+func (m *motion) observe(s timedIMU) {
+	w := &m.win
+	if w.n == 0 {
+		w.start = s.stamp
 	}
-	m.calN++
+	w.n++
 	for k := 0; k < 3; k++ {
-		m.calSum[k] += s.gyro[k]
-		m.calSq[k] += s.gyro[k] * s.gyro[k]
+		w.sumG[k] += s.gyro[k]
+		w.sumG2[k] += s.gyro[k] * s.gyro[k]
+		w.sumA[k] += s.acc[k]
 	}
-	if s.stamp < m.calStart || time.Duration(s.stamp-m.calStart) < m.zeroFor {
+	w.sumAccelLength += math.Sqrt(s.acc[0]*s.acc[0] + s.acc[1]*s.acc[1] + s.acc[2]*s.acc[2])
+	if s.stamp < w.start || time.Duration(s.stamp-w.start) < m.zeroFor {
 		return
 	}
-	var mean, spread [3]float64
-	still := true
+	m.judge(*w, s.stamp)
+	m.win = stillWindow{}
+}
+
+// judge decides whether a full window was a standstill, and if so takes the
+// zero from it.
+func (m *motion) judge(w stillWindow, at uint64) {
+	var mean, spread, acc [3]float64
+	worst := 0.0
 	for k := 0; k < 3; k++ {
-		mean[k] = m.calSum[k] / m.calN
-		spread[k] = math.Sqrt(math.Max(0, m.calSq[k]/m.calN-mean[k]*mean[k]))
-		still = still && spread[k] < stillSpread
+		mean[k] = w.sumG[k] / w.n
+		spread[k] = math.Sqrt(math.Max(0, w.sumG2[k]/w.n-mean[k]*mean[k]))
+		acc[k] = w.sumA[k] / w.n
+		worst = math.Max(worst, spread[k])
 	}
-	m.calN, m.calSum, m.calSq = 0, [3]float64{}, [3]float64{}
-	if !still {
-		log.Printf("vigie: the vehicle moved while the gyroscope's zero was measured (spread %.2f, %.2f, %.2f °/s); measuring again",
-			spread[0]*180/math.Pi, spread[1]*180/math.Pi, spread[2]*180/math.Pi)
+	l := m.limits
+	if worst > l.gyroStd || math.Abs(w.sumAccelLength/w.n-1) > l.accel {
+		if !m.known {
+			log.Printf("vigie: the vehicle moved while the gyroscope's zero was measured (spread %.2f, %.2f, %.2f °/s); measuring again",
+				spread[0]*180/math.Pi, spread[1]*180/math.Pi, spread[2]*180/math.Pi)
+		}
 		return
 	}
-	m.zero, m.known = mean, true
-	log.Printf("vigie: the gyroscope's zero is %.3f, %.3f, %.3f °/s about x, y, z; it is subtracted from every reading",
-		mean[0]*180/math.Pi, mean[1]*180/math.Pi, mean[2]*180/math.Pi)
+	if !m.known && math.Abs(mean[2]) > l.maxFirst {
+		log.Printf("vigie: the gyroscope read %.2f°/s about the vertical while otherwise still — more than a zero should, "+
+			"so the vehicle is taken to be turning slowly; measuring again", mean[2]*180/math.Pi)
+		return
+	}
+	if m.known {
+		minutes := time.Duration(at - m.zeroAt).Minutes()
+		if math.Abs(mean[2]-m.zero[2]) > l.maxStep+l.drift*minutes {
+			m.offZero++
+			return
+		}
+	}
+	first := !m.known
+	m.zero, m.known, m.zeroAt = mean, true, at
+	m.stills++
+	if first {
+		log.Printf("vigie: the gyroscope's zero is %.3f, %.3f, %.3f °/s about x, y, z; it is subtracted from every reading, "+
+			"and measured again whenever the vehicle stands still",
+			mean[0]*180/math.Pi, mean[1]*180/math.Pi, mean[2]*180/math.Pi)
+		m.sayMount(acc)
+	}
+}
+
+// sayMount says, once, which way up the lidar is in its own frame and what
+// roll and pitch would level it. The yaw rate is the gyroscope's rate about
+// the vehicle's vertical only if the mount says truly how the lidar is turned:
+// tilted 11° and taken as level, every turn reads 2 % short and a fifth of
+// every roll reads as turning. Gravity gives roll and pitch, not yaw: that the
+// scan shows a person standing ahead at 0° is how the yaw is checked.
+func (m *motion) sayMount(accVehicle [3]float64) {
+	n := math.Sqrt(accVehicle[0]*accVehicle[0] + accVehicle[1]*accVehicle[1] + accVehicle[2]*accVehicle[2])
+	if n == 0 {
+		return
+	}
+	upVehicle := [3]float64{accVehicle[0] / n, accVehicle[1] / n, accVehicle[2] / n}
+	rot := m.rot
+	if rot == (rotation{}) {
+		rot = Mount{}.rotation()
+	}
+	up := rot.transpose().apply(upVehicle)
+	roll, pitch := levelling(up)
+	tilted := math.Acos(math.Max(-1, math.Min(1, upVehicle[2]))) * 180 / math.Pi
+	log.Printf("vigie: up, in the lidar's own frame, is [%.4f, %.4f, %.4f]; with yawDegrees %.1f, "+
+		"rollDegrees %.2f and pitchDegrees %.2f would level it", up[0], up[1], up[2], m.mount.YawDegrees, roll, pitch)
+	if tilted > 1 {
+		log.Printf("vigie: as mounted, the vehicle reads %.1f° from level. If it stood on level ground, set the "+
+			"mount's roll and pitch above: until then every turn reads short and part of every roll reads as turning", tilted)
+	}
+}
+
+// levelling is the roll and pitch, in degrees, that turn up — measured in the
+// lidar's own frame — to the vehicle's vertical, for the mount's order of
+// rotations Rz(yaw)·Ry(pitch)·Rx(roll). The yaw does not change where up is.
+func levelling(up [3]float64) (roll, pitch float64) {
+	roll = math.Atan2(up[1], up[2])
+	pitch = math.Atan2(-up[0], math.Hypot(up[1], up[2]))
+	return roll * 180 / math.Pi, pitch * 180 / math.Pi
 }
 
 type timedIMU struct {
 	at    time.Time  // when it arrived
-	stamp uint64     // when the lidar took it, ns on its own clock
+	stamp uint64     // when the lidar took it, ns, put on this host's clock (clock.go)
 	gyro  [3]float64 // rad/s
 	acc   [3]float64 // g
 }
@@ -302,22 +423,46 @@ type timedIMU struct {
 func (m *motion) add(s timedIMU) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.zeroFor > 0 && !m.known {
-		m.measureZero(s)
+	if m.limits == (stillLimits{}) {
+		m.limits = defaultConfig().stillLimits()
+	}
+	// A hole longer than maxGap is a lost stream, not a stretch of turning, and
+	// a clock that went back by more than a second is a restart. Neither is
+	// integrated across, and for a while after one the heading is withheld, so
+	// that whoever differences two readings of it cannot do so across the hole
+	// unawares. A small step back is the clock map finding a packet that waited
+	// less (clock.go): that sample is not integrated, and nothing is lost.
+	restart := m.got && s.stamp+uint64(time.Second) < m.lastStamp
+	lost := restart || m.got && s.stamp > m.lastStamp && time.Duration(s.stamp-m.lastStamp) > m.limits.maxGap
+	if lost {
+		m.win = stillWindow{}
+		if m.integrating {
+			m.gaps++
+			m.recoverTo = s.stamp + uint64(m.limits.recover)
+		}
+	}
+	if m.zeroFor > 0 {
+		m.observe(s)
 	}
 	for k := 0; k < 3; k++ {
 		s.gyro[k] -= m.zero[k]
 	}
-	// Integrate the yaw rate into a heading, sample by sample, on the lidar's
-	// own clock: arrival times carry the network's jitter, its stamps do not.
-	// A gap of more than a quarter second is a lost stream, not a quarter
-	// second of turning, and a clock that went backwards is a restart.
-	if m.got && s.stamp > m.lastStamp && (m.known || m.zeroFor == 0) {
-		if dt := float64(s.stamp-m.lastStamp) / 1e9; dt < 0.25 {
-			m.heading += s.gyro[2] * dt * 180 / math.Pi
+	// Integrate the yaw rate into a heading, sample by sample, by the
+	// trapezoid rule, on the lidar's stamps put on this host's clock: arrival
+	// times carry the network's jitter, the stamps do not, and this host's
+	// clock is the one the wheels are stamped on.
+	if m.known || m.zeroFor == 0 {
+		rate := s.gyro[2]
+		if m.integrating && !lost && s.stamp > m.lastStamp {
+			dt := float64(s.stamp-m.lastStamp) / 1e9
+			m.heading += 0.5 * (m.lastRate + rate) * dt * 180 / math.Pi
 		}
+		m.lastRate, m.integrating = rate, true
 	}
-	m.lastStamp, m.got = s.stamp, true
+	if !m.got || s.stamp > m.lastStamp || restart {
+		m.lastStamp = s.stamp
+	}
+	m.got = true
 	m.samples = append(m.samples, s)
 	cut := s.at.Add(-m.window)
 	i := 0
@@ -347,6 +492,34 @@ func (m *motion) averages() (gyro, acc [3]float64, heading float64, at time.Time
 		acc[k] /= n
 	}
 	return gyro, acc, m.heading, m.samples[len(m.samples)-1].at, true
+}
+
+// imuState is what the services and the log say about the gyroscope beyond
+// its averages.
+type imuState struct {
+	taken      time.Time // the newest sample's stamp, on this host's clock
+	recovering bool      // just after a gap, whose turn is lost
+	zeroKnown  bool
+	zero       float64   // about the vertical, °/s
+	zeroAt     time.Time // when it was last measured
+	stills     int
+	offZero    int
+	gaps       int
+}
+
+func (m *motion) state() imuState {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return imuState{
+		taken:      time.Unix(0, int64(m.lastStamp)),
+		recovering: m.lastStamp < m.recoverTo,
+		zeroKnown:  m.known,
+		zero:       m.zero[2] * 180 / math.Pi,
+		zeroAt:     time.Unix(0, int64(m.zeroAt)),
+		stills:     m.stills,
+		offZero:    m.offZero,
+		gaps:       m.gaps,
+	}
 }
 
 // tilt is pitch and roll from the accelerometer, in degrees. At rest it reads
