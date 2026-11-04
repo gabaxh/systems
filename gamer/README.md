@@ -1,6 +1,6 @@
 # gamer
 
-Drives the Artitrax mini wheel loader by hand, from a game controller, through
+DDrives the Artitrax mini wheel loader by hand, from a game controller, through
 the [loader](../loader/) system. The system is the gamer; its asset is the
 Gamepad.
 
