@@ -51,11 +51,6 @@ or `go run .`.
 | 3 | `esr` | `cd esr && ./esr_ilin` |
 | 4 | `orchestrator` | `cd orchestrator && ./orchestrator_ilin` |
 | 5 | `loader` | `cd loader && ./loader_ilin` |
-| 6 | `gamer` | `cd gamer && ./gamer_ilin` |
-| 7 | `guetteur` | `cd guetteur && ./guetteur_ilin` |
-| 8 | `vigie` | `cd vigie && ./vigie_ilin` |
-| 9 | `cartographer` | `cd cartographer && ./cartographer_ilin` |
-| 10 | `collector` | `cd collector && ./collector_ilin` |
 
 Systems keep retrying, so a wrong order only causes error lines for a moment.
 This order keeps the logs easy to read.
