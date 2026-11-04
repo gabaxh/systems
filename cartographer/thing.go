@@ -6,6 +6,7 @@
  *
  * Contributors:
  *   Jan A. van Deventer, Luleå - initial implementation
+ *   Gabriel Axheim Gustafsson, Luleå - gyrodometry's sampler and the vigie's heading
  ***************************************************************************SDG*/
 
 package main
@@ -18,7 +19,9 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,6 +74,10 @@ type CartographerConfig struct {
 	// Odometry is the loader's wheel encoders, turned into motion between
 	// sweeps. See odometry.go.
 	Odometry OdometryConfig `json:"odometry"`
+
+	// Gyro is gyrodometry: the wheels' heading corrected by the vigie's gyro
+	// where the two disagree. Off unless enabled. See gyrodometry.go.
+	Gyro GyroConfig `json:"gyro"`
 }
 
 func (c CartographerConfig) headingFromWalls() bool {
@@ -96,6 +103,18 @@ type Traits struct {
 	// readWheels fetches the scanner axle's two wheels. A field so that the
 	// whole mapping step can be tested without a loader.
 	readWheels func() (left, right wheelSample, err error)
+
+	// With gyrodometry on, the wheels and the vigie's heading are read by a
+	// sampler of their own, and gyro holds the motion since the last sweep.
+	// Off, gyro is nil and none of this is used.
+	headingCervice *components.Cervice
+	readHeading    func() (degrees float64, at time.Time, err error)
+	gyro           *gyrodometer
+	gyroLog        *intervalLog
+	// The gyro's turn since the last sweep, for a sweep whose wheels failed;
+	// consume's alone.
+	gyroTurn     float64
+	haveGyroTurn bool
 
 	mu sync.RWMutex
 	g  *grid
@@ -174,6 +193,7 @@ func initTemplate() *components.UnitAsset {
 			Search:           defaultSearch(),
 			HeadingFromWalls: &on,
 			Odometry:         defaultOdometry(),
+			Gyro:             defaultGyro(),
 		},
 	}
 }
@@ -219,18 +239,46 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 	t.readWheels = t.readLoaderWheels
 	t.g.matchRange = cfg.MatchRangeMetres
 
+	cervices := components.Cervices{
+		t.scanCervice.Definition:   t.scanCervice,
+		t.leftCervice.IReferentce:  t.leftCervice,
+		t.rightCervice.IReferentce: t.rightCervice,
+	}
+	switch {
+	case cfg.Gyro.on() && !cfg.Odometry.on():
+		log.Println("cartographer: gyro.enabled is set but odometry is off; gyrodometry needs the wheels, so it is off too")
+	case cfg.Gyro.on():
+		t.headingCervice = &components.Cervice{
+			Definition: "heading",
+			Protos:     components.SProtocols(sys.Husk.ProtoPort),
+			Mode:       "get",
+			Nodes:      make(map[string][]components.NodeInfo),
+			Details:    cfg.Gyro.Sensor,
+		}
+		cervices[t.headingCervice.Definition] = t.headingCervice
+		t.readHeading = t.readVigieHeading
+		t.gyro = newGyrodometer(cfg.Gyro, cfg.Odometry)
+		if cfg.Gyro.LogPath != "" {
+			l, err := newIntervalLog(cfg.Gyro.LogPath)
+			if err != nil {
+				log.Fatalf("cartographer: cannot open the gyrodometry log: %v", err)
+			}
+			t.gyroLog = l
+			t.gyro.onInterval = l.write
+		}
+		log.Printf("cartographer: gyrodometry on, mode %s: the heading of the vigie with %s, compared with the wheels every %d ms, threshold %.2f°/s",
+			cfg.Gyro.Mode, detailsText(cfg.Gyro.Sensor), cfg.Gyro.IntervalMs, cfg.Gyro.ThresholdDegreesPerSecond)
+		go t.sampleMotion(sys.Ctx)
+	}
+
 	ua := &components.UnitAsset{
 		Name:        uac.Name,
 		Mission:     uac.Mission,
 		Owner:       sys,
 		Details:     uac.Details,
 		ServicesMap: usecases.MakeServiceMap(uac.Services),
-		CervicesMap: components.Cervices{
-			t.scanCervice.Definition:   t.scanCervice,
-			t.leftCervice.IReferentce:  t.leftCervice,
-			t.rightCervice.IReferentce: t.rightCervice,
-		},
-		Traits: t,
+		CervicesMap: cervices,
+		Traits:      t,
 	}
 	ua.ServingFunc = func(w http.ResponseWriter, r *http.Request, servicePath string) {
 		serving(t, w, r, servicePath)
@@ -240,6 +288,11 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 	go t.snapshot(sys.Ctx)
 
 	return ua, func() {
+		if t.gyroLog != nil {
+			if err := t.gyroLog.close(); err != nil {
+				log.Printf("cartographer: closing the gyrodometry log: %v", err)
+			}
+		}
 		if err := t.g.writePGM(cfg.PGMPath); err != nil {
 			log.Printf("cartographer: could not write the final map: %v", err)
 			return
@@ -277,6 +330,7 @@ func applyDefaults(cfg *CartographerConfig) {
 		cfg.Search = defaultSearch()
 	}
 	applyOdometryDefaults(&cfg.Odometry)
+	applyGyroDefaults(&cfg.Gyro)
 }
 
 // wheelCervice is the quest for one wheel's travel on the loader.
@@ -293,6 +347,20 @@ func wheelCervice(o OdometryConfig, ref string, nodeID int, sys *components.Syst
 		Nodes:       make(map[string][]components.NodeInfo),
 		Details:     details,
 	}
+}
+
+// detailsText writes a service's details as a person would: Model Livox Mid-360.
+func detailsText(d map[string][]string) string {
+	keys := make([]string, 0, len(d))
+	for k := range d {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, k+" "+strings.Join(d[k], ", "))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func axleName(o OdometryConfig) string {
@@ -389,6 +457,9 @@ func (t *Traits) odometryDelta(now time.Time) (pose, bool) {
 	if !t.cfg.Odometry.on() {
 		return pose{}, false
 	}
+	if t.gyro != nil {
+		return t.gyroDelta()
+	}
 	l, r, err := t.readWheels()
 	if err != nil {
 		t.noteOdometry(err)
@@ -402,6 +473,79 @@ func (t *Traits) odometryDelta(now time.Time) (pose, bool) {
 		t.odoFailures = 0
 	}
 	return delta, ok
+}
+
+// gyroDelta is the motion gyrodometry has made of the wheels and the gyro
+// since the previous sweep, moved to the scanner the way odometer.advance
+// moves the wheels'. When the wheels failed but the gyro did not, the gyro's
+// turn is kept for consume to use with constant velocity.
+func (t *Traits) gyroDelta() (pose, bool) {
+	m := t.gyro.take()
+	if !m.ok {
+		t.noteOdometry(m.err)
+		t.gyroTurn, t.haveGyroTurn = m.gyroTurn, m.gyroOK
+		return pose{}, false
+	}
+	t.odoFailures = 0
+	mount := t.odo.mount
+	return compose(compose(inverse(mount), m.axle), mount), true
+}
+
+// sampleMotion reads the wheels and the vigie's heading every pollMs, keeps
+// them with their timestamps, and lets the gyrodometer compare whatever
+// intervals have closed. Its read errors are not logged: a sweep without
+// odometry says why, at a rate a person can read.
+func (t *Traits) sampleMotion(ctx context.Context) {
+	tick := time.NewTicker(time.Duration(t.cfg.Gyro.PollMs) * time.Millisecond)
+	defer tick.Stop()
+	report := time.NewTicker(30 * time.Second)
+	defer report.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-report.C:
+			log.Printf("cartographer: gyrodometry — %s", t.gyro.summary())
+			if t.gyroLog != nil {
+				if err := t.gyroLog.flush(); err != nil {
+					log.Printf("cartographer: writing the gyrodometry log: %v", err)
+				}
+			}
+		case now := <-tick.C:
+			if l, r, err := t.readWheels(); err == nil {
+				t.gyro.addWheels(l, r)
+			}
+			if h, at, err := t.readHeading(); err == nil {
+				t.gyro.addHeading(h, at)
+			}
+			t.gyro.step(now)
+		}
+	}
+}
+
+// readVigieHeading asks the vigie for its heading, in degrees, discovering it
+// if need be. A 503 — the vigie still measuring its zero, or just after a gap
+// in its stream — is an error here, and leaves a hole in the history that
+// keeps the gyro out of the intervals across it.
+func (t *Traits) readVigieHeading() (float64, time.Time, error) {
+	cer := t.headingCervice
+	if len(cer.Nodes) == 0 {
+		if err := usecases.Search4Services(cer, t.owner); err != nil {
+			return 0, time.Time{}, err
+		}
+	}
+	f, err := usecases.GetState(cer, t.owner)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("heading: %w", err)
+	}
+	sig, ok := f.(*forms.SignalA_v1a)
+	if !ok {
+		return 0, time.Time{}, errUnexpectedForm
+	}
+	if sig.Unit != "" && sig.Unit != unitDegree {
+		return 0, time.Time{}, fmt.Errorf("heading came in %s, not degrees", sig.Unit)
+	}
+	return sig.Value, sig.Timestamp, nil
 }
 
 func (t *Traits) readLoaderWheels() (wheelSample, wheelSample, error) {
@@ -479,7 +623,13 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 		// Constant velocity. Crude, and the reason a real odometry source is
 		// worth having: it assumes the vehicle kept doing what it was doing.
 		prior = pose{prior.x + vx*dt, prior.y + vy*dt, prior.theta + vtheta*dt}
+		// With gyrodometry, the wheels may have failed while the gyro did
+		// not; then at least the turn is measured rather than assumed.
+		if t.haveGyroTurn {
+			prior.theta = wrapAngle(t.at.theta + t.gyroTurn)
+		}
 	}
+	t.haveGyroTurn = false
 
 	at, sharp := prior, true
 	if !first {

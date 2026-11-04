@@ -177,9 +177,7 @@ func (o *odometer) advance(l, r wheelSample, now time.Time) (delta pose, ok bool
 	dl := l.metres - o.left.metres
 	dr := r.metres - o.right.metres
 
-	// A little slack for readings that are not quite simultaneous.
-	plausible := o.cfg.MaxWheelSpeed*math.Max(dt, 0)*1.5 + 0.05
-	if math.Abs(dl) > plausible || math.Abs(dr) > plausible {
+	if !plausible(dl, dr, dt, o.cfg.MaxWheelSpeed) {
 		o.left, o.right = l, r
 		return pose{}, false, &discontinuity{fmt.Sprintf(
 			"the wheels jumped %.2f and %.2f m in %.2f s — taken as the loader restarting, not as motion", dl, dr, dt)}
@@ -191,12 +189,26 @@ func (o *odometer) advance(l, r wheelSample, now time.Time) (delta pose, ok bool
 	return compose(compose(inverse(o.mount), axle), o.mount), true, nil
 }
 
+// plausible is whether two wheels can have rolled dl and dr metres in dt
+// seconds. More than maxSpeed allows, with a little slack for readings that
+// are not quite simultaneous, is not motion: it is the loader restarting and
+// counting from zero again.
+func plausible(dl, dr, dt, maxSpeed float64) bool {
+	limit := maxSpeed*math.Max(dt, 0)*1.5 + 0.05
+	return math.Abs(dl) <= limit && math.Abs(dr) <= limit
+}
+
 // arc is the motion of a differential-drive axle whose wheels travelled sl and
 // sr metres, integrated as a circular arc rather than a straight step, which
 // matters when a sweep's worth of turning is not small.
 func arc(sl, sr, track float64) pose {
-	ds := (sl + sr) / 2
-	dth := (sr - sl) / track
+	return arcStep((sl+sr)/2, (sr-sl)/track)
+}
+
+// arcStep is the motion of an axle that travelled ds metres while turning dth
+// radians, along a circular arc. Gyrodometry takes the turn from the gyro or
+// the wheels, interval by interval, and the distance always from the wheels.
+func arcStep(ds, dth float64) pose {
 	if math.Abs(dth) < 1e-9 {
 		return pose{x: ds}
 	}

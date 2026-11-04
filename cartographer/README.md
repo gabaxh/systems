@@ -168,3 +168,85 @@ follows the vehicle to the centimeter; without them every sweep is refused.
 **Check the defaults against the vehicle:** they assume the SF45/B is on the
 **front** half, over the axle, facing forward. If it is mounted elsewhere, say
 so in `scannerMount`, and pick the axle it is on.
+
+## Gyrodometry
+
+**Off unless `gyro.enabled` is true**, and off the cartographer reads the
+wheels exactly as described above. On, the heading between sweeps comes from
+the wheels except where the [vigie](../vigie)'s gyro says they are wrong —
+Borenstein and Feng's *gyrodometry* (ICRA 1996). The reasoning, and how the
+gyro was characterized, are in `gyrodometry_proposal_2026-10-20.md`.
+
+Wheels and a gyro fail in opposite ways. The wheels do not drift, once
+UMBmark has calibrated the track and the wheel sizes, but a spinning wheel or
+a scrubbing tyre is a turn that never happened. The gyro is right over a
+fraction of a second, but its bias adds up. So the turn is taken from the
+wheels, and from the gyro only over the short intervals in which the two
+disagree by more than `thresholdDegreesPerSecond`. The distance is always the
+wheels'.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant L as Loader, the front wheels
+    participant V as Vigie, the Mid-360's gyro
+    participant C as Cartographer
+
+    loop every pollMs (50 ms)
+        C->>L: GET distance, left and right
+        C->>V: GET heading
+        C->>C: keep each with its own timestamp
+        C->>C: for every 100 ms interval that has closed:<br/>the turn from the wheels and from the heading,<br/>both at the same two instants
+        alt they differ by more than the threshold, or did within holdMs
+            C->>C: the gyro's turn
+        else
+            C->>C: the wheels' turn
+        end
+    end
+    C->>C: each sweep: the motion gathered since the last is the prior
+```
+
+- **The heading, not the rate.** The vigie integrates its gyro at 200 Hz and
+  serves the angle, so two readings give the turn between their timestamps
+  exactly, however seldom they are read.
+- **Per interval, not per sweep.** A tenth of a second, as in the paper, so a
+  short slip is isolated rather than spoiling a whole sweep.
+- **A hold.** A wheel spinning in a pile disagrees for seconds, wandering
+  above and below the threshold; the gyro keeps the turn for `holdMs` after
+  the last disagreement. `holdMs: 0` is the paper's rule.
+- **Holes fall back to the wheels.** No vigie, a stale heading, or the 503 the
+  vigie gives just after a gap in its own stream: the intervals across it take
+  the wheels' turn, as without gyrodometry. If the wheels fail and the gyro
+  does not, the sweep starts from constant velocity with the gyro's turn.
+- **The matcher still has the last word.** Gyrodometry improves the prior;
+  where the walls fix the pose, the walls win.
+
+The tests drive a scripted vehicle (`gyrodometry_test.go`). A wheel slipping
+20 % for a second while driving straight turns the wheels' heading 18°, and
+gyrodometry's 0.65° — the gyro's bias over the event. A biased gyro changes
+nothing while the two agree, and the joint swinging at standstill is taken
+from the gyro.
+
+| `gyro` field | default | |
+|---|---|---|
+| `enabled` | false | absent means off |
+| `sensor` | `{"Model": ["Livox Mid-360"]}` | picks the vigie |
+| `pollMs` | 50 | how often the wheels and the heading are read |
+| `intervalMs` | 100 | the paper's T |
+| `lagMs` | 100 | how far behind the present the intervals end, so readings from both sides have arrived |
+| `maxAgeMs` | 200 | the longest hole in the heading an interval may span |
+| `thresholdDegreesPerSecond` | 1.25 | the paper's 0.125° per 0.1 s; to be checked on the vehicle |
+| `holdMs` | 300 | 0 is the paper's rule |
+| `mode` | `gyrodometry` | `odometry` or `gyro` take the turn from one source always, to compare maps |
+| `logPath` | | one CSV line per interval: `t,T,dL,dR,turnWheelsDeg,turnGyroDeg,source` |
+
+Every thirty seconds the log says how often the gyro was believed:
+
+```
+cartographer: gyrodometry — 2.1 % of 300 intervals from the gyro, longest 0.6 s, gyro unavailable in 0.0 %
+```
+
+**Before trusting it on the vehicle:** set the vigie's mount from gravity (its
+README, *Check the mount*), calibrate the wheels with UMBmark
+(`umbmark_guide_2026-10-21.md`), and set the threshold from the CSV of a
+normal drive: above the 99.5th percentile of |turnGyro − turnWheels| / T.
