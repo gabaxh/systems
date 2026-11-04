@@ -42,7 +42,7 @@ func main() {
 
 	// instantiate the husk
 	sys.Husk = &components.Husk{
-		Description: "streams live MJPEG video from a Raspberry Pi camera",
+		Description: "streams live MJPEG video from a Raspberry Pi or Linux V4L2 camera",
 		Details:     map[string][]string{"Developer": {"Arrowhead"}},
 		Host:        components.NewDevice(),
 		ProtoPort:   map[string]int{"https": 30162, "http": 20162, "coap": 0},
