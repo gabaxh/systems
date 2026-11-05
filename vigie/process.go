@@ -82,6 +82,12 @@ type SliceConfig struct {
 	// AccumulateMs is how long points are gathered for one scan. The Mid-360
 	// covers its field of view gradually, so a tenth of a second is sparse.
 	AccumulateMs int `json:"accumulateMs"`
+
+	// SpikeJumpMetres is how much further than both its neighbours a bin's
+	// return may be before it is taken for a stray one and dropped, as the
+	// guetteur's rejectSpikes does. Zero takes the default, 0.5 m; a negative
+	// value turns the filter off.
+	SpikeJumpMetres float64 `json:"spikeJumpMetres"`
 }
 
 // Box is a region of the vehicle frame, in metres. A zero box is no box.
@@ -207,6 +213,52 @@ func slice(pts []timedPoint, cfg SliceConfig, body Box, first, last time.Time) s
 			sw.distances[i], sw.valid[i] = d, true
 		}
 	}
+	return sw
+}
+
+// rejectSpikes marks as no return every bin whose return lies more than jump
+// further than both of its neighbours. It is the guetteur's filter of the same
+// name, for the Mid-360's scan.
+//
+// That is the shape a stray return leaves in a scan: one bin well behind the
+// surface its neighbours agree on. In a corner the Mid-360 does this often: a
+// beam that grazes the wall where two meet, or slips through the gap at a door
+// frame, or comes back from a mixed pixel half on each surface, puts a point
+// beyond the wall. Drawn into the map it is worse than useless, because the
+// beam on its way there is marked free space and carves a line through the
+// real wall. So the bin is made invalid rather than shortened.
+//
+// Only further-than-both is rejected. A bin nearer than both is a thin real
+// thing, a chair leg or a post, and a bin beside a bin with no return has
+// nothing to be compared with on that side and is kept. Every bin is judged
+// against the scan as it was made, so one rejection cannot make its neighbour
+// look like a spike. Unlike the guetteur's sweep, this scan is a whole turn:
+// the first and the last bins are neighbours, and are compared across the
+// seam behind the vehicle.
+func rejectSpikes(sw sweep, jump float64) sweep {
+	if jump <= 0 {
+		return sw
+	}
+	n := len(sw.valid)
+	if len(sw.distances) < n {
+		n = len(sw.distances)
+	}
+	if n < 3 {
+		return sw
+	}
+	valid := make([]bool, len(sw.valid))
+	copy(valid, sw.valid)
+	d := sw.distances
+	for i := 0; i < n; i++ {
+		prev, next := (i+n-1)%n, (i+1)%n
+		if !sw.valid[prev] || !sw.valid[i] || !sw.valid[next] {
+			continue
+		}
+		if d[i]-d[prev] > jump && d[i]-d[next] > jump {
+			valid[i] = false
+		}
+	}
+	sw.valid = valid
 	return sw
 }
 

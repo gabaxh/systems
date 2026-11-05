@@ -82,7 +82,7 @@ func remember(m *memory, truths []pose, wrong func(pose) pose) []pose {
 		prev := est
 		if k > 0 {
 			est = compose(est, wrong(compose(inverse(truths[k-1]), truth)))
-			m.step(prev, est, true)
+			m.step(prev, est, byWheels)
 		}
 		n := len(m.frames)
 		m.keep(est, sweep360(truth, testTime.Add(time.Duration(k)*200*time.Millisecond)))
@@ -447,7 +447,7 @@ func TestWhatCameAfterTheSnapshotIsFound(t *testing.T) {
 	at := start
 	for k := 1; k <= 20; k++ {
 		next := compose(at, pose{x: 0.1})
-		m.step(at, next, true)
+		m.step(at, next, byWheels)
 		at = next
 		m.keep(at, sweep360(at, testTime))
 	}

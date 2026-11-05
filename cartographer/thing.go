@@ -669,6 +669,7 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	t.haveGyroTurn = false
 
 	at, sharp := prior, true
+	wallsHeading := false // in a corridor, the walls set the heading
 	if !first {
 		m := g.match(prior, sw.Angles, sw.Distances, sw.Valid, t.cfg.Search)
 		at, sharp = m.at, m.sharp
@@ -689,6 +690,7 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 				// keep only what the walls cannot see.
 				if m.headingSharp && t.cfg.headingFromWalls() {
 					at.theta = m.at.theta
+					wallsHeading = true
 					t.mu.Lock()
 					t.wallHeadings++
 					n := t.wallHeadings
@@ -727,8 +729,18 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 
 	// The motion since the last sweep counts toward the edge to the next
 	// keyframe whether or not this sweep is drawn: the vehicle moved either way.
+	// How it was placed is how far the step may be off: see memory.step.
 	if t.mem != nil && !first {
-		t.mem.step(t.at, at, haveOdometry)
+		how := byConstantVelocity
+		switch {
+		case sharp:
+			how = byMatch
+		case wallsHeading:
+			how = byWallsHeading
+		case haveOdometry:
+			how = byWheels
+		}
+		t.mem.step(t.at, at, how)
 	}
 
 	moved := math.Hypot(at.x-t.at.x, at.y-t.at.y)

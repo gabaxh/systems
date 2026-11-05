@@ -68,6 +68,7 @@ sequenceDiagram
 
     C->>V: GET scan
     V->>V: the last 200 ms of points in the height band,<br/>nearest per degree of direction
+    V->>V: drop the spikes: a bin further than both neighbours by spikeJumpMetres
     V-->>C: ScanA, 360 bins
 ```
 
@@ -76,6 +77,16 @@ field of view gradually, in a pattern that never repeats. A tenth of a second of
 points is sparse, so a scan is made from the last `accumulateMs`, 200 ms by
 default. At walking pace the vehicle moves about 25 cm in that time, and the
 points are not corrected for it; the same is true of the guetteur's sweep.
+
+**Spikes are dropped.** In a corner the Mid-360 often puts a point beyond the
+wall: a beam that grazes the wall where two meet, slips through the gap at a
+door frame, or comes back half from each surface. Drawn into the map, it carves
+a line of free space through the real wall. So a bin whose return is more than
+`slice.spikeJumpMetres` (0.5 m) further than both of its neighbours is made no
+return. This is the guetteur's `rejectSpikes`, with one difference: the scan is
+a whole turn, so the first and last bins are compared with each other across
+the seam behind the vehicle. A bin nearer than both neighbours, like a post or
+a chair leg, is kept. A negative value turns the filter off.
 
 ## The first run
 
