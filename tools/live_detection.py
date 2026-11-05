@@ -71,7 +71,7 @@ async function update() {
     previousImage = nextImage;
     status.textContent = 'YOLO request: ' + response.headers.get('X-YOLO-ms') + ' ms';
   } catch (error) { image.hidden = true; status.textContent = error.message; }
-  setTimeout(update, 500);
+  setTimeout(update, 0);
 }
 update();
 </script>'''
