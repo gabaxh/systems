@@ -14,13 +14,18 @@ package main
 // a correlative scan matcher that finds where a sweep must have been taken from
 // for it to line up with the map so far.
 //
-// This is a SLAM *front end* and it is honest about being one. It has no pose
-// graph and no loop closure, so a long loop through a building will not snap
-// shut when it returns to where it started; the drift accumulated on the way
-// round simply stays. For a hallway driven up and back — which is the
-// experiment the students are being given — that is the right amount of
-// machinery. Loop closure is a second system's worth of work and should be
-// added when there is a loop to close, not before.
+// This is a SLAM *front end* and it is honest about being one. On its own it
+// has no pose graph and no loop closure, so a long loop through a building
+// will not snap shut when it returns to where it started; the drift
+// accumulated on the way round simply stays. For a hallway driven up and back
+// — which is the experiment the students are being given — that is the right
+// amount of machinery.
+//
+// Loop closure was "a second system's worth of work, to be added when there
+// is a loop to close". With the MID-360 there is one, and it is the back end
+// in keyframes.go, posegraph.go and loops.go, off unless loop.enabled is set.
+// It uses this file's grid and matcher as they are: matchSampled is match
+// with its scores kept, and a submap is a grid like any other.
 
 import (
 	"fmt"
@@ -327,17 +332,47 @@ const (
 // the coarse pass liked. Exhaustive search at fine resolution over the same
 // window would be some hundreds of times the work for the same answer.
 func (g *grid) match(prior pose, angles, distances []float64, valid []bool, cfg SearchConfig) matchResult {
+	m, _, _ := g.matchKeeping(prior, angles, distances, valid, cfg, false)
+	return m
+}
+
+// matchSampled is match, and also what the search's scores say about the pose:
+// its information matrix, in the frame of the grid, and in how many
+// independent directions the view fixes it at all (see matchInformation).
+//
+// The front end does not use it; the loop closure does, to decide whether a
+// match against an older part of the map is an edge, and what it is worth.
+// The pose and the sharpness are exactly those match returns.
+func (g *grid) matchSampled(prior pose, angles, distances []float64, valid []bool, cfg SearchConfig) (matchResult, mat3, int) {
+	m, wide, near := g.matchKeeping(prior, angles, distances, valid, cfg, true)
+	if m.score <= 0 {
+		return m, mat3{}, 0
+	}
+	info, seen := matchInformation(wide, near, cfg)
+	return m, info, seen
+}
+
+// matchKeeping is the two-pass search behind match and matchSampled. With keep
+// set, every pose each pass scored is kept, as its offset from where that pass
+// was centred: the coarse pass's over the whole window, and the fine pass's
+// around the peak.
+func (g *grid) matchKeeping(prior pose, angles, distances []float64, valid []bool, cfg SearchConfig, keep bool) (matchResult, []matchSample, []matchSample) {
 	if g.dirty {
 		g.rebuildField()
 	}
 
-	search := func(centre pose, linStep, linRange, angStep, angRange float64, stride int) (pose, float64) {
+	search := func(centre pose, linStep, linRange, angStep, angRange float64, stride int, kept *[]matchSample) (pose, float64) {
 		local, localScore := centre, math.Inf(-1)
 		for dx := -linRange; dx <= linRange+1e-9; dx += linStep {
 			for dy := -linRange; dy <= linRange+1e-9; dy += linStep {
 				for dt := -angRange; dt <= angRange+1e-9; dt += angStep {
 					c := pose{centre.x + dx, centre.y + dy, centre.theta + dt}
 					s := g.score(c, angles, distances, valid, stride)
+					if kept != nil {
+						// At full stride, so that the two passes' scores are
+						// on the same scale.
+						*kept = append(*kept, matchSample{[3]float64{dx, dy, dt}, s * float64(stride)})
+					}
 					if s > localScore {
 						local, localScore = c, s
 					}
@@ -347,11 +382,19 @@ func (g *grid) match(prior pose, angles, distances []float64, valid []bool, cfg 
 		return local, localScore
 	}
 
-	coarse, _ := search(prior, cfg.CoarseStep, cfg.SearchRange, cfg.CoarseAngle, cfg.AngleRange, cfg.CoarseStride)
-	best, bestScore := search(coarse, cfg.FineStep, cfg.CoarseStep, cfg.FineAngle, cfg.CoarseAngle, 1)
+	var wide, near *[]matchSample
+	if keep {
+		wide, near = new([]matchSample), new([]matchSample)
+	}
+	coarse, _ := search(prior, cfg.CoarseStep, cfg.SearchRange, cfg.CoarseAngle, cfg.AngleRange, cfg.CoarseStride, wide)
+	best, bestScore := search(coarse, cfg.FineStep, cfg.CoarseStep, cfg.FineAngle, cfg.CoarseAngle, 1, near)
 
 	position, heading := g.sharpness(best, bestScore, angles, distances, valid)
-	return matchResult{at: best, score: bestScore, sharp: position && heading, headingSharp: heading}
+	m := matchResult{at: best, score: bestScore, sharp: position && heading, headingSharp: heading}
+	if !keep {
+		return m, nil, nil
+	}
+	return m, *wide, *near
 }
 
 // sharpness nudges the winning pose in six directions and asks whether the
