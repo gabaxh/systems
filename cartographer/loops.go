@@ -53,9 +53,10 @@ type loopMatch struct {
 	info, infoGrid mat3
 	seen           int
 
-	// score is the likelihood under each valid return within matchRange, on
-	// average: 1 for every return exactly on a wall.
-	score float64
+	// score is the likelihood under each valid return within matchRange that
+	// lands where the submap has observed something, on average: 1 for every
+	// such return exactly on a wall. overlap is the share of returns that do.
+	score, overlap float64
 
 	accepted bool
 }
@@ -177,21 +178,61 @@ func (c *closer) match(m *memory, i, j int) loopMatch {
 	a, d, v := m.frames[j].sweep.float64s()
 	res, info, seen := g.matchSampled(prior, a, d, v, c.cfg.Search)
 
-	returns := 0
-	for k := range v {
-		if v[k] && (c.matchRange <= 0 || d[k] <= c.matchRange) {
-			returns++
-		}
-	}
 	if seen > 0 && seen < 3 {
 		info = headingOnly(info)
 	}
 	lm := loopMatch{i: i, j: j, prior: prior, z: res.at, infoGrid: info, seen: seen}
-	if returns > 0 {
-		lm.score = res.score / float64(returns)
-	}
+	lm.score, lm.overlap = g.agreement(res.at, a, d, v)
 	lm.info = edgeInformation(info, res.at.theta)
 	return lm
+}
+
+// agreement is how well a sweep taken from p agrees with what the map has
+// seen: the likelihood field under each valid return within matchRange that
+// lands in a cell the map has observed, free or occupied, on average; and
+// overlap, the share of those returns that land in one.
+//
+// A return that lands where the map knows nothing says nothing either way,
+// and is left out of the score. It used to count as a miss. That was fine
+// along a corridor driven twice, where both passes see the same walls, and
+// wrong at a junction approached from a new direction: the corridor just
+// driven along, the rooms on the other side, all landed in unknown cells,
+// and on 5 November a right match scored 0.4 and was refused. A return that
+// lands in observed free space, where the map says there is nothing to hit,
+// still counts against the match, as it should.
+//
+// The overlap is judged on its own (minOverlap), so that a sweep that lands
+// almost entirely in the unknown cannot pass on its few remaining returns.
+func (g *grid) agreement(p pose, angles, distances []float64, valid []bool) (score, overlap float64) {
+	if g.dirty {
+		g.rebuildField()
+	}
+	returns, known := 0, 0
+	var total float64
+	for k := range angles {
+		if k >= len(valid) || k >= len(distances) || !valid[k] {
+			continue
+		}
+		if g.matchRange > 0 && distances[k] > g.matchRange {
+			continue
+		}
+		returns++
+		wx, wy := project(p, angles[k], distances[k])
+		cx, cy, ok := g.cellOf(wx, wy)
+		if !ok {
+			continue
+		}
+		i := cy*g.width + cx
+		if g.cells[i] == 0 && g.field[i] == 0 {
+			continue // never observed, and no wall near
+		}
+		known++
+		total += float64(g.field[i])
+	}
+	if returns == 0 || known == 0 {
+		return 0, 0
+	}
+	return total / float64(known), float64(known) / float64(returns)
 }
 
 // headingOnly keeps, of a match that does not fix all three directions, only
@@ -239,7 +280,7 @@ func edgeInformation(grid mat3, thetaZ float64) mat3 {
 
 // believable is the gate a single match must pass before it counts at all.
 func (c *closer) believable(lm loopMatch) bool {
-	return lm.score >= c.cfg.MinScore && lm.seen >= 2
+	return lm.score >= c.cfg.MinScore && lm.overlap >= c.cfg.MinOverlap && lm.seen >= 2
 }
 
 // consistencyTolerance is how closely two matches must agree on the
@@ -249,21 +290,30 @@ const (
 	consistentRadians = 3 * math.Pi / 180
 )
 
-// consistent says whether two matches, from consecutive keyframes, say the
-// same thing: applied to b's keyframe, the two corrections must put it in the
-// same place, in every direction b's match fixes. Along a corridor b's match
-// fixes nothing, so it cannot disagree there either.
+// consistent says whether two matches say the same thing: applied to b's
+// keyframe, the two corrections must put it in the same place, in every
+// direction both matches fix. Along a corridor a match fixes nothing, so it
+// can neither disagree there nor confirm anything there.
+//
+// Both, not just b's: a corridor match's position along the corridor is
+// meaningless, and comparing a full match's position with it — or worse,
+// letting it count as agreement — said nothing true. Of the two, the one that
+// fixes fewer directions says which are compared.
 func consistent(frames []keyframe, a, b loopMatch) bool {
 	target := frames[b.j].pose
 	pa := compose(a.correction(frames), target)
 	pb := compose(b.correction(frames), target)
 	d := [3]float64{pa.x - pb.x, pa.y - pb.y, wrapAngle(pa.theta - pb.theta)}
 
-	// The directions b's match fixes, in the map frame: its information in
-	// i's frame, turned by i's heading.
-	ci, si := math.Cos(frames[b.i].pose.theta), math.Sin(frames[b.i].pose.theta)
+	// The directions the less informed match fixes, in the map frame: its
+	// information in its i's frame, turned by that keyframe's heading.
+	less := b
+	if a.seen < b.seen {
+		less = a
+	}
+	ci, si := math.Cos(frames[less.i].pose.theta), math.Sin(frames[less.i].pose.theta)
 	r := mat3{{ci, -si, 0}, {si, ci, 0}, {0, 0, 1}}
-	info := r.mul(b.infoGrid).mul(r.transpose())
+	info := r.mul(less.infoGrid).mul(r.transpose())
 	values, vectors := info.eigen()
 	top := math.Max(values[0], math.Max(values[1], values[2]))
 	var kept [3]float64
@@ -280,6 +330,46 @@ func consistent(frames []keyframe, a, b loopMatch) bool {
 		}
 	}
 	return math.Hypot(kept[0], kept[1]) <= consistentMetres && math.Abs(kept[2]) <= consistentRadians
+}
+
+// positionConfirmed says whether the streak holds ConsistentMatches matches
+// that fix all three directions and agree with lm, lm itself included.
+//
+// The replay of the 4 November drive found why this is needed. Judged on
+// the returns that land where the submap has seen something, a partial
+// overlap near the start scored 0.80, claimed all three directions, and put
+// the vehicle 0.7 m too far along the corridor. The match that "confirmed" it
+// was a corridor match, which fixes only the heading, so the two agreed in
+// the one direction they shared and the wrong position went into the graph.
+// Every match after it was a corridor match too, and none could take it out.
+//
+// Only matches with at least PositionOverlap of their returns on known ground
+// count. Replaying that drive with the truth known: the wrong matches near
+// the start had 56–61 % of their returns on known ground and were 1.1 m off
+// along the corridor; the right ones had 83–94 % and were 1–2 cm off. On half
+// a sweep a match still has the heading right, to a degree; where along a
+// corridor it is, it can have wrong by a door's spacing.
+func (c *closer) positionConfirmed(frames []keyframe, lm loopMatch) bool {
+	if lm.seen < 3 || lm.overlap < c.cfg.PositionOverlap {
+		return false
+	}
+	n := 0
+	for _, o := range c.streak {
+		if o.seen == 3 && o.overlap >= c.cfg.PositionOverlap && (o.j == lm.j || consistent(frames, o, lm)) {
+			n++
+		}
+	}
+	return n >= c.cfg.ConsistentMatches
+}
+
+// trusted is the information a believed match gives the graph, in the frame of
+// the edge's residual: all of it once its position is confirmed, and only its
+// heading before that, as a corridor match gives.
+func (c *closer) trusted(frames []keyframe, lm loopMatch) mat3 {
+	if lm.seen == 3 && !c.positionConfirmed(frames, lm) {
+		return edgeInformation(headingOnly(lm.infoGrid), lm.z.theta)
+	}
+	return lm.info
 }
 
 // consider is the loop closure's work for keyframe j: try it against its
@@ -321,6 +411,9 @@ func (c *closer) consider(m *memory, j int) (closure, bool) {
 	}
 	if len(fresh) == 0 {
 		return closure{}, false
+	}
+	for k, lm := range fresh {
+		fresh[k].info = c.trusted(m.frames, lm)
 	}
 	loops := append([]edge(nil), c.loops...)
 	for _, lm := range fresh {
@@ -520,7 +613,7 @@ func (c *closer) record(m *memory, lm loopMatch, believed, accepted bool, chi2 f
 	}
 	dz := compose(inverse(lm.prior), lm.z)
 	c.log.write(loopRow{
-		t: c.now(), i: lm.i, j: lm.j, score: lm.score, seen: lm.seen,
+		t: c.now(), i: lm.i, j: lm.j, score: lm.score, overlap: lm.overlap, seen: lm.seen,
 		dx: dz.x, dy: dz.y, dtheta: dz.theta, chi2: chi2, believed: believed, accepted: accepted,
 	})
 }
@@ -530,7 +623,7 @@ func (c *closer) record(m *memory, lm loopMatch, believed, accepted bool, chi2 f
 type loopRow struct {
 	t                  time.Time
 	i, j               int
-	score              float64
+	score, overlap     float64
 	seen               int
 	dx, dy, dtheta     float64 // where the match moved j from the estimate, in i's frame
 	chi2               float64 // after optimising without the kernel, what maxChi2 judges; 0 if not tried
@@ -552,7 +645,7 @@ func newLoopLog(path string) (*loopLog, error) {
 	}
 	w := bufio.NewWriter(f)
 	if st, err := f.Stat(); err == nil && st.Size() == 0 {
-		fmt.Fprintln(w, "t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted")
+		fmt.Fprintln(w, "t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted,overlap")
 	}
 	return &loopLog{f: f, w: w}, nil
 }
@@ -560,8 +653,8 @@ func newLoopLog(path string) (*loopLog, error) {
 func (l *loopLog) write(r loopRow) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	fmt.Fprintf(l.w, "%.3f,%d,%d,%.4f,%d,%.4f,%.4f,%.3f,%.3f,%t,%t\n", float64(r.t.UnixMilli())/1000,
-		r.i, r.j, r.score, r.seen, r.dx, r.dy, r.dtheta*180/math.Pi, r.chi2, r.believed, r.accepted)
+	fmt.Fprintf(l.w, "%.3f,%d,%d,%.4f,%d,%.4f,%.4f,%.3f,%.3f,%t,%t,%.3f\n", float64(r.t.UnixMilli())/1000,
+		r.i, r.j, r.score, r.seen, r.dx, r.dy, r.dtheta*180/math.Pi, r.chi2, r.believed, r.accepted, r.overlap)
 }
 
 func (l *loopLog) flush() error {

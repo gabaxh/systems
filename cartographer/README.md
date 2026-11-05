@@ -306,12 +306,26 @@ sequenceDiagram
   older keyframe and its neighbours, not against the whole map: the whole map
   already holds the doubled wall the loop is meant to remove.
 - **Believing it.** Corridors repeat, and a convincing match in the wrong place
-  folds the map. So a match must score at least `minScore` per return. It must
-  fix at least two directions. One that fixes only two, as in a corridor,
-  keeps only its heading: the direction the corridor does not fix is never
-  found exactly, and the rest of the match is not to be trusted. It must be
-  found again from the next keyframe with the same correction. And once in the
-  graph, it must agree with the rest, within `maxChi2`.
+  folds the map. A match has to pass every one of these:
+  - **Score:** at least `minScore`, counted over the returns that land where
+    the old submap has seen something. A return in unknown ground says
+    nothing either way. At a junction approached from a new direction, most of
+    what the vehicle sees was never seen before.
+  - **Overlap:** at least `minOverlap` of the returns must land on known
+    ground.
+  - **Directions:** it must fix at least two. One that fixes only two, as in
+    a corridor, keeps only its heading. The direction the corridor does not
+    fix is never found exactly, and the rest of the match is not to be
+    trusted.
+  - **Twice:** it must be found again from the next keyframe with the same
+    correction, compared in the directions both matches fix.
+  - **Position:** a match's position goes into the graph only once a second
+    match with at least `positionOverlap` of its returns on known ground
+    agrees with it. Until then it gives its heading only. On half a sweep a
+    match still has the heading right, but its place along a corridor can be
+    off by a door's spacing.
+  - **χ²:** once in the graph, it must agree with the rest, within
+    `maxChi2`.
 - **Optimising.** Levenberg–Marquardt on the graph, by conjugate gradients
   preconditioned by the chain of keyframes. A new loop starts from the headings
   and then the positions solved alone, and is judged without a robust kernel;
@@ -345,7 +359,9 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 | `maxCandidates` | 3 | |
 | `submapMetres` / `submapKeyframes` | 16 / 5 | |
 | `search` | ±1.2 m, ±20°, 0.10 m / 2° → 0.0125 m / 0.5° | as the front end's `search` |
-| `minScore` | 0.55 | per return; 1 is every return on a wall |
+| `minScore` | 0.55 | per return that lands where the old submap has seen something; 1 is every such return on a wall |
+| `minOverlap` | 0.3 | the share of returns that must land where the old submap has seen something for a match to count at all |
+| `positionOverlap` | 0.75 | the share needed before a match's position is trusted, and not just its heading. A second such match must agree |
 | `consistentMatches` | 2 | keyframes in a row |
 | `maxChi2` | 7.8 | χ² of three degrees of freedom at 95 % |
 | `robustScale` | 3 | Cauchy, in standard deviations, on loops already accepted |
@@ -353,7 +369,7 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 | `redrawMetres` | 0.05 | |
 | `matchedMetres` / `matchedDegrees` | 0.02 / 0.05 | how far a step may be off where the map fixed the pose; the heading's also where the walls set it |
 | `corridorAlongFraction` | 0.25 | along a corridor, the position's uncertainty per step as a fraction of the step. Large, because the wheels' error there is mostly a scale error, the same every metre |
-| `logPath` | | one CSV line per match tried, and one more for each put to the graph: `t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted`. `chi2` is the one `maxChi2` judges, before the robust kernel; 0 on lines for matches not put to the graph |
+| `logPath` | | one CSV line per match tried, and one more for each put to the graph: `t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted,overlap`. `chi2` is the one `maxChi2` judges, before the robust kernel; 0 on lines for matches not put to the graph. `overlap` is the share of returns on known ground |
 | `graphPath` | | the pose graph in g2o format, after each closure |
 
 **First tried on the vehicle on 5 November**, on a laptop, with a 250 m grid.

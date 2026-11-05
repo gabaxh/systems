@@ -299,7 +299,7 @@ func TestTheLoopLogIsWritten(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	l.write(loopRow{t: testTime, i: 3, j: 120, score: 0.71, seen: 3, dx: 0.4, dy: -0.1, dtheta: 2 * degree, chi2: 1.2, believed: true, accepted: true})
+	l.write(loopRow{t: testTime, i: 3, j: 120, score: 0.71, overlap: 0.62, seen: 3, dx: 0.4, dy: -0.1, dtheta: 2 * degree, chi2: 1.2, believed: true, accepted: true})
 	if err := l.close(); err != nil {
 		t.Fatal(err)
 	}
@@ -309,7 +309,7 @@ func TestTheLoopLogIsWritten(t *testing.T) {
 	}
 	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 	if len(lines) != 2 || !strings.HasPrefix(lines[0], "t,i,j,score") ||
-		lines[1] != "1700000000.000,3,120,0.7100,3,0.4000,-0.1000,2.000,1.200,true,true" {
+		lines[1] != "1700000000.000,3,120,0.7100,3,0.4000,-0.1000,2.000,1.200,true,true,0.620" {
 		t.Errorf("the log reads %q", lines)
 	}
 }
@@ -555,5 +555,139 @@ func TestALaggingCloserClosesTheLoopOnce(t *testing.T) {
 	t.Logf("%d passes, %d loops, %d redraws; the vehicle %.3f m and %.2f° from the truth", passes, len(tr.closer.loops), tr.redraws, d, turn)
 	if d > 0.05 || turn > 1 {
 		t.Errorf("a lagging closer left the vehicle %.3f m and %.2f° from the truth", d, turn)
+	}
+}
+
+// junctionWorld is a corridor along x with a branch going up from it: a
+// short stub at x = 8…11, then a jog to x = 10…13 that runs on out of sight
+// of the corridor.
+func junctionWorld(t testing.TB) {
+	t.Helper()
+	saved := testWalls
+	t.Cleanup(func() { testWalls = saved })
+	testWalls = []wall{
+		{-2, -1.5, 20, -1.5}, {-2, 1.5, 8, 1.5}, {11, 1.5, 20, 1.5},
+		{-2, -1.5, -2, 1.5}, {20, -1.5, 20, 1.5},
+		// a short stub up from the corridor, x = 8…11
+		{8, 1.5, 8, 6}, {11, 1.5, 11, 4.5},
+		// then the branch jogs right, x = 10…13, and runs on out of sight
+		{8, 6, 10, 6}, {10, 6, 10, 30}, {11, 4.5, 13, 4.5}, {13, 4.5, 13, 30}, {10, 30, 13, 30},
+	}
+}
+
+// The failure of the run of 5 November, second time round. The vehicle
+// came back to a junction it had passed, but down the branch, which the
+// keyframes it was matched against had never looked into. Much of its sweep
+// fell where the old submap knew nothing, scored nothing, and pulled a right
+// match down to 0.4, below the gate; the loop was never closed, and the
+// drift it would have removed went on to double a corridor. A match is now
+// judged on the returns that land where the submap has seen something, and
+// separately on how many of them that is.
+func TestAJunctionApproachedFromTheBranchIsRecognised(t *testing.T) {
+	junctionWorld(t)
+	m := testMemory()
+	// The first pass, along the main corridor.
+	at := pose{}
+	m.keep(at, sweep360(at, testTime))
+	for _, p := range route(pose{}, leg{0, 18})[1:] {
+		m.step(at, p, byWheels)
+		at = p
+		m.keep(at, sweep360(at, testTime))
+	}
+	i := -1
+	for k, f := range m.frames {
+		if math.Abs(f.pose.x-9.5) < 0.3 {
+			i = k
+		}
+	}
+	// Much later, down the branch towards the junction, with the drift of a
+	// loop in the estimate: 0.6 m, 0.4 m and 3°.
+	m.path += 60
+	drift := pose{0.6, 0.4, 3 * degree}
+	truths := route(pose{11.5, 16, -90 * degree}, leg{0, 9.5})
+	est := compose(drift, truths[0])
+	m.frames = append(m.frames, keyframe{id: len(m.frames), pose: est, path: m.path, sweep: storedSweep{kf: len(m.frames)}})
+	for _, p := range truths {
+		est = compose(drift, p)
+		f := len(m.frames)
+		m.frames = append(m.frames, keyframe{id: f, pose: est, path: m.path, sweep: storedSweep{kf: f}})
+		s := sweep360(p, testTime)
+		m.frames[f].sweep = storedSweep{kf: f, angles: make([]float32, 360), distances: make([]float32, 360), valid: s.Valid}
+		for k := range s.Angles {
+			m.frames[f].sweep.angles[k] = float32(s.Angles[k])
+			m.frames[f].sweep.distances[k] = float32(s.Distances[k])
+		}
+		m.path += 0.1
+	}
+	j := len(m.frames) - 1
+
+	c := testCloser()
+	lm := c.match(m, i, j)
+	plain := lm.score * lm.overlap // the score as it was: over every return
+	t.Logf("junction from the branch: score %.2f over the %.0f %% of returns the submap has seen, %.2f over all; %d directions",
+		lm.score, 100*lm.overlap, plain, lm.seen)
+	if plain >= c.cfg.MinScore {
+		t.Fatalf("scored over every return the match passes too (%.2f); the test would prove nothing", plain)
+	}
+	if !c.believable(lm) {
+		t.Errorf("a right match at a junction approached from the branch was not believed: score %.2f, overlap %.2f, %d directions",
+			lm.score, lm.overlap, lm.seen)
+	}
+	// And it is right: it undoes the drift.
+	got := compose(m.frames[i].pose, lm.z)
+	want := truths[len(truths)-1]
+	if d := math.Hypot(got.x-want.x, got.y-want.y); d > 0.1 {
+		t.Errorf("the match puts the keyframe %.2f m from where it was", d)
+	}
+}
+
+// A sweep that lands almost entirely where the submap knows nothing is not a
+// match, however well its few remaining returns fit.
+func TestALittleOverlapIsNotAMatch(t *testing.T) {
+	c := testCloser()
+	lm := loopMatch{score: 0.95, overlap: 0.1, seen: 3}
+	if c.believable(lm) {
+		t.Error("a match on a tenth of the sweep was believed")
+	}
+	lm.overlap = 0.5
+	if !c.believable(lm) {
+		t.Error("a good match on half the sweep was not believed")
+	}
+}
+
+// A match's position goes into the graph only once a second match agrees on
+// it, and only if both saw enough of the old map; its heading goes in before
+// that.
+func TestAPositionNeedsOverlapAndASecondOpinion(t *testing.T) {
+	frames := []keyframe{{id: 0, pose: pose{}}, {id: 1, pose: pose{x: 0.5}},
+		{id: 2, pose: pose{x: 12, y: 0.4}}, {id: 3, pose: pose{x: 12.5, y: 0.4}}}
+	full := diag3(1e4, 1e4, 1e5)
+	a := loopMatch{i: 0, j: 2, z: pose{x: 12}, infoGrid: full, seen: 3, overlap: 0.9}
+	b := loopMatch{i: 1, j: 3, z: pose{x: 12}, infoGrid: full, seen: 3, overlap: 0.9}
+	a.info, b.info = edgeInformation(full, 0), edgeInformation(full, 0)
+	c := testCloser()
+
+	positionOf := func(m mat3) float64 { return m[0][0] + m[1][1] }
+
+	c.streak = []loopMatch{b}
+	if got := c.trusted(frames, b); positionOf(got) != 0 || got[2][2] <= 0 {
+		t.Errorf("alone, a match gave the graph %v; want its heading only", got)
+	}
+	c.streak = []loopMatch{a, b}
+	if got := c.trusted(frames, b); positionOf(got) == 0 {
+		t.Errorf("confirmed by a second, a match still gave only its heading: %v", got)
+	}
+	// The same two, each seeing only half of the old map.
+	a.overlap, b.overlap = 0.55, 0.55
+	c.streak = []loopMatch{a, b}
+	if got := c.trusted(frames, b); positionOf(got) != 0 {
+		t.Errorf("on half a sweep each, two matches gave the graph a position: %v", got)
+	}
+	// A corridor match cannot confirm a position: it has none to agree with.
+	a.overlap, b.overlap = 0.9, 0.9
+	a.seen, a.infoGrid = 2, diag3(0, 1e4, 1e5)
+	c.streak = []loopMatch{a, b}
+	if got := c.trusted(frames, b); positionOf(got) != 0 {
+		t.Errorf("a corridor match confirmed a position: %v", got)
 	}
 }

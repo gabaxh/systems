@@ -78,11 +78,16 @@ type LoopConfig struct {
 	SubmapKeyframes int          `json:"submapKeyframes"`
 	Search          SearchConfig `json:"search"`
 
-	// A match is believed when its score per return is at least MinScore,
-	// it fixes at least two directions, and ConsistentMatches keyframes in a
-	// row agree on it; and kept when its χ² after optimising is at most
-	// MaxChi2.
-	MinScore          float64 `json:"minScore"`
+	// A match is believed when its score is at least MinScore over the
+	// returns that land where the submap has seen something, at least
+	// MinOverlap of the returns do, it fixes at least two directions, and
+	// ConsistentMatches keyframes in a row agree on it; and kept when its χ²
+	// after optimising is at most MaxChi2.
+	MinScore   float64 `json:"minScore"`
+	MinOverlap float64 `json:"minOverlap"`
+	// PositionOverlap is how much of a match's sweep must land on known
+	// ground before its position is trusted, and not just its heading.
+	PositionOverlap   float64 `json:"positionOverlap"`
 	ConsistentMatches int     `json:"consistentMatches"`
 	MaxChi2           float64 `json:"maxChi2"`
 
@@ -142,6 +147,8 @@ func defaultLoop() LoopConfig {
 		SubmapKeyframes:      5,
 		Search:               defaultLoopSearch(),
 		MinScore:             0.55,
+		MinOverlap:           0.3,
+		PositionOverlap:      0.75,
 		ConsistentMatches:    2,
 		MaxChi2:              7.8,
 		RedrawMetres:         0.05,
@@ -200,6 +207,12 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.MinScore <= 0 {
 		c.MinScore = d.MinScore
+	}
+	if c.MinOverlap <= 0 {
+		c.MinOverlap = d.MinOverlap
+	}
+	if c.PositionOverlap <= 0 {
+		c.PositionOverlap = d.PositionOverlap
 	}
 	if c.ConsistentMatches <= 0 {
 		c.ConsistentMatches = d.ConsistentMatches
