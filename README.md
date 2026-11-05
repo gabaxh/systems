@@ -96,6 +96,9 @@ curvature, with left positive (ISO 8855), and knows nothing of the machine.
 | `guetteur` | Reads a LightWare SF45/B scanning LiDAR over serial and exposes each sweep, and the clearance ahead, as services |
 | `vigie` | Reads a Livox Mid-360 3D LiDAR and its built-in IMU over Ethernet: a 360° scan in the guetteur's form, the clearance ahead at any height the vehicle could hit, the rate of turn and the tilt. Not yet run against the device |
 | `cartographer` | Builds an occupancy map from the guetteur's sweeps and the loader's wheel travel (SLAM front end), and reports where the scanner is in it |
+| `navigator` | Plans a forward route through the cartographer's map to a destination, no tighter than the vehicle can turn |
+| `chauffeur` | Drives the navigator's route through the loader, and holds for anything that makes it unsafe to follow, until a person says to go on. Not yet run on the vehicle |
+| `commander` | The page a person works the vehicle from: click on the map to set a destination, check the route, press Start. Answers only on its own machine |
 
 ### Imaging
 

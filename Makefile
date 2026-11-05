@@ -10,8 +10,8 @@ BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BUILD_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 PKG        := github.com/sdoque/mbaigo/components
 
-SYSTEMS := assessor authorizer beehive beekeeper busdriver ca cartographer clerk \
-           collector democrat drafter ds18b20 ds18b20F emulator envoy esr ethermostat \
+SYSTEMS := assessor authorizer beehive beekeeper busdriver ca cartographer chauffeur clerk \
+           collector commander democrat drafter ds18b20 ds18b20F emulator envoy esr ethermostat \
            filmer flattener gamer guetteur hobbyist kgrapher leveler loader maitreD \
            meteorologue modboss modeler navigator nurse orchestrator painter parallax \
            photographer recognizer revolutionary sailor sapper telegrapher \

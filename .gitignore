@@ -57,8 +57,10 @@ serviceRegistry.db
 /beekeeper/beekeeper
 /busdriver/busdriver
 /ca/ca
+/chauffeur/chauffeur
 /clerk/clerk
 /collector/collector
+/commander/commander
 /democrat/democrat
 /drafter/drafter
 /ds18b20/ds18b20

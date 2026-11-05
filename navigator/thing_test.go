@@ -151,3 +151,111 @@ func TestThePictureIsWritten(t *testing.T) {
 		t.Errorf("%d bytes for %d x %d", len(b), w, h)
 	}
 }
+
+// standing is a navigator with a destination set in a corridor, reading its map
+// from a test instead of the cartographer.
+func standing(t *testing.T) (*Traits, *testMap) {
+	t.Helper()
+	tm := newTestMap(22, 6)
+	tm.corridor(1, 2, 21, 4)
+	cfg := NavConfig{}
+	applyDefaults(&cfg)
+	cfg.PicturePath = filepath.Join(t.TempDir(), "plan.ppm")
+	at := here{x: 2, y: 3, frame: tm.m.Frame}
+	tr := &Traits{cfg: cfg}
+	tr.readMap = func() (*forms.MapA_v1a, error) { return &tm.m, nil }
+	tr.readPose = func() (here, error) { return at, nil }
+	tr.readLimit = func() float64 { return 0.5 }
+	if _, err := tr.planTo(19, 3, at, nil); err != nil {
+		t.Fatal(err)
+	}
+	if tr.path == nil {
+		t.Fatal("no route to begin with")
+	}
+	return tr, tm
+}
+
+// A door opens across the corridor. A route to the nearest point would look like
+// any other, and the vehicle would arrive at the door: so no route, until it
+// closes, and the destination is still there when it does.
+func TestABlockedWayIsNoRouteUntilItOpens(t *testing.T) {
+	tr, tm := standing(t)
+	tm.fill(10, 2, 10.1, 4, forms.MapOccupied)
+	tr.replanOnce()
+	if tr.path != nil {
+		t.Fatalf("a route with the way blocked, ending at (%.1f, %.1f)", tr.path.X[len(tr.path.X)-1], tr.path.Y[len(tr.path.Y)-1])
+	}
+	if tr.goal == nil {
+		t.Fatal("the destination was dropped")
+	}
+
+	tm.fill(10, 2, 10.1, 4, forms.MapFree)
+	tr.replanOnce()
+	if tr.path == nil {
+		t.Fatal("the way is open and there is no route")
+	}
+	if end := tr.path.X[len(tr.path.X)-1]; end < 18 {
+		t.Errorf("the route ends at x=%.1f, want the destination at 19", end)
+	}
+}
+
+// A plan that fails for any reason takes down the route. Before, the old one
+// stayed up, and it was planned against a map that had changed.
+func TestAFailedPlanTakesDownTheRoute(t *testing.T) {
+	tr, _ := standing(t)
+	tr.readMap = func() (*forms.MapA_v1a, error) { return nil, fmt.Errorf("no map") }
+	tr.replanOnce()
+	if tr.path != nil {
+		t.Error("the old route is still up")
+	}
+	if tr.goal == nil {
+		t.Error("the destination was dropped")
+	}
+}
+
+// A destination the person was told is out of reach stays as they accepted it:
+// the route goes on ending at the nearest point, rather than being withdrawn.
+func TestAnAcceptedNearestPointKeepsItsRoute(t *testing.T) {
+	tr, tm := standing(t)
+	at := here{x: 2, y: 3, frame: tm.m.Frame}
+	if _, err := tr.planTo(30, 3, at, nil); err != nil {
+		t.Fatal(err)
+	}
+	if tr.goal.why == "" {
+		t.Fatal("the goal outside the map was not moved")
+	}
+	tr.replanOnce()
+	if tr.path == nil {
+		t.Error("the route to the accepted nearest point was withdrawn")
+	}
+}
+
+// A destination dropped while a replan is running stays dropped.
+func TestAGoalDroppedDuringAPlanStaysDropped(t *testing.T) {
+	tr, tm := standing(t)
+	read := tr.readMap
+	tr.readMap = func() (*forms.MapA_v1a, error) {
+		tr.drop()
+		return read()
+	}
+	tr.replanOnce()
+	if tr.goal != nil || tr.path != nil {
+		t.Errorf("the plan brought it back: goal=%v, map %s", tr.goal, tm.m.Frame)
+	}
+}
+
+// Arrival still drops the destination, and a new map still does.
+func TestArrivalAndANewMapDropTheGoal(t *testing.T) {
+	tr, tm := standing(t)
+	tr.readPose = func() (here, error) { return here{x: tr.goal.x, y: tr.goal.y, frame: tm.m.Frame}, nil }
+	tr.replanOnce()
+	if tr.goal != nil {
+		t.Error("arrived, and the destination stands")
+	}
+	tr, _ = standing(t)
+	tr.readPose = func() (here, error) { return here{x: 2, y: 3, frame: "map@another"}, nil }
+	tr.replanOnce()
+	if tr.goal != nil {
+		t.Error("a new map, and the destination stands")
+	}
+}
