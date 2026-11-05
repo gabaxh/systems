@@ -93,14 +93,6 @@ type LoopConfig struct {
 	// millimetres, and redrawing it each time would be all the work there is.
 	RedrawMetres float64 `json:"redrawMetres"`
 
-	// How far a step may be off where the walls placed the sweep (see
-	// memory.step): MatchedMetres and MatchedDegrees where the map fixed the
-	// pose, MatchedDegrees for the heading in a corridor, and
-	// CorridorAlongFraction of the distance for the position along it.
-	MatchedMetres         float64 `json:"matchedMetres"`
-	MatchedDegrees        float64 `json:"matchedDegrees"`
-	CorridorAlongFraction float64 `json:"corridorAlongFraction"`
-
 	// LogPath, when set, gets one CSV line per loop tried; GraphPath the pose
 	// graph in g2o format after each closure.
 	LogPath   string `json:"logPath"`
@@ -145,15 +137,6 @@ func defaultLoop() LoopConfig {
 		ConsistentMatches:    2,
 		MaxChi2:              7.8,
 		RedrawMetres:         0.05,
-		// From the run of 5 November: 1.5° of heading and 1.8 m of
-		// along-track drift left after 350 m and 700 keyframes. As a random
-		// walk that is 0.05° a keyframe for a heading the walls hold, and,
-		// spread as independent errors over 0.15 m steps, about 25 % of
-		// each step along a corridor; for the position the map fixes, a
-		// little more than the matcher's fine step of 1.25 cm.
-		MatchedMetres:         0.02,
-		MatchedDegrees:        0.05,
-		CorridorAlongFraction: 0.25,
 	}
 }
 
@@ -209,15 +192,6 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.RedrawMetres <= 0 {
 		c.RedrawMetres = d.RedrawMetres
-	}
-	if c.MatchedMetres <= 0 {
-		c.MatchedMetres = d.MatchedMetres
-	}
-	if c.MatchedDegrees <= 0 {
-		c.MatchedDegrees = d.MatchedDegrees
-	}
-	if c.CorridorAlongFraction <= 0 {
-		c.CorridorAlongFraction = d.CorridorAlongFraction
 	}
 }
 
@@ -287,28 +261,12 @@ type memory struct {
 
 func newMemory(cfg LoopConfig) *memory { return &memory{cfg: cfg} }
 
-// placed is how the front end placed a sweep, which is what says how far the
-// step to it may be off.
-type placed int
-
-const (
-	// byConstantVelocity: no odometry, and a view that did not fix the pose
-	// either — the least trusted.
-	byConstantVelocity placed = iota
-	// byWheels: the wheels, or gyrodometry, and nothing from the walls.
-	byWheels
-	// byWallsHeading: a corridor. The walls set the heading and the wheels
-	// the position along it.
-	byWallsHeading
-	// byMatch: the map fixed the whole pose.
-	byMatch
-)
-
 // step accounts for the motion from one sweep to the next, from and to in the
-// map frame, the second placed as how says.
+// map frame. measured says whether the wheels, or gyrodometry, measured it;
+// otherwise it was constant velocity.
 //
-// With the wheels alone the covariance of the motion since the last keyframe,
-// r, grows as the covariance of a composition does:
+// The covariance of the motion since the last keyframe, r, grows as the
+// covariance of a composition does:
 //
 //	r ∘ δ:   Σ ← J Σ Jᵀ + R(r.θ) Σ_δ R(r.θ)ᵀ
 //
@@ -317,39 +275,13 @@ const (
 // uncertain position. Σ_δ is the step's own covariance from OdometryNoise,
 // turned into the keyframe's frame — which stepCovariance does when it is
 // given the heading.
-//
-// Where the walls placed the sweep, they say more, and the first drives
-// showed what it costs not to listen. A pose the walls set is set against
-// the map, so its error relative to the last keyframe is the match's own, and
-// does not keep growing with every sweep since. Treating it as the wheels'
-// random walk made the heading look loose and the distance along a corridor
-// tight — the opposite of what the front end does wrong — and the optimiser,
-// asked to remove 1.8 m of along-track drift at the end of a loop, bent the
-// corridor between two squares into an arc instead of stretching it.
-//
-//   - byMatch: the map fixed the pose, and Σ is reset to the match's accuracy,
-//     MatchedMetres and MatchedDegrees.
-//   - byWallsHeading: the walls fixed the heading, and its row and column of
-//     Σ are reset to MatchedDegrees. The position is the wheels', and its
-//     along-track uncertainty grows with CorridorAlongFraction rather than
-//     the noise model's alongFraction: there the wheels are all there is,
-//     and their error is mostly a scale error, the same every metre, which an
-//     independent error per step understates.
-func (m *memory) step(from, to pose, how placed) {
+func (m *memory) step(from, to pose, measured bool) {
 	if len(m.frames) == 0 {
 		return
 	}
 	last := m.frames[len(m.frames)-1].pose
 	r := compose(inverse(last), from)
 	delta := compose(inverse(from), to)
-	m.path += math.Hypot(delta.x, delta.y)
-
-	if how == byMatch {
-		lin := m.cfg.MatchedMetres
-		ang := m.cfg.MatchedDegrees * math.Pi / 180
-		m.cov = diag3(lin*lin, lin*lin, ang*ang)
-		return
-	}
 
 	c, s := math.Cos(r.theta), math.Sin(r.theta)
 	j := mat3{
@@ -357,12 +289,8 @@ func (m *memory) step(from, to pose, how placed) {
 		{0, 1, c*delta.x - s*delta.y},
 		{0, 0, 1},
 	}
-	noise := m.cfg.Noise
-	if how == byWallsHeading {
-		noise.AlongFraction = math.Max(noise.AlongFraction, m.cfg.CorridorAlongFraction)
-	}
-	stepCov := noise.stepCovariance(delta, r.theta)
-	if how == byConstantVelocity {
+	stepCov := m.cfg.Noise.stepCovariance(delta, r.theta)
+	if !measured {
 		for i := range stepCov {
 			for k := range stepCov[i] {
 				stepCov[i][k] *= blindFactor * blindFactor
@@ -371,12 +299,7 @@ func (m *memory) step(from, to pose, how placed) {
 		m.blind++
 	}
 	m.cov = j.mul(m.cov).mul(j.transpose()).add(stepCov)
-
-	if how == byWallsHeading {
-		ang := m.cfg.MatchedDegrees * math.Pi / 180
-		m.cov[0][2], m.cov[1][2], m.cov[2][0], m.cov[2][1] = 0, 0, 0, 0
-		m.cov[2][2] = ang * ang
-	}
+	m.path += math.Hypot(delta.x, delta.y)
 }
 
 // keep is the sweep that was just drawn into the map from at. It starts a new

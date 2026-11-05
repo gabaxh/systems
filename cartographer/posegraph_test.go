@@ -182,7 +182,7 @@ func TestTheFrontEndsOwnGraphDoesNotMove(t *testing.T) {
 	at := start
 	for i := 1; i <= 60; i++ {
 		next := compose(at, pose{0.07, 0, 2 * degree})
-		m.step(at, next, byWheels)
+		m.step(at, next, true)
 		at = next
 		m.keep(at, scanAt(at, testTime))
 	}

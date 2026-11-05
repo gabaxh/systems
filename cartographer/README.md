@@ -286,20 +286,8 @@ sequenceDiagram
 - **Keyframes.** Every sweep the front end draws is kept, as float32, hanging
   off a keyframe by its offset. Every `keyframeTravelMetres` or
   `keyframeTurnDegrees` one of them becomes a keyframe: a node of the pose
-  graph. Between keyframes, each step's uncertainty depends on how the front
-  end placed that sweep, and the total is the weight of the edge between them:
-  - **The map fixed the pose:** the uncertainty is reset to `matchedMetres` and
-    `matchedDegrees`.
-  - **In a corridor, where the walls set the heading:** the heading is reset to
-    `matchedDegrees`, and the position along the corridor grows with
-    `corridorAlongFraction`.
-  - **Wheels alone (or gyrodometry):** the uncertainty grows with `noise`.
-
-  This matters for where a loop's error goes. On 5 November, weighting every
-  step as the wheels' random walk made the heading look loose and the distance
-  along a corridor tight, which is the opposite of what the front end gets
-  wrong. Closing 1.8 m of along-track drift, the optimiser bent the corridor
-  between the two squares instead of stretching it.
+  graph. Between keyframes the wheels' (or gyrodometry's) uncertainty is grown
+  step by step with `noise`; that is the weight of the edge between them.
 - **Finding a loop.** A keyframe is matched against the older keyframes at
   least `minGapMetres` back along the path, and near enough by the map that the
   drift could explain the rest. The match is against a submap drawn from the
@@ -351,8 +339,6 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 | `robustScale` | 3 | Cauchy, in standard deviations, on loops already accepted |
 | `maxIterations` | 20 | |
 | `redrawMetres` | 0.05 | |
-| `matchedMetres` / `matchedDegrees` | 0.02 / 0.05 | how far a step may be off where the map fixed the pose; the heading's also where the walls set it |
-| `corridorAlongFraction` | 0.25 | along a corridor, the position's uncertainty per step as a fraction of the step. Large, because the wheels' error there is mostly a scale error, the same every metre |
 | `logPath` | | one CSV line per match tried, and one more for each put to the graph: `t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted`. `chi2` is the one `maxChi2` judges, before the robust kernel; 0 on lines for matches not put to the graph |
 | `graphPath` | | the pose graph in g2o format, after each closure |
 

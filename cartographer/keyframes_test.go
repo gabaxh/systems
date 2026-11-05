@@ -34,11 +34,7 @@ func driveMemory(m *memory, n int, step float64, measured bool) pose {
 		if i == 0 {
 			next = at
 		} else {
-			how := byConstantVelocity
-			if measured {
-				how = byWheels
-			}
-			m.step(at, next, how)
+			m.step(at, next, measured)
 		}
 		at = next
 		m.keep(at, scanAt(at, start.Add(time.Duration(i)*200*time.Millisecond)))
@@ -80,7 +76,7 @@ func TestATurnMakesAKeyframe(t *testing.T) {
 	m.keep(at, scanAt(at, start))
 	for i := 1; i <= 9; i++ {
 		next := pose{theta: float64(i) * 10 * math.Pi / 180}
-		m.step(at, next, byWheels)
+		m.step(at, next, true)
 		at = next
 		m.keep(at, scanAt(at, start))
 	}
@@ -274,113 +270,5 @@ func TestLoopClosureIsOffUnlessAskedFor(t *testing.T) {
 	}
 	if d := initTemplate().Traits.(*CartographerConfig).Loop; d.on() || d.KeyframeTravelMetres <= 0 || d.MaxSweeps <= 0 {
 		t.Errorf("the template's loop block %+v", d)
-	}
-}
-
-// rectangleDrive drives a 20 × 10 m rectangle once round, the walls holding the
-// heading on the straights and the map fixing the corners, with the wheels
-// reading 5 % long on the second leg only. old makes every step the wheels'
-// alone, as before the walls were listened to. It returns the graph with one
-// loop edge, from the last keyframe back to the first, and where each keyframe
-// truly was.
-func rectangleDrive(old bool) (*poseGraph, []pose) {
-	m := testMemory()
-	truths := route(pose{}, leg{0, 20}, leg{90, 10}, leg{90, 20}, leg{90, 10.2})
-	est := truths[0]
-	var kfTruth []pose
-	leg2 := false
-	for k, truth := range truths {
-		if k > 0 {
-			step := compose(inverse(truths[k-1]), truth)
-			turning := step.theta != 0
-			if turning && !leg2 && k > 150 && k < 300 {
-				leg2 = true
-			}
-			wheels := step
-			// The second leg runs from the first corner to the second.
-			onLeg2 := !turning && truth.y > 0.05 && truth.x > 19.9 && truth.y < 9.95
-			if onLeg2 {
-				wheels.x *= 1.05
-			}
-			prev := est
-			est = compose(est, wheels)
-			est.theta = truth.theta // the walls hold the heading
-			how := byWallsHeading
-			if turning {
-				how = byMatch
-			}
-			if old {
-				how = byWheels
-			}
-			m.step(prev, est, how)
-		}
-		n := len(m.frames)
-		m.keep(est, scanAt(est, testTime))
-		if len(m.frames) > n {
-			kfTruth = append(kfTruth, truth)
-		}
-	}
-	last := len(m.frames) - 1
-	loop := edge{i: 0, j: last, z: compose(inverse(kfTruth[0]), kfTruth[last]), loop: true,
-		info: diag3(1e4, 1e4, 1e5)}
-	return m.graph([]edge{loop}), kfTruth
-}
-
-// The failure of the run of 5 November, in a rectangle. Along a corridor the
-// walls hold the heading and the wheels alone say how far; a wheel that reads
-// long makes one leg too long, and closing the loop must shorten it. Weighted
-// as the wheels' random walk, the heading looked the loose part, and the
-// optimiser bent the straight legs instead.
-func TestACorridorStretchesInsteadOfBending(t *testing.T) {
-	worst := func(g *poseGraph, truth []pose) (metres, degrees float64) {
-		g.optimise(graphOptions{maxIterations: 20, initialise: true})
-		for i, p := range g.nodes {
-			metres = math.Max(metres, math.Hypot(p.x-truth[i].x, p.y-truth[i].y))
-			degrees = math.Max(degrees, math.Abs(wrapAngle(p.theta-truth[i].theta))*180/math.Pi)
-		}
-		return metres, degrees
-	}
-	newM, newD := worst(rectangleDrive(false))
-	oldM, oldD := worst(rectangleDrive(true))
-	t.Logf("weighted by the walls: worst %.3f m and %.2f°; as the wheels' random walk: %.3f m and %.2f°", newM, newD, oldM, oldD)
-	if newD > 0.3 {
-		t.Errorf("a straight leg was bent by %.2f° to close the loop", newD)
-	}
-	if oldD < 1 {
-		t.Errorf("weighted the old way the legs bent only %.2f°; the test would prove nothing", oldD)
-	}
-	// The leg read 0.5 m long. The loop cannot tell which of the two parallel
-	// legs that was, so the most it can do is take half off each: 0.25 m.
-	if newM > 0.27 || newM >= oldM {
-		t.Errorf("a keyframe is %.3f m out, against %.3f m the old way and the 0.25 m a loop cannot tell apart", newM, oldM)
-	}
-}
-
-// Where the map fixed the pose, the uncertainty since the last keyframe is
-// the match's, however far the wheels went; where the walls fixed only the
-// heading, the heading's is, and the position's keeps growing.
-func TestWhatTheWallsFixedIsNotARandomWalk(t *testing.T) {
-	m := testMemory()
-	m.keep(pose{}, scanAt(pose{}, testTime))
-	at := pose{}
-	for i := 0; i < 3; i++ {
-		next := compose(at, pose{x: 0.1})
-		m.step(at, next, byMatch)
-		at = next
-	}
-	lin, ang := m.cfg.MatchedMetres, m.cfg.MatchedDegrees*math.Pi/180
-	if !nearTo(m.cov[0][0], lin*lin, 1e-12) || !nearTo(m.cov[2][2], ang*ang, 1e-12) {
-		t.Errorf("after three matched steps: %v", m.cov)
-	}
-	for i := 0; i < 3; i++ {
-		next := compose(at, pose{x: 0.1})
-		m.step(at, next, byWallsHeading)
-		at = next
-	}
-	if !nearTo(m.cov[2][2], ang*ang, 1e-12) || m.cov[0][2] != 0 || m.cov[1][2] != 0 {
-		t.Errorf("with the walls holding the heading it is %v", m.cov)
-	}
-	if m.cov[0][0] <= lin*lin {
-		t.Errorf("the position along a corridor did not grow: %v", m.cov)
 	}
 }

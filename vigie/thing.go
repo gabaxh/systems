@@ -194,7 +194,7 @@ func defaultConfig() VigieConfig {
 		Slice: SliceConfig{
 			MinHeightMetres: 0.3, MaxHeightMetres: 1.5,
 			BinDegrees: 1, MinRangeMetres: 0.2, MaxRangeMetres: 40,
-			AccumulateMs: 200, SpikeJumpMetres: 0.5,
+			AccumulateMs: 200,
 		},
 		Clearance:       ClearanceConfig{HalfWidthMetres: 0.45, MinHeightMetres: 0.1, MaxHeightMetres: 1.6},
 		IMUAverageMs:    100,
@@ -229,9 +229,6 @@ func applyDefaults(c *VigieConfig) {
 	}
 	if c.Slice.AccumulateMs <= 0 {
 		c.Slice.AccumulateMs = d.Slice.AccumulateMs
-	}
-	if c.Slice.SpikeJumpMetres == 0 {
-		c.Slice.SpikeJumpMetres = d.Slice.SpikeJumpMetres
 	}
 	if c.Clearance.HalfWidthMetres <= 0 {
 		c.Clearance = d.Clearance
@@ -565,7 +562,7 @@ func (t *Traits) scanService(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no points within the freshness window", http.StatusServiceUnavailable)
 		return
 	}
-	sw := rejectSpikes(slice(pts, t.cfg.Slice, t.cfg.Body, first, last), t.cfg.Slice.SpikeJumpMetres)
+	sw := slice(pts, t.cfg.Slice, t.cfg.Body, first, last)
 	f := forms.ScanA_v1a{}
 	f.NewForm()
 	f.Angles = sw.angles
