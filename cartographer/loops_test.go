@@ -27,7 +27,7 @@ type wall = struct{ x1, y1, x2, y2 float64 }
 // corridor 3 m wide running round a 14 × 4 m block, inside a 20 × 10 m
 // building: a loop to close. Two recesses in the outer wall, and the corners,
 // are what tell one stretch of it from another.
-func ringWorld(t *testing.T) {
+func ringWorld(t testing.TB) {
 	t.Helper()
 	saved := testWalls
 	t.Cleanup(func() { testWalls = saved })
@@ -495,5 +495,65 @@ func TestACorridorLoopKeepsOnlyItsHeading(t *testing.T) {
 	}
 	if !headingOnly(mat3{}).isZero() {
 		t.Error("a match that fixes nothing kept something")
+	}
+}
+
+// The bug the 5 November run found. On the vehicle the loop closer falls
+// behind, and works through several keyframes from one snapshot; each closure
+// it finds there was computed from the same stale poses. Applying the second
+// must not move the vehicle again by what the first already did: the graph's
+// poses are where things are, not how far to move them. Before the fix, each
+// closure stacked its whole correction on the last, and six of them turned the
+// vehicle 25° and drew a corridor across the map.
+func TestTwoClosuresFromOneSnapshotDoNotStack(t *testing.T) {
+	tr, _ := ringTraits(t)
+	var snap *memory
+	var cl closure
+	found := false
+	for j := range tr.mem.frames {
+		snap = tr.mem.snapshot()
+		if cl, found = tr.closer.consider(snap, j); found {
+			break
+		}
+	}
+	if !found {
+		t.Fatal("no loop closed round the ring")
+	}
+	tr.loopClosed(snap, cl)
+	once := tr.at
+	keyframe := tr.mem.frames[len(tr.mem.frames)-1].pose
+
+	tr.loopClosed(snap, cl) // the same solution again, from the same snapshot
+	if d := math.Hypot(tr.at.x-once.x, tr.at.y-once.y); d > 0.001 || math.Abs(wrapAngle(tr.at.theta-once.theta)) > 0.001 {
+		t.Errorf("a second closure from the same snapshot moved the vehicle %.3f m and %.2f° more", d, wrapAngle(tr.at.theta-once.theta)*180/math.Pi)
+	}
+	if k := tr.mem.frames[len(tr.mem.frames)-1].pose; !samePose(k, keyframe) {
+		t.Errorf("the newest keyframe moved again, from %+v to %+v", keyframe, k)
+	}
+}
+
+// The loop closer as it runs on the vehicle: behind the front end, with a
+// backlog of keyframes in one snapshot, the closing ones among them. It must
+// close the loop as well as when it keeps up — and before the fix it closed
+// it once per keyframe, each closure stacked on the last.
+func TestALaggingCloserClosesTheLoopOnce(t *testing.T) {
+	tr, truth := ringTraits(t)
+	// Behind by a backlog just short of what it would skip: the keyframes
+	// round the last corner and back past the start.
+	tr.closer.done = len(tr.mem.frames) - loopBacklog
+	passes := 0
+	for tr.closer.done < len(tr.mem.frames) && passes < 50 {
+		tr.closeBatch()
+		passes++
+	}
+	if tr.redraws == 0 {
+		t.Fatalf("no closure in %d passes", passes)
+	}
+	end := truth[len(truth)-1]
+	d := math.Hypot(tr.at.x-end.x, tr.at.y-end.y)
+	turn := math.Abs(wrapAngle(tr.at.theta-end.theta)) * 180 / math.Pi
+	t.Logf("%d passes, %d loops, %d redraws; the vehicle %.3f m and %.2f° from the truth", passes, len(tr.closer.loops), tr.redraws, d, turn)
+	if d > 0.05 || turn > 1 {
+		t.Errorf("a lagging closer left the vehicle %.3f m and %.2f° from the truth", d, turn)
 	}
 }

@@ -339,12 +339,26 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 | `robustScale` | 3 | Cauchy, in standard deviations, on loops already accepted |
 | `maxIterations` | 20 | |
 | `redrawMetres` | 0.05 | |
-| `logPath` | | one CSV line per match tried: `t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted` |
+| `logPath` | | one CSV line per match tried, and one more for each put to the graph: `t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted`. `chi2` is the one `maxChi2` judges, before the robust kernel; 0 on lines for matches not put to the graph |
 | `graphPath` | | the pose graph in g2o format, after each closure |
 
-**Not yet tried on the vehicle.** Before then:
-- **Speed:** a loop match takes about 60 ms on a laptop, and the Pi may be ten
-  times slower. If the log says the loop closer fell behind and skipped
-  keyframes, set `maxCandidates` to 1.
+**First tried on the vehicle on 5 November**, on a laptop, with a 250 m grid.
+The first loop closed. Later in the run, closures found from one stale
+snapshot stacked on each other and turned the map 20–30°. That is fixed:
+see the proposal, section 3.6, and `TestALaggingCloserClosesTheLoopOnce`.
+What else that run changed:
+- **The size of the grid no longer costs anything.** The likelihood field is
+  rebuilt only over the part of the grid anything has been drawn in, plus a
+  margin. On a 250 m grid (25 million cells) a rebuild took 466 ms, after
+  every sweep drawn and after every redraw. It now takes 2.5 ms
+  (`BenchmarkRebuildFieldOn250Metres`).
+- **Drawing allocates nothing.** Every beam used to build a list of cells.
+  A redraw of the ring on a 250 m grid went from 327 ms to 122 ms
+  (`BenchmarkRedrawOn250Metres`), and the front end draws each sweep faster
+  too.
+- **`maxCandidates`** is how many older keyframes each new keyframe is tried
+  against, nearest first. Each try is a submap and a wide search. If the log
+  says the loop closer fell behind and skipped keyframes, 1 is a third of the
+  work.
 - **The scanner:** the cartographer's `scan` cervice still takes any provider,
   guetteur or vigie, and it should be pinned to the vigie.

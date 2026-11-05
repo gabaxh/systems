@@ -75,10 +75,11 @@ type closer struct {
 	matchRange float64
 	resolution float64
 
-	loops  []edge
-	streak []loopMatch
-	done   int // keyframes considered so far
-	log    *loopLog
+	loops   []edge
+	streak  []loopMatch
+	done    int // keyframes considered so far
+	skipped int // keyframes skipped because the closer fell behind
+	log     *loopLog
 
 	// now stamps the log; a field so that tests need no clock.
 	now func() time.Time
@@ -331,8 +332,15 @@ func (c *closer) consider(m *memory, j int) (closure, bool) {
 	// Phase one: the new loops without the kernel, from the headings and
 	// positions solved alone, and then judged by their own χ².
 	g.optimise(graphOptions{maxIterations: c.cfg.MaxIterations, initialise: true})
+	// The χ² each new loop is judged by, and the one the log records: before
+	// the kernel, in a graph that had to make room for it. After the kernel a
+	// loop the rest disagrees with is weighed down rather than met, and its
+	// χ² can come out far above maxChi2 although it passed — which is what
+	// made the log of 5 November show accepted loops at 10 and 21.
+	judged := make([]float64, len(fresh))
 	for k := range fresh {
 		chi2 := g.chi2(first + k)
+		judged[k] = chi2
 		if chi2 > c.cfg.MaxChi2 {
 			c.record(m, fresh[k], true, false, chi2)
 			log.Printf("cartographer: loop refused, keyframe %d ↔ %d: χ² %.1f with the rest of the map (at most %.1f)",
@@ -351,7 +359,7 @@ func (c *closer) consider(m *memory, j int) (closure, bool) {
 	}
 	for k, lm := range fresh {
 		c.streak[freshIdx[k]].accepted = true
-		c.record(m, lm, true, true, g.chi2(first+k))
+		c.record(m, lm, true, true, judged[k])
 		c.loops = append(c.loops, edge{i: lm.i, j: lm.j, z: lm.z, info: lm.info, loop: true})
 	}
 	if c.cfg.GraphPath != "" {
@@ -374,41 +382,60 @@ const loopBacklog = 20
 func (t *Traits) closeLoops(ctx context.Context) {
 	tick := time.NewTicker(500 * time.Millisecond)
 	defer tick.Stop()
-	skipped := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
 		}
-		c := t.closer
-		t.mu.RLock()
-		var snap *memory
-		if len(t.mem.frames) > c.done {
-			snap = t.mem.snapshot()
+		for t.closeBatch() {
+			// A closure ended the batch early: go straight on with a fresh
+			// snapshot rather than wait for the next tick.
 		}
-		t.mu.RUnlock()
-		if snap == nil {
-			continue
-		}
-		if behind := len(snap.frames) - c.done; behind > loopBacklog {
-			skipped += behind - 1
-			c.done = len(snap.frames) - 1
-			c.streak = nil
-			log.Printf("cartographer: the loop closer fell %d keyframes behind and skipped them (%d so far)", behind-1, skipped)
-		}
-		for j := c.done; j < len(snap.frames); j++ {
-			if cl, ok := c.consider(snap, j); ok {
-				t.loopClosed(snap, cl)
-			}
-		}
-		c.done = len(snap.frames)
-		if c.log != nil {
+		if c := t.closer; c.log != nil {
 			if err := c.log.flush(); err != nil {
 				log.Printf("cartographer: writing the loop log: %v", err)
 			}
 		}
 	}
+}
+
+// closeBatch takes a snapshot of the memory, if there are keyframes the loop
+// closer has not considered, and considers them in order. It returns true when
+// a closure ended the batch with keyframes left to consider.
+func (t *Traits) closeBatch() bool {
+	c := t.closer
+	t.mu.RLock()
+	var snap *memory
+	if len(t.mem.frames) > c.done {
+		snap = t.mem.snapshot()
+	}
+	t.mu.RUnlock()
+	if snap == nil {
+		return false
+	}
+	if behind := len(snap.frames) - c.done; behind > loopBacklog {
+		c.skipped += behind - 1
+		c.done = len(snap.frames) - 1
+		c.streak = nil
+		log.Printf("cartographer: the loop closer fell %d keyframes behind and skipped them (%d so far)", behind-1, c.skipped)
+	}
+	start := c.done
+	c.done = len(snap.frames)
+	for j := start; j < len(snap.frames); j++ {
+		if cl, ok := c.consider(snap, j); ok {
+			t.loopClosed(snap, cl)
+			// The snapshot is stale now: its keyframes are where they were
+			// before this closure moved them. Matching the rest of it would
+			// find the same offset again and close the same loop again — the
+			// 5 November run did, six times over. So stop, and go on from a
+			// fresh snapshot.
+			c.done = j + 1
+			c.streak = nil
+			return c.done < len(snap.frames)
+		}
+	}
+	return false
 }
 
 // loopClosed puts a closure into the map: the keyframes where the graph put
@@ -435,12 +462,10 @@ func (t *Traits) loopClosed(snap *memory, cl closure) {
 	g := newGrid(t.cfg.WidthMetres, t.cfg.HeightMetres, t.cfg.Resolution)
 	g.matchRange = t.cfg.MatchRangeMetres
 	redrawn.drawAll(g)
-	last := len(snap.frames) - 1
-	correction := compose(cl.nodes[last], inverse(snap.frames[last].pose))
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.applyClosure(g, snap, cl.nodes, correction)
+	correction := t.applyClosure(g, snap, cl.nodes)
 	log.Printf("cartographer: the map is redrawn from %d keyframes, moved by up to %.2f m (%d loops in all); the vehicle moved %.2f m and %.1f°",
 		len(cl.nodes), cl.moved, len(t.closer.loops), math.Hypot(correction.x, correction.y), math.Abs(correction.theta)*180/math.Pi)
 }
@@ -452,10 +477,19 @@ func copyPoses(frames []keyframe, nodes []pose) {
 }
 
 // applyClosure is the part of loopClosed done under the lock: g is the grid
-// drawn from snap's sweeps at nodes, and correction what the graph did to
-// snap's newest keyframe.
-func (t *Traits) applyClosure(g *grid, snap *memory, nodes []pose, correction pose) {
+// drawn from snap's sweeps at nodes. It returns the correction it moved the
+// vehicle and the newer keyframes by.
+//
+// The correction for what came after the snapshot is taken from where the
+// snapshot's newest keyframe is now, not from where the snapshot had it. The
+// two differ when another closure has moved it since; the graph's poses say
+// where things are, and moving by the difference from the stale pose would
+// apply that other closure a second time. That is what turned the vehicle
+// 25° on the 5 November run (TestTwoClosuresFromOneSnapshotDoNotStack).
+func (t *Traits) applyClosure(g *grid, snap *memory, nodes []pose) pose {
 	m := t.mem
+	last := len(snap.frames) - 1
+	correction := compose(nodes[last], inverse(m.frames[last].pose))
 	frames, sweeps := m.since(snap)
 	copyPoses(m.frames[:len(snap.frames)], nodes)
 	for _, k := range frames {
@@ -476,6 +510,7 @@ func (t *Traits) applyClosure(g *grid, snap *memory, nodes []pose, correction po
 	// this that it was, and moves too (see consume).
 	t.corrections = compose(correction, t.corrections)
 	t.redraws++
+	return correction
 }
 
 // record writes one match to the log, if there is one.
@@ -498,7 +533,7 @@ type loopRow struct {
 	score              float64
 	seen               int
 	dx, dy, dtheta     float64 // where the match moved j from the estimate, in i's frame
-	chi2               float64 // after optimising; 0 if it was not tried
+	chi2               float64 // after optimising without the kernel, what maxChi2 judges; 0 if not tried
 	believed, accepted bool
 }
 

@@ -285,10 +285,19 @@ func TestASlipDoesNotBendTheMap(t *testing.T) {
 	headingAfter := func(gyro bool) float64 {
 		const step = 0.07 // metres per sweep
 		var left, right float64 = 57.3, 57.3
+		at := clock
+		// The wheels are stamped with the test's clock, not the wall clock.
+		// Stamped with the wall clock, two sweeps a few milliseconds apart in
+		// real time made the slip a jump of several metres a second, which
+		// the odometer takes for the loader restarting and drops — so the
+		// wheels-only drive never slipped, whenever the matcher was quick.
+		// That made this test fail now and then, and always once the map
+		// drew faster. The clock is far from now, so the odometer is told
+		// not to mind the readings' age.
 		tr := mappingTraits(func() (wheelSample, wheelSample, error) {
-			now := time.Now()
-			return wheelSample{left, now}, wheelSample{right, now}, nil
+			return wheelSample{left, at}, wheelSample{right, at}, nil
 		})
+		tr.odo.cfg.MaxAgeMs = 1 << 40
 		walls := false
 		tr.cfg.HeadingFromWalls = &walls
 		if gyro {
@@ -296,7 +305,6 @@ func TestASlipDoesNotBendTheMap(t *testing.T) {
 			tr.gyro = newGyrodometer(tr.cfg.Gyro, tr.cfg.Odometry)
 		}
 		truth := pose{x: 2}
-		at := clock
 		for i := 0; i <= 30; i++ {
 			// Four polls a sweep: the wheels and the heading, still at 0.
 			for k := 0; k < 4; k++ {
