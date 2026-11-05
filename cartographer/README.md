@@ -64,11 +64,15 @@ sequenceDiagram
 
 ## What it is, and what it is not
 
-This is a SLAM **front end**. There is no pose graph and no loop closure, so a
-long circuit of a building will not snap shut when it returns to where it
-started — the drift accumulated on the way round simply stays. For a hallway
-driven up and back, which is the experiment the students are being given, that
-is the right amount of machinery.
+By default this is a SLAM **front end**, with no pose graph and no loop
+closure. A long circuit of a building will not snap shut when it returns to
+where it started: the drift collected on the way round simply stays. For a
+hallway driven up and back, which is the experiment the students are being
+given, that is the right amount of machinery.
+
+With `loop.enabled` set, a back end is added: keyframes, a pose graph, and a
+map redrawn when the vehicle comes back to where it has been. See *Loop
+closure* below.
 
 ## Three things that are not obvious, and were each found by a failing test
 
@@ -250,3 +254,111 @@ cartographer: gyrodometry — 2.1 % of 300 intervals from the gyro, longest 0.6 
 README, *Check the mount*), calibrate the wheels with UMBmark
 (`umbmark_guide_2026-10-21.md`), and set the threshold from the CSV of a
 normal drive: above the 99.5th percentile of |turnGyro − turnWheels| / T.
+
+## Loop closure
+
+**Off unless `loop.enabled` is true**, and off the cartographer maps exactly
+as described above. On, it adds a back end: it remembers where each part of
+the map was seen from, notices when the vehicle is back somewhere it has
+been, and takes the drift collected in between back out of the map. The
+reasoning, the maths and the measurements are in
+`loop_closure_proposal_2026-11-05.md`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant F as Front end (consume)
+    participant M as Memory
+    participant L as Loop closer (its own goroutine)
+
+    F->>M: every sweep drawn: kept, hanging off a keyframe;<br/>every 0.5 m or 15°, a new keyframe, with the<br/>wheels' uncertainty since the last
+    loop every 500 ms
+        L->>M: a snapshot, if there are new keyframes
+        L->>L: for each: the older keyframes 10 m or more back<br/>along the path and near by the map; match against<br/>a submap drawn from them
+        alt scores well, fixes two directions, and twice in a row
+            L->>L: into the pose graph; optimise; its χ² must agree<br/>with the rest of the graph
+            L->>L: draw the map again from the keyframes, outside the lock
+            L->>F: swap the map in, and move the vehicle with it
+        end
+    end
+```
+
+- **Keyframes.** Every sweep the front end draws is kept, as float32, hanging
+  off a keyframe by its offset. Every `keyframeTravelMetres` or
+  `keyframeTurnDegrees` one of them becomes a keyframe: a node of the pose
+  graph. Between keyframes the wheels' (or gyrodometry's) uncertainty is grown
+  step by step with `noise`; that is the weight of the edge between them.
+- **Finding a loop.** A keyframe is matched against the older keyframes at
+  least `minGapMetres` back along the path, and near enough by the map that the
+  drift could explain the rest. The match is against a submap drawn from the
+  older keyframe and its neighbours, not against the whole map: the whole map
+  already holds the doubled wall the loop is meant to remove.
+- **Believing it.** Corridors repeat, and a convincing match in the wrong place
+  folds the map. So a match must score at least `minScore` per return. It must
+  fix at least two directions. One that fixes only two, as in a corridor,
+  keeps only its heading: the direction the corridor does not fix is never
+  found exactly, and the rest of the match is not to be trusted. It must be
+  found again from the next keyframe with the same correction. And once in the
+  graph, it must agree with the rest, within `maxChi2`.
+- **Optimising.** Levenberg–Marquardt on the graph, by conjugate gradients
+  preconditioned by the chain of keyframes. A new loop starts from the headings
+  and then the positions solved alone, and is judged without a robust kernel;
+  loops already accepted get a Cauchy kernel (`robustScale`), so that one
+  later found to be wrong cannot fold the map.
+- **Redrawing.** When some keyframe moves more than `redrawMetres`, the grid is
+  drawn again from every kept sweep, outside the lock, and swapped in. The
+  vehicle's pose moves with the newest keyframe, and a sweep matched against
+  the old grid during the swap is moved too. The frame stays
+  `map@<start time>`; the `pose` service jumps once, by the size of the
+  correction.
+
+The tests drive the ring corridor of `loops_test.go`, 20 × 10 m round a block,
+with a twentieth of a degree of phantom turn every metre:
+- the end keyframe goes from 0.25 m out to 4 mm;
+- the share of drawn walls within 10 cm of a real one goes from 60 % to 98 %.
+
+A plain corridor driven up and back with wheels reading 3 % long accepts
+23 loops, none of which moves a keyframe along the corridor. A 1 km loop of
+2000 keyframes with 100° of drift in it closes in one iteration and 8 ms
+(`BenchmarkALongLoop`).
+
+| `loop` field | default | |
+|---|---|---|
+| `enabled` | false | absent means off |
+| `keyframeTravelMetres` / `keyframeTurnDegrees` | 0.5 / 15 | |
+| `noise` | 3 % along, 2 % across, 1.5 °/m, 10 % of a turn | lower `headingDegreesPerMeter` with gyrodometry |
+| `maxSweeps` | 20000 | past it the oldest are thinned; keyframes are kept |
+| `minGapMetres` | 10 | how far back along the path a loop must reach |
+| `searchRadiusMetres` / `driftFraction` | 2 / 0.05 | how near by the map, growing with the path between |
+| `maxCandidates` | 3 | |
+| `submapMetres` / `submapKeyframes` | 16 / 5 | |
+| `search` | ±1.2 m, ±20°, 0.10 m / 2° → 0.0125 m / 0.5° | as the front end's `search` |
+| `minScore` | 0.55 | per return; 1 is every return on a wall |
+| `consistentMatches` | 2 | keyframes in a row |
+| `maxChi2` | 7.8 | χ² of three degrees of freedom at 95 % |
+| `robustScale` | 3 | Cauchy, in standard deviations, on loops already accepted |
+| `maxIterations` | 20 | |
+| `redrawMetres` | 0.05 | |
+| `logPath` | | one CSV line per match tried, and one more for each put to the graph: `t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted`. `chi2` is the one `maxChi2` judges, before the robust kernel; 0 on lines for matches not put to the graph |
+| `graphPath` | | the pose graph in g2o format, after each closure |
+
+**First tried on the vehicle on 5 November**, on a laptop, with a 250 m grid.
+The first loop closed. Later in the run, closures found from one stale
+snapshot stacked on each other and turned the map 20–30°. That is fixed:
+see the proposal, section 3.6, and `TestALaggingCloserClosesTheLoopOnce`.
+What else that run changed:
+- **The size of the grid no longer costs anything.** The likelihood field is
+  rebuilt only over the part of the grid anything has been drawn in, plus a
+  margin. On a 250 m grid (25 million cells) a rebuild took 466 ms, after
+  every sweep drawn and after every redraw. It now takes 2.5 ms
+  (`BenchmarkRebuildFieldOn250Metres`).
+- **Drawing allocates nothing.** Every beam used to build a list of cells.
+  A redraw of the ring on a 250 m grid went from 327 ms to 122 ms
+  (`BenchmarkRedrawOn250Metres`), and the front end draws each sweep faster
+  too.
+- **`maxCandidates`** is how many older keyframes each new keyframe is tried
+  against, nearest first. Each try is a submap and a wide search. If the log
+  says the loop closer fell behind and skipped keyframes, 1 is a third of the
+  work.
+- **The scanner:** the cartographer's `scan` cervice still takes any provider,
+  guetteur or vigie, and it should be pinned to the vigie.

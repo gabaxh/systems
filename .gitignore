@@ -14,7 +14,7 @@
 # and withdrawn: anything general enough to match an unsuffixed file one level
 # down also matches modboss/plc, and an ignored directory takes everything
 # inside it with it. The suffix is the rule.
-*.sh
+
 *.orig
 
 # Test binary, built with `go test -c`

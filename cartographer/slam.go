@@ -14,13 +14,18 @@ package main
 // a correlative scan matcher that finds where a sweep must have been taken from
 // for it to line up with the map so far.
 //
-// This is a SLAM *front end* and it is honest about being one. It has no pose
-// graph and no loop closure, so a long loop through a building will not snap
-// shut when it returns to where it started; the drift accumulated on the way
-// round simply stays. For a hallway driven up and back — which is the
-// experiment the students are being given — that is the right amount of
-// machinery. Loop closure is a second system's worth of work and should be
-// added when there is a loop to close, not before.
+// This is a SLAM *front end* and it is honest about being one. On its own it
+// has no pose graph and no loop closure, so a long loop through a building
+// will not snap shut when it returns to where it started; the drift
+// accumulated on the way round simply stays. For a hallway driven up and back
+// — which is the experiment the students are being given — that is the right
+// amount of machinery.
+//
+// Loop closure was "a second system's worth of work, to be added when there
+// is a loop to close". With the MID-360 there is one, and it is the back end
+// in keyframes.go, posegraph.go and loops.go, off unless loop.enabled is set.
+// It uses this file's grid and matcher as they are: matchSampled is match
+// with its scores kept, and a submap is a grid like any other.
 
 import (
 	"fmt"
@@ -69,6 +74,15 @@ type grid struct {
 	field []float32
 	dirty bool
 
+	// The cells anything has been drawn in, inclusive: the map's extent. It
+	// is empty while ex1 < ex0. Everything outside it is unknown, and so is
+	// the likelihood field there, which is why rebuildField looks no further.
+	// On a grid sized for a building it is all that matters: on 5 November
+	// the grid was 250 m across, 25 million cells, the drive covered a few
+	// hundred thousand of them, and rebuilding the whole field after every
+	// sweep took half a second on a laptop.
+	ex0, ey0, ex1, ey1 int
+
 	// matchRange is how far out the scan matcher trusts a return, in metres;
 	// 0 means all of them.
 	//
@@ -94,6 +108,7 @@ func newGrid(widthM, heightM, res float64) *grid {
 		originY: -heightM / 2,
 		cells:   make([]float32, w*h),
 		field:   make([]float32, w*h),
+		ex0:     w, ey0: h, ex1: -1, ey1: -1,
 	}
 }
 
@@ -116,6 +131,18 @@ func (g *grid) at(cx, cy int) float32 {
 func (g *grid) add(cx, cy int, v float32) {
 	if cx < 0 || cy < 0 || cx >= g.width || cy >= g.height {
 		return
+	}
+	if cx < g.ex0 {
+		g.ex0 = cx
+	}
+	if cx > g.ex1 {
+		g.ex1 = cx
+	}
+	if cy < g.ey0 {
+		g.ey0 = cy
+	}
+	if cy > g.ey1 {
+		g.ey1 = cy
 	}
 	i := cy*g.width + cx
 	n := g.cells[i] + v
@@ -152,9 +179,7 @@ func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 			prevOK = false
 			continue
 		}
-		for _, c := range line(sx, sy, ex, ey) {
-			g.add(c[0], c[1], logFree)
-		}
+		g.ray(sx, sy, ex, ey, logFree)
 		g.add(ex, ey, logOcc)
 
 		// Join this return to the one before it when the two are close enough
@@ -170,9 +195,7 @@ func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 		// drawn across the gap.
 		if prevOK {
 			if dx, dy := float64(ex-prevX)*g.res, float64(ey-prevY)*g.res; math.Hypot(dx, dy) <= surfaceGap {
-				for _, c := range line(prevX, prevY, ex, ey) {
-					g.add(c[0], c[1], logOcc)
-				}
+				g.ray(prevX, prevY, ex, ey, logOcc)
 			}
 		}
 		prevX, prevY, prevOK = ex, ey, true
@@ -213,14 +236,35 @@ const fieldCutoff = 3
 // along-wall direction then carries no false evidence, and the pose is
 // constrained by the things that genuinely constrain it: the ends of a
 // corridor, a doorway, a corner.
+//
+// Only the map's extent is worked on, with a margin of the cutoff round it.
+// Nothing outside the extent was ever drawn, so no cell out there is within
+// the cutoff of a wall and its field is zero, as it already is. Nor does
+// clipping the distance transform to the region change any distance inside
+// it: the chamfer path from a cell to its nearest wall stays within the box
+// the two span, and both lie in the region. The extent only grows, so the
+// field from an earlier rebuild never lies outside the region of a later one.
 func (g *grid) rebuildField() {
+	g.dirty = false
+	if g.ex1 < g.ex0 || g.ey1 < g.ey0 {
+		return // nothing drawn, and the field is zero everywhere
+	}
+	cutoffCells := float32(fieldCutoff * fieldSigma / g.res)
+	margin := int(math.Ceil(float64(cutoffCells))) + 1
+	x0, y0 := max(0, g.ex0-margin), max(0, g.ey0-margin)
+	x1, y1 := min(g.width-1, g.ex1+margin), min(g.height-1, g.ey1+margin)
+	rw, rh := x1-x0+1, y1-y0+1
+
 	const big = float32(1e9)
-	d := make([]float32, len(g.cells))
-	for i, v := range g.cells {
-		if v > 0 {
-			d[i] = 0
-		} else {
-			d[i] = big
+	d := make([]float32, rw*rh)
+	for y := 0; y < rh; y++ {
+		row := g.cells[(y+y0)*g.width+x0 : (y+y0)*g.width+x0+rw]
+		for x, v := range row {
+			if v > 0 {
+				d[y*rw+x] = 0
+			} else {
+				d[y*rw+x] = big
+			}
 		}
 	}
 
@@ -228,42 +272,44 @@ func (g *grid) rebuildField() {
 	// approximate Euclidean distance rather than city-block distance.
 	const diag = float32(1.41421356)
 	at := func(x, y int) float32 {
-		if x < 0 || y < 0 || x >= g.width || y >= g.height {
+		if x < 0 || y < 0 || x >= rw || y >= rh {
 			return big
 		}
-		return d[y*g.width+x]
+		return d[y*rw+x]
 	}
 	relax := func(x, y int, candidates ...float32) {
-		i := y*g.width + x
+		i := y*rw + x
 		for _, c := range candidates {
 			if c < d[i] {
 				d[i] = c
 			}
 		}
 	}
-	for y := 0; y < g.height; y++ {
-		for x := 0; x < g.width; x++ {
+	for y := 0; y < rh; y++ {
+		for x := 0; x < rw; x++ {
 			relax(x, y, at(x-1, y)+1, at(x, y-1)+1, at(x-1, y-1)+diag, at(x+1, y-1)+diag)
 		}
 	}
-	for y := g.height - 1; y >= 0; y-- {
-		for x := g.width - 1; x >= 0; x-- {
+	for y := rh - 1; y >= 0; y-- {
+		for x := rw - 1; x >= 0; x-- {
 			relax(x, y, at(x+1, y)+1, at(x, y+1)+1, at(x+1, y+1)+diag, at(x-1, y+1)+diag)
 		}
 	}
 
 	// Only near an obstacle is the Gaussian worth computing; beyond the cutoff
-	// it is indistinguishable from zero and this is a million-cell loop.
-	cutoffCells := float32(fieldCutoff * fieldSigma / g.res)
-	for i, dist := range d {
-		if dist > cutoffCells {
-			g.field[i] = 0
-			continue
+	// it is indistinguishable from zero.
+	for y := 0; y < rh; y++ {
+		for x := 0; x < rw; x++ {
+			i := (y+y0)*g.width + x + x0
+			dist := d[y*rw+x]
+			if dist > cutoffCells {
+				g.field[i] = 0
+				continue
+			}
+			m := float64(dist) * g.res
+			g.field[i] = float32(math.Exp(-m * m / (2 * fieldSigma * fieldSigma)))
 		}
-		m := float64(dist) * g.res
-		g.field[i] = float32(math.Exp(-m * m / (2 * fieldSigma * fieldSigma)))
 	}
-	g.dirty = false
 }
 
 // score is how well a sweep taken from this pose agrees with the map: the
@@ -327,17 +373,47 @@ const (
 // the coarse pass liked. Exhaustive search at fine resolution over the same
 // window would be some hundreds of times the work for the same answer.
 func (g *grid) match(prior pose, angles, distances []float64, valid []bool, cfg SearchConfig) matchResult {
+	m, _, _ := g.matchKeeping(prior, angles, distances, valid, cfg, false)
+	return m
+}
+
+// matchSampled is match, and also what the search's scores say about the pose:
+// its information matrix, in the frame of the grid, and in how many
+// independent directions the view fixes it at all (see matchInformation).
+//
+// The front end does not use it; the loop closure does, to decide whether a
+// match against an older part of the map is an edge, and what it is worth.
+// The pose and the sharpness are exactly those match returns.
+func (g *grid) matchSampled(prior pose, angles, distances []float64, valid []bool, cfg SearchConfig) (matchResult, mat3, int) {
+	m, wide, near := g.matchKeeping(prior, angles, distances, valid, cfg, true)
+	if m.score <= 0 {
+		return m, mat3{}, 0
+	}
+	info, seen := matchInformation(wide, near, cfg)
+	return m, info, seen
+}
+
+// matchKeeping is the two-pass search behind match and matchSampled. With keep
+// set, every pose each pass scored is kept, as its offset from where that pass
+// was centred: the coarse pass's over the whole window, and the fine pass's
+// around the peak.
+func (g *grid) matchKeeping(prior pose, angles, distances []float64, valid []bool, cfg SearchConfig, keep bool) (matchResult, []matchSample, []matchSample) {
 	if g.dirty {
 		g.rebuildField()
 	}
 
-	search := func(centre pose, linStep, linRange, angStep, angRange float64, stride int) (pose, float64) {
+	search := func(centre pose, linStep, linRange, angStep, angRange float64, stride int, kept *[]matchSample) (pose, float64) {
 		local, localScore := centre, math.Inf(-1)
 		for dx := -linRange; dx <= linRange+1e-9; dx += linStep {
 			for dy := -linRange; dy <= linRange+1e-9; dy += linStep {
 				for dt := -angRange; dt <= angRange+1e-9; dt += angStep {
 					c := pose{centre.x + dx, centre.y + dy, centre.theta + dt}
 					s := g.score(c, angles, distances, valid, stride)
+					if kept != nil {
+						// At full stride, so that the two passes' scores are
+						// on the same scale.
+						*kept = append(*kept, matchSample{[3]float64{dx, dy, dt}, s * float64(stride)})
+					}
 					if s > localScore {
 						local, localScore = c, s
 					}
@@ -347,11 +423,19 @@ func (g *grid) match(prior pose, angles, distances []float64, valid []bool, cfg 
 		return local, localScore
 	}
 
-	coarse, _ := search(prior, cfg.CoarseStep, cfg.SearchRange, cfg.CoarseAngle, cfg.AngleRange, cfg.CoarseStride)
-	best, bestScore := search(coarse, cfg.FineStep, cfg.CoarseStep, cfg.FineAngle, cfg.CoarseAngle, 1)
+	var wide, near *[]matchSample
+	if keep {
+		wide, near = new([]matchSample), new([]matchSample)
+	}
+	coarse, _ := search(prior, cfg.CoarseStep, cfg.SearchRange, cfg.CoarseAngle, cfg.AngleRange, cfg.CoarseStride, wide)
+	best, bestScore := search(coarse, cfg.FineStep, cfg.CoarseStep, cfg.FineAngle, cfg.CoarseAngle, 1, near)
 
 	position, heading := g.sharpness(best, bestScore, angles, distances, valid)
-	return matchResult{at: best, score: bestScore, sharp: position && heading, headingSharp: heading}
+	m := matchResult{at: best, score: bestScore, sharp: position && heading, headingSharp: heading}
+	if !keep {
+		return m, nil, nil
+	}
+	return m, *wide, *near
 }
 
 // sharpness nudges the winning pose in six directions and asks whether the
@@ -409,6 +493,36 @@ func defaultSearch() SearchConfig {
 
 // line is Bresenham between two cells, used to mark the free space a beam
 // passed through on its way to whatever stopped it.
+// ray adds v to every cell of the Bresenham line from (x0, y0) to (x1, y1),
+// the endpoint excepted: for a beam the endpoint is the obstacle, not free
+// space. It is line without the list. Drawing a sweep is 360 of these and a
+// redraw is every sweep the run has kept, and building a slice for each one
+// was nine-tenths of a redraw's time.
+func (g *grid) ray(x0, y0, x1, y1 int, v float32) {
+	dx := abs(x1 - x0)
+	dy := -abs(y1 - y0)
+	sx, sy := -1, -1
+	if x0 < x1 {
+		sx = 1
+	}
+	if y0 < y1 {
+		sy = 1
+	}
+	err := dx + dy
+	for x0 != x1 || y0 != y1 {
+		g.add(x0, y0, v)
+		e2 := 2 * err
+		if e2 >= dy {
+			err += dy
+			x0 += sx
+		}
+		if e2 <= dx {
+			err += dx
+			y0 += sy
+		}
+	}
+}
+
 func line(x0, y0, x1, y1 int) [][2]int {
 	var out [][2]int
 	dx := abs(x1 - x0)

@@ -78,6 +78,11 @@ type CartographerConfig struct {
 	// Gyro is gyrodometry: the wheels' heading corrected by the vigie's gyro
 	// where the two disagree. Off unless enabled. See gyrodometry.go.
 	Gyro GyroConfig `json:"gyro"`
+
+	// Loop is loop closure: keyframes, a pose graph, and a map that snaps
+	// shut when the vehicle comes back to where it has been. Off unless
+	// enabled. See keyframes.go and loop_closure_proposal_2026-11-05.md.
+	Loop LoopConfig `json:"loop"`
 }
 
 func (c CartographerConfig) headingFromWalls() bool {
@@ -119,6 +124,16 @@ type Traits struct {
 	mu sync.RWMutex
 	g  *grid
 	at pose
+	// mem is what loop closure remembers of the run: the keyframes and the
+	// sweeps drawn between them. nil with loop closure off. closer is the loop
+	// goroutine's, and is not under the lock.
+	mem    *memory
+	closer *closer
+	// corrections is every closure's correction so far, composed: a sweep
+	// matched against the grid while a closure swapped it is moved by what
+	// changed. redraws counts the swaps.
+	corrections pose
+	redraws     int
 	// velocity carried between sweeps, used as the prior when no odometry is
 	// available: the best guess about where the vehicle is now is where it was
 	// going last time.
@@ -194,6 +209,7 @@ func initTemplate() *components.UnitAsset {
 			HeadingFromWalls: &on,
 			Odometry:         defaultOdometry(),
 			Gyro:             defaultGyro(),
+			Loop:             defaultLoop(),
 		},
 	}
 }
@@ -238,6 +254,20 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 
 	t.readWheels = t.readLoaderWheels
 	t.g.matchRange = cfg.MatchRangeMetres
+	if cfg.Loop.on() {
+		t.mem = newMemory(cfg.Loop)
+		t.closer = newCloser(cfg.Loop, cfg.MatchRangeMetres, cfg.Resolution)
+		if cfg.Loop.LogPath != "" {
+			l, err := newLoopLog(cfg.Loop.LogPath)
+			if err != nil {
+				log.Fatalf("cartographer: cannot open the loop log: %v", err)
+			}
+			t.closer.log = l
+		}
+		log.Printf("cartographer: loop closure on: a keyframe every %.2f m or %.0f°, loops looked for %.0f m or more back along the path",
+			cfg.Loop.KeyframeTravelMetres, cfg.Loop.KeyframeTurnDegrees, cfg.Loop.MinGapMetres)
+		go t.closeLoops(sys.Ctx)
+	}
 
 	cervices := components.Cervices{
 		t.scanCervice.Definition:   t.scanCervice,
@@ -293,6 +323,11 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 				log.Printf("cartographer: closing the gyrodometry log: %v", err)
 			}
 		}
+		if t.closer != nil && t.closer.log != nil {
+			if err := t.closer.log.close(); err != nil {
+				log.Printf("cartographer: closing the loop log: %v", err)
+			}
+		}
 		if err := t.g.writePGM(cfg.PGMPath); err != nil {
 			log.Printf("cartographer: could not write the final map: %v", err)
 			return
@@ -331,6 +366,7 @@ func applyDefaults(cfg *CartographerConfig) {
 	}
 	applyOdometryDefaults(&cfg.Odometry)
 	applyGyroDefaults(&cfg.Gyro)
+	applyLoopDefaults(&cfg.Loop)
 }
 
 // wheelCervice is the quest for one wheel's travel on the loader.
@@ -607,6 +643,7 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	}
 	vx, vy, vtheta := t.vx, t.vy, t.vtheta
 	g := t.g
+	corrections := t.corrections
 	t.mu.Unlock()
 
 	// The wheels say how far the scanner moved since the last sweep, and that
@@ -679,11 +716,29 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	// A loop closure redrew the map while this sweep was being matched
+	// against the old one. The pose it was given is in the old map's terms,
+	// so it moves by what the closure did to the vehicle, and the sweep goes
+	// into the new grid.
+	if t.corrections != corrections {
+		at = compose(compose(t.corrections, inverse(corrections)), at)
+		g = t.g
+	}
+
+	// The motion since the last sweep counts toward the edge to the next
+	// keyframe whether or not this sweep is drawn: the vehicle moved either way.
+	if t.mem != nil && !first {
+		t.mem.step(t.at, at, haveOdometry)
+	}
+
 	moved := math.Hypot(at.x-t.at.x, at.y-t.at.y)
 	turned := math.Abs(wrapAngle(at.theta-t.at.theta)) * 180 / math.Pi
 	if first || moved >= t.cfg.MinTravelMetres || turned >= t.cfg.MinTurnDegrees {
 		g.integrate(at, sw.Angles, sw.Distances, sw.Valid)
 		t.integrated++
+		if t.mem != nil {
+			t.mem.keep(at, sw)
+		}
 	}
 
 	if dt > 0 {
