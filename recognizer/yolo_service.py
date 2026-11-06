@@ -33,6 +33,12 @@ from ultralytics import YOLO
 app = Flask(__name__)
 _model = None        # loaded at startup
 _model_name = "yolov8n.pt"
+MINIMUM_DETECTION_CONFIDENCE = 0.85
+
+
+def detect_objects(model, image):
+    """Return only detections whose confidence score is at least 85%."""
+    return model(image, conf=MINIMUM_DETECTION_CONFIDENCE)
 
 
 @app.get("/health")
@@ -59,8 +65,8 @@ def detect():
     if img is None:
         return jsonify({"error": "could not decode image — expected a valid JPEG"}), 400
 
-    # Run inference.
-    results = model(img)
+    # Run inference and reject detections below the minimum confidence score.
+    results = detect_objects(model, img)
 
     # Collect unique class labels in detection order.
     labels = [results[0].names[int(cls)] for cls in results[0].boxes.cls.tolist()]
