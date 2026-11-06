@@ -52,6 +52,15 @@ type LoopConfig struct {
 	// turns the heading.
 	Noise OdometryNoise `json:"noise"`
 
+	// Where the walls placed a sweep, they, not the wheels, say how far its
+	// heading may be off (see memory.step). MatchedHeadingDegreesPerMeter
+	// and MatchedTurnFraction take the place of the noise model's heading
+	// terms there. CorridorAlongFraction is the along-track error per step
+	// where the walls held only the heading and the wheels alone said how far.
+	MatchedHeadingDegreesPerMeter float64 `json:"matchedHeadingDegreesPerMeter"`
+	MatchedTurnFraction           float64 `json:"matchedTurnFraction"`
+	CorridorAlongFraction         float64 `json:"corridorAlongFraction"`
+
 	// MaxSweeps is how many sweeps are kept. Past it the oldest are thinned;
 	// keyframes are never dropped.
 	MaxSweeps int `json:"maxSweeps"`
@@ -123,20 +132,27 @@ func defaultLoop() LoopConfig {
 		KeyframeTravelMetres: 0.5,
 		KeyframeTurnDegrees:  15,
 		Noise:                defaultOdometryNoise(),
-		MaxSweeps:            20000,
-		RobustScale:          3,
-		MaxIterations:        20,
-		MinGapMetres:         10,
-		SearchRadiusMetres:   2,
-		DriftFraction:        0.05,
-		MaxCandidates:        3,
-		SubmapMetres:         16,
-		SubmapKeyframes:      5,
-		Search:               defaultLoopSearch(),
-		MinScore:             0.55,
-		ConsistentMatches:    2,
-		MaxChi2:              7.8,
-		RedrawMetres:         0.05,
+		// From the run of 6 November: the loop's 1.5° of heading belongs at
+		// the corners, where a new corridor is drawn from a turn, and not
+		// along a straight one, where the walls hold the heading sweep after
+		// sweep. 0.1°/m is 0.05° a keyframe; 2 % of a 90° corner is 1.8°.
+		MatchedHeadingDegreesPerMeter: 0.1,
+		MatchedTurnFraction:           0.02,
+		CorridorAlongFraction:         0.25,
+		MaxSweeps:                     20000,
+		RobustScale:                   3,
+		MaxIterations:                 20,
+		MinGapMetres:                  10,
+		SearchRadiusMetres:            2,
+		DriftFraction:                 0.05,
+		MaxCandidates:                 3,
+		SubmapMetres:                  16,
+		SubmapKeyframes:               5,
+		Search:                        defaultLoopSearch(),
+		MinScore:                      0.55,
+		ConsistentMatches:             2,
+		MaxChi2:                       7.8,
+		RedrawMetres:                  0.05,
 	}
 }
 
@@ -150,6 +166,15 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.Noise == (OdometryNoise{}) {
 		c.Noise = d.Noise
+	}
+	if c.MatchedHeadingDegreesPerMeter <= 0 {
+		c.MatchedHeadingDegreesPerMeter = d.MatchedHeadingDegreesPerMeter
+	}
+	if c.MatchedTurnFraction <= 0 {
+		c.MatchedTurnFraction = d.MatchedTurnFraction
+	}
+	if c.CorridorAlongFraction <= 0 {
+		c.CorridorAlongFraction = d.CorridorAlongFraction
 	}
 	if c.MaxSweeps <= 0 {
 		c.MaxSweeps = d.MaxSweeps
@@ -261,9 +286,31 @@ type memory struct {
 
 func newMemory(cfg LoopConfig) *memory { return &memory{cfg: cfg} }
 
+// placed is how the front end placed a sweep, which is what says how far the
+// step to it may be off.
+type placed int
+
+const (
+	// byConstantVelocity: no odometry, and a view that did not fix the pose
+	// either — the least trusted.
+	byConstantVelocity placed = iota
+	// byWheels: the wheels, or gyrodometry, and nothing from the walls.
+	byWheels
+	// byWallsHeading: a corridor. The walls set the heading and the wheels
+	// the position along it.
+	byWallsHeading
+	// byMatch: the map fixed the whole pose.
+	byMatch
+)
+
+// minWallStepRadians is the least heading uncertainty a step the walls placed
+// has. It is far below the matcher's fine step of 0.5°: each sweep is set
+// against the same walls as the one before, so its error is not a new one
+// added to the last but mostly the same one again.
+const minWallStepRadians = 0.01 * math.Pi / 180
+
 // step accounts for the motion from one sweep to the next, from and to in the
-// map frame. measured says whether the wheels, or gyrodometry, measured it;
-// otherwise it was constant velocity.
+// map frame, the second placed as how says.
 //
 // The covariance of the motion since the last keyframe, r, grows as the
 // covariance of a composition does:
@@ -275,7 +322,24 @@ func newMemory(cfg LoopConfig) *memory { return &memory{cfg: cfg} }
 // uncertain position. Σ_δ is the step's own covariance from OdometryNoise,
 // turned into the keyframe's frame — which stepCovariance does when it is
 // given the heading.
-func (m *memory) step(from, to pose, measured bool) {
+//
+// Where the walls placed the sweep, the step's heading is theirs, not the
+// wheels'. Down a straight corridor the walls hold it sweep after sweep, so
+// it hardly wanders; what drift there is comes in at the corners, where a new
+// corridor is drawn from a turn. Weighing those steps as the wheels' 1.5°/m
+// made every keyframe of a straight corridor look free to turn half a degree,
+// and on 6 November the optimiser spread the loop's 1.5° along the top
+// corridor as a curve: one straight wall, drawn from keyframes 0.7° apart,
+// came out twice. So there the heading's noise is MatchedHeadingDegreesPerMeter
+// and MatchedTurnFraction of the turn. Down a corridor, where the wheels alone
+// say how far, the along-track noise is CorridorAlongFraction: their error is
+// mostly a scale error, the same every metre, which an independent error per
+// step understates.
+//
+// Σ keeps growing either way. 1b8fd2a reset it to the match's accuracy
+// instead, which made the chain so stiff that a right loop could not be met
+// and every one was refused.
+func (m *memory) step(from, to pose, how placed) {
 	if len(m.frames) == 0 {
 		return
 	}
@@ -289,8 +353,18 @@ func (m *memory) step(from, to pose, measured bool) {
 		{0, 1, c*delta.x - s*delta.y},
 		{0, 0, 1},
 	}
-	stepCov := m.cfg.Noise.stepCovariance(delta, r.theta)
-	if !measured {
+	noise := m.cfg.Noise
+	if how == byWallsHeading {
+		noise.AlongFraction = math.Max(noise.AlongFraction, m.cfg.CorridorAlongFraction)
+	}
+	stepCov := noise.stepCovariance(delta, r.theta)
+	if how == byWallsHeading || how == byMatch {
+		ds := math.Hypot(delta.x, delta.y)
+		turn := math.Max(minWallStepRadians,
+			m.cfg.MatchedHeadingDegreesPerMeter*math.Pi/180*ds+m.cfg.MatchedTurnFraction*math.Abs(delta.theta))
+		stepCov[2][2] = turn * turn
+	}
+	if how == byConstantVelocity {
 		for i := range stepCov {
 			for k := range stepCov[i] {
 				stepCov[i][k] *= blindFactor * blindFactor

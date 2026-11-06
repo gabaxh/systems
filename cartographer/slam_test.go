@@ -278,3 +278,29 @@ func TestLineExcludesTheEndpoint(t *testing.T) {
 		t.Errorf("got %d intermediate cells, want 3", len(cells))
 	}
 }
+
+// A far beam clears the cells up to freeRange and no further, and its return
+// is still drawn; a near return draws as before.
+func TestAFarReturnDoesNotCarveBeyondTheCap(t *testing.T) {
+	g := newGrid(20, 20, 0.05)
+	g.freeRange = 5
+	g.integrate(pose{}, []float64{0, 90}, []float64{8, 3}, []bool{true, true})
+	at := func(x, y float64) float32 {
+		cx, cy, _ := g.cellOf(x, y)
+		return g.at(cx, cy)
+	}
+	if v := at(4.5, 0.01); v >= 0 {
+		t.Errorf("4.5 m along the far beam: %.2f, want cleared", v)
+	}
+	for _, x := range []float64{5.5, 7, 7.9} {
+		if v := at(x, 0.01); v != 0 {
+			t.Errorf("%.1f m along the far beam: %.2f, want untouched", x, v)
+		}
+	}
+	if v := at(8.01, 0.01); v <= 0 {
+		t.Errorf("the far return at 8 m: %.2f, want a wall", v)
+	}
+	if v := at(0.01, 3.01); v <= 0 {
+		t.Errorf("the near return at 3 m: %.2f, want a wall", v)
+	}
+}

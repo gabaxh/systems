@@ -34,7 +34,11 @@ func driveMemory(m *memory, n int, step float64, measured bool) pose {
 		if i == 0 {
 			next = at
 		} else {
-			m.step(at, next, measured)
+			how := byConstantVelocity
+			if measured {
+				how = byWheels
+			}
+			m.step(at, next, how)
 		}
 		at = next
 		m.keep(at, scanAt(at, start.Add(time.Duration(i)*200*time.Millisecond)))
@@ -76,7 +80,7 @@ func TestATurnMakesAKeyframe(t *testing.T) {
 	m.keep(at, scanAt(at, start))
 	for i := 1; i <= 9; i++ {
 		next := pose{theta: float64(i) * 10 * math.Pi / 180}
-		m.step(at, next, true)
+		m.step(at, next, byWheels)
 		at = next
 		m.keep(at, scanAt(at, start))
 	}
@@ -270,5 +274,183 @@ func TestLoopClosureIsOffUnlessAskedFor(t *testing.T) {
 	}
 	if d := initTemplate().Traits.(*CartographerConfig).Loop; d.on() || d.KeyframeTravelMetres <= 0 || d.MaxSweeps <= 0 {
 		t.Errorf("the template's loop block %+v", d)
+	}
+}
+
+// rectangle is how rectangleDrive drives a 20 × 10 m rectangle once round.
+type rectangle struct {
+	// old makes every step the wheels' alone, as before the walls were
+	// listened to.
+	old bool
+	// leg2Scale is how long the wheels read on the second leg; 1 is right.
+	leg2Scale float64
+	// cornerDegrees is a heading error picked up turning the second corner,
+	// which the walls then hold for the rest of the drive.
+	cornerDegrees float64
+}
+
+// rectangleDrive drives the rectangle, the walls holding the heading on the
+// straights and the map fixing the corners. It returns the graph with one loop
+// edge, from the last keyframe back to the first, where each keyframe truly
+// was, and which leg each keyframe is on (-1 for one taken turning).
+func rectangleDrive(r rectangle) (*poseGraph, []pose, []int) {
+	m := testMemory()
+	truths := route(pose{}, leg{0, 20}, leg{90, 10}, leg{90, 20}, leg{90, 10.2})
+	est := truths[0]
+	var kfTruth []pose
+	var kfLeg []int
+	corner, legNo := 0, 0
+	for k, truth := range truths {
+		turning := false
+		if k > 0 {
+			step := compose(inverse(truths[k-1]), truth)
+			turning = step.theta != 0
+			if turning && k >= 2 && compose(inverse(truths[k-2]), truths[k-1]).theta == 0 {
+				corner++
+			}
+			wheels := step
+			if !turning && corner == 1 && r.leg2Scale != 0 {
+				wheels.x *= r.leg2Scale
+			}
+			prev := est
+			est = compose(est, wheels)
+			// The walls hold the heading, wrong by whatever was picked up
+			// at the second corner.
+			est.theta = truth.theta
+			if corner >= 2 {
+				est.theta = wrapAngle(truth.theta + r.cornerDegrees*degree)
+			}
+			how := byWallsHeading
+			if turning {
+				how = byMatch
+			}
+			if r.old {
+				how = byWheels
+			}
+			m.step(prev, est, how)
+			if !turning {
+				legNo = corner
+			}
+		}
+		n := len(m.frames)
+		m.keep(est, scanAt(est, testTime))
+		if len(m.frames) > n {
+			kfTruth = append(kfTruth, truth)
+			if turning {
+				kfLeg = append(kfLeg, -1)
+			} else {
+				kfLeg = append(kfLeg, legNo)
+			}
+		}
+	}
+	last := len(m.frames) - 1
+	loop := edge{i: 0, j: last, z: compose(inverse(kfTruth[0]), kfTruth[last]), loop: true,
+		info: diag3(1e4, 1e4, 1e5)}
+	return m.graph([]edge{loop}), kfTruth, kfLeg
+}
+
+// The failure of the run of 5 November, in a rectangle. Along a corridor the
+// walls hold the heading and the wheels alone say how far; a wheel that reads
+// long makes one leg too long, and closing the loop must shorten it. Weighted
+// as the wheels' random walk, the heading looked the loose part, and the
+// optimiser bent the straight legs instead.
+func TestACorridorStretchesInsteadOfBending(t *testing.T) {
+	worst := func(g *poseGraph, truth []pose, _ []int) (metres, degrees float64) {
+		g.optimise(graphOptions{maxIterations: 20, initialise: true})
+		for i, p := range g.nodes {
+			metres = math.Max(metres, math.Hypot(p.x-truth[i].x, p.y-truth[i].y))
+			degrees = math.Max(degrees, math.Abs(wrapAngle(p.theta-truth[i].theta))*180/math.Pi)
+		}
+		return metres, degrees
+	}
+	newM, newD := worst(rectangleDrive(rectangle{leg2Scale: 1.05}))
+	oldM, oldD := worst(rectangleDrive(rectangle{leg2Scale: 1.05, old: true}))
+	t.Logf("weighted by the walls: worst %.3f m and %.2f°; as the wheels' random walk: %.3f m and %.2f°", newM, newD, oldM, oldD)
+	if newD > 0.3 {
+		t.Errorf("a straight leg was bent by %.2f° to close the loop", newD)
+	}
+	if oldD < 1 {
+		t.Errorf("weighted the old way the legs bent only %.2f°; the test would prove nothing", oldD)
+	}
+	// The leg read 0.5 m long. The loop cannot tell which of the two parallel
+	// legs that was, so the most it can do is take half off each: 0.25 m. A
+	// little more is the price of letting the corners turn, which is where a
+	// real heading error goes (TestAStraightCorridorStaysStraight).
+	if newM > 0.30 || newM >= oldM {
+		t.Errorf("a keyframe is %.3f m out, against %.3f m the old way and the 0.25 m a loop cannot tell apart", newM, oldM)
+	}
+}
+
+// The failure of the run of 6 November, in a rectangle. A heading error picked
+// up at a corner is held by the walls down every straight after it, so it
+// belongs at the corners, where the straights meet. Spread along the
+// straights instead, each one comes out curved, and one wall drawn from both
+// ends of a straight is drawn twice.
+func TestAStraightCorridorStaysStraight(t *testing.T) {
+	spread := func(g *poseGraph, truth []pose, legs []int) (worst float64) {
+		g.optimise(graphOptions{maxIterations: 20, initialise: true})
+		for l := 0; l < 4; l++ {
+			lo, hi := math.Inf(1), math.Inf(-1)
+			for i, p := range g.nodes {
+				if legs[i] == l {
+					e := wrapAngle(p.theta-truth[i].theta) * 180 / math.Pi
+					lo, hi = math.Min(lo, e), math.Max(hi, e)
+				}
+			}
+			worst = math.Max(worst, hi-lo)
+		}
+		return worst
+	}
+	g, truth, legs := rectangleDrive(rectangle{cornerDegrees: 1.5})
+	newS := spread(g, truth, legs)
+	oldS := spread(rectangleDrive(rectangle{cornerDegrees: 1.5, old: true}))
+	t.Logf("heading spread along the worst straight: %.3f° weighted by the walls, %.3f° as the wheels' random walk", newS, oldS)
+	if newS > 0.2 {
+		t.Errorf("a straight leg curves by %.3f° after closing the loop", newS)
+	}
+	if oldS < 5*newS || oldS < 0.2 {
+		t.Errorf("the old weights curved the legs by only %.3f°; the test would prove nothing", oldS)
+	}
+	if e := g.chi2(len(g.edges) - 1); e > testMemory().cfg.MaxChi2 {
+		t.Errorf("the loop's χ² is %.2f: the chain is too stiff to meet a right loop", e)
+	}
+}
+
+// Where the walls placed the pose, the heading's uncertainty grows far slower
+// than the wheels' and the along-track position's faster in a corridor, and
+// neither is reset: a chain reset to the match's accuracy at every sweep was
+// too stiff to meet any loop (1b8fd2a).
+func TestWhatTheWallsFixedIsWeighedAsTheWalls(t *testing.T) {
+	grow := func(how placed) mat3 {
+		m := testMemory()
+		m.keep(pose{}, scanAt(pose{}, testTime))
+		at := pose{}
+		for i := 0; i < 4; i++ {
+			next := compose(at, pose{x: 0.1})
+			m.step(at, next, how)
+			at = next
+		}
+		return m.cov
+	}
+	wheels, walls, matched := grow(byWheels), grow(byWallsHeading), grow(byMatch)
+	if walls[2][2] >= wheels[2][2]/10 || matched[2][2] >= wheels[2][2]/10 {
+		t.Errorf("heading variance: wheels %.3g, walls %.3g, matched %.3g", wheels[2][2], walls[2][2], matched[2][2])
+	}
+	if walls[0][0] <= wheels[0][0] {
+		t.Errorf("along a corridor the position should be looser than the wheels' own: %.3g against %.3g", walls[0][0], wheels[0][0])
+	}
+	two := func() mat3 {
+		m := testMemory()
+		m.keep(pose{}, scanAt(pose{}, testTime))
+		at := pose{}
+		for i := 0; i < 8; i++ {
+			next := compose(at, pose{x: 0.05})
+			m.step(at, next, byMatch)
+			at = next
+		}
+		return m.cov
+	}()
+	if two[2][2] <= matched[2][2]/2 || two[0][0] <= 0 {
+		t.Errorf("matched steps do not accumulate: %v after 8, %v after 4", two, matched)
 	}
 }

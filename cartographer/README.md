@@ -286,8 +286,15 @@ sequenceDiagram
 - **Keyframes.** Every sweep the front end draws is kept, as float32, hanging
   off a keyframe by its offset. Every `keyframeTravelMetres` or
   `keyframeTurnDegrees` one of them becomes a keyframe: a node of the pose
-  graph. Between keyframes the wheels' (or gyrodometry's) uncertainty is grown
-  step by step with `noise`; that is the weight of the edge between them.
+  graph. Between keyframes the uncertainty of the motion is grown step by
+  step; that is the weight of the edge between them.
+- **Weighed by what placed each sweep.** Where the wheels alone placed a
+  sweep, its step grows with `noise`. Where the walls placed it, its heading
+  grows only by `matchedHeadingDegreesPerMeter` and `matchedTurnFraction` of
+  any turn. Down a straight corridor the walls hold the heading sweep after
+  sweep, so the drift a loop finds goes to the corners, where a new corridor
+  is drawn from a turn. Where the walls held only the heading, the position
+  along the corridor grows by `corridorAlongFraction` of each step.
 - **Finding a loop.** A keyframe is matched against the older keyframes at
   least `minGapMetres` back along the path, and near enough by the map that the
   drift could explain the rest. The match is against a submap drawn from the
@@ -315,7 +322,8 @@ sequenceDiagram
 The tests drive the ring corridor of `loops_test.go`, 20 × 10 m round a block,
 with a twentieth of a degree of phantom turn every metre:
 - the end keyframe goes from 0.25 m out to 4 mm;
-- the share of drawn walls within 10 cm of a real one goes from 60 % to 98 %.
+- the share of drawn walls within 10 cm of a real one goes from 60 % to 97 %
+  (98.6 % with `freeRangeMetres` off; see below).
 
 A plain corridor driven up and back with wheels reading 3 % long accepts
 23 loops, none of which moves a keyframe along the corridor. A 1 km loop of
@@ -326,7 +334,9 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 |---|---|---|
 | `enabled` | false | absent means off |
 | `keyframeTravelMetres` / `keyframeTurnDegrees` | 0.5 / 15 | |
-| `noise` | 3 % along, 2 % across, 1.5 °/m, 10 % of a turn | lower `headingDegreesPerMeter` with gyrodometry |
+| `noise` | 3 % along, 2 % across, 1.5 °/m, 10 % of a turn | where the wheels alone placed a sweep; lower `headingDegreesPerMeter` with gyrodometry |
+| `matchedHeadingDegreesPerMeter` / `matchedTurnFraction` | 0.1 / 0.02 | the heading's noise where the walls placed a sweep |
+| `corridorAlongFraction` | 0.25 | the along-track noise where the walls held only the heading |
 | `maxSweeps` | 20000 | past it the oldest are thinned; keyframes are kept |
 | `minGapMetres` | 10 | how far back along the path a loop must reach |
 | `searchRadiusMetres` / `driftFraction` | 2 / 0.05 | how near by the map, growing with the path between |
@@ -362,3 +372,57 @@ What else that run changed:
   work.
 - **The scanner:** the cartographer's `scan` cervice still takes any provider,
   guetteur or vigie, and it should be pinned to the vigie.
+
+**Driven again on 6 November**, once round the block with a reverse and a
+loop in a side room, with `logPath` and `graphPath` set. The loop closed
+(60 loops), but the inner walls came out doubled, and white wedges crossed
+them into the block. The g2o and the loop log said why:
+- **The straights were curved.** The last closure, 1.14 m, went into the
+  graph with 0.01 m of stretch and 1.5° of turn, spread along the straight
+  corridors: the keyframes of the top corridor disagreed in heading by 0.78°,
+  and a wall seen from both ends of it was drawn twice. The edges are now
+  weighed by what placed each sweep (above).
+- **Matches that drifted were believed.** Driving on past where it had turned
+  round, the vehicle matched an old keyframe's long view of the corridor
+  ahead: −0.5°, −1°, −1.5°, −2° in four keyframes. The rest of the graph
+  disagrees with them by up to 2.1°, but the old weights let the chain bend
+  to meet them. Against the new weights, `maxChi2` refuses the worst of them.
+- **Long beams cleared walls.** A beam now clears the cells only out to
+  `freeRangeMetres` (12 m, in the main traits; negative for no limit), and
+  its return is drawn wherever it is. A beam 20 m down a corridor from a
+  keyframe half a degree out passes 17 cm to the side and, at a grazing
+  angle, undoes the wall it runs along.
+
+The run's graph, solved again with the new weights and judged again by
+`maxChi2` (`replay_test.go`, `-tags replay`): 3 of the 60 loops are refused,
+among them 127 ↔ 77. The heading spread along each straight falls from
+0.38–0.78° to 0.10–0.27°, and the closing loop still fits (χ² 1.5).
+
+The drive was also replayed through the whole cartographer
+(`simulate_test.go`, `-tags sim`), with the wheels' logged motion as the truth
+and a sweep ray-cast from the run's map at each pose. The replay is chaotic:
+which loops get in decides the result, so one run says little. Over four
+wheel-size errors (0.99, 0.995, 1.005, 1.01):
+
+| | end error | keyframe error, mean / worst | heading spread over 20 keyframes |
+|---|---|---|---|
+| before | 2.75 m | 1.16 / 2.71 m | 5.2° |
+| the new weights | 2.73 m | 1.19 / 2.69 m | 3.8° |
+| the new weights and `freeRangeMetres`, as shipped | 1.57 m | 0.77 / 1.92 m | 3.7° |
+
+Three other changes were tried and taken out, because the replay was worse
+with them (3.13 m, 1.35 / 3.26 m) and kept a third fewer loops:
+- submaps drawn only out to `matchRangeMetres`;
+- a 1° heading tolerance between matches, and a check against recently
+  accepted loops;
+- a floor under each match's uncertainty.
+
+Drawing nothing at all beyond 12 m, rather than only clearing nothing beyond
+it, was worse still (4.8 m at 0.99). With less map to match against, the front
+end drifted.
+- The log line "the vehicle moved … m" after a redraw was the translation of
+  the correction, a turn about the map's origin; it is now the vehicle's own
+  displacement.
+- The run's configuration still had `minOverlap`, `positionOverlap`,
+  `matchedMetres` and `matchedDegrees` from the reverted commits. This
+  version does not read them, and an unknown field is silently ignored.

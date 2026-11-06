@@ -94,6 +94,22 @@ type grid struct {
 	// throws an endpoint furthest. Ignoring them for matching costs nothing:
 	// they are still integrated into the map.
 	matchRange float64
+
+	// freeRange is how far along a beam the cells are cleared, in metres; 0
+	// means all the way to the return. The return itself is drawn wherever
+	// it is.
+	//
+	// A far beam is where a small heading error does the most damage to the
+	// map. A beam looking 20 m down a corridor from a keyframe half a degree
+	// out passes 17 cm to the side of where it should, and at a grazing angle
+	// it clears every cell of the wall it runs along: −0.4 a beam against
+	// +0.85 a hit, so three beams undo a wall that was seen once. On 6
+	// November those beams cut white wedges through the inner walls into the
+	// block they surround. The far wall it hit is still drawn: the front end
+	// needs it. Drawing nothing beyond 12 m was tried first, and in a replay of
+	// that drive the front end, with less map to match against, ended 4.8 m
+	// out instead of 2.6 m.
+	freeRange float64
 }
 
 func newGrid(widthM, heightM, res float64) *grid {
@@ -179,7 +195,13 @@ func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 			prevOK = false
 			continue
 		}
-		g.ray(sx, sy, ex, ey, logFree)
+		if g.freeRange > 0 && distances[i] > g.freeRange {
+			if cx, cy, ok := g.cellOf(project(p, angles[i], g.freeRange)); ok {
+				g.ray(sx, sy, cx, cy, logFree)
+			}
+		} else {
+			g.ray(sx, sy, ex, ey, logFree)
+		}
 		g.add(ex, ey, logOcc)
 
 		// Join this return to the one before it when the two are close enough

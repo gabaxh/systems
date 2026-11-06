@@ -82,7 +82,7 @@ func remember(m *memory, truths []pose, wrong func(pose) pose) []pose {
 		prev := est
 		if k > 0 {
 			est = compose(est, wrong(compose(inverse(truths[k-1]), truth)))
-			m.step(prev, est, true)
+			m.step(prev, est, byWheels)
 		}
 		n := len(m.frames)
 		m.keep(est, sweep360(truth, testTime.Add(time.Duration(k)*200*time.Millisecond)))
@@ -403,7 +403,11 @@ func TestClosingTheRingRedrawsTheMap(t *testing.T) {
 	end := truth[len(truth)-1]
 	t.Logf("%d closures, %d redraws; %.1f %% of the walls drawn within 10 cm of a real one before, %.1f %% after; the vehicle %.3f m from the truth",
 		closures, tr.redraws, 100*before, 100*after, math.Hypot(tr.at.x-end.x, tr.at.y-end.y))
-	if after < 0.97 || after <= before {
+	// 98.6 % with every beam clearing the cells all the way to its return.
+	// With freeRange at 12 m it is 96.9 %: a stray far return is no longer
+	// cleared by the beams that pass through it later. That is the price of
+	// beams that no longer clear the walls they graze (see grid.freeRange).
+	if after < 0.96 || after <= before {
 		t.Errorf("%.1f %% of the redrawn map is on a real wall (%.1f %% before)", 100*after, 100*before)
 	}
 	if d := math.Hypot(tr.at.x-end.x, tr.at.y-end.y); d > 0.05 {
@@ -447,7 +451,7 @@ func TestWhatCameAfterTheSnapshotIsFound(t *testing.T) {
 	at := start
 	for k := 1; k <= 20; k++ {
 		next := compose(at, pose{x: 0.1})
-		m.step(at, next, true)
+		m.step(at, next, byWheels)
 		at = next
 		m.keep(at, sweep360(at, testTime))
 	}

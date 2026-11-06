@@ -461,13 +461,19 @@ func (t *Traits) loopClosed(snap *memory, cl closure) {
 	copyPoses(redrawn.frames, cl.nodes)
 	g := newGrid(t.cfg.WidthMetres, t.cfg.HeightMetres, t.cfg.Resolution)
 	g.matchRange = t.cfg.MatchRangeMetres
+	g.freeRange = t.cfg.freeRange()
 	redrawn.drawAll(g)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	// The vehicle's own displacement, not the correction's translation: the
+	// correction is a transform of the map frame, and a turn of 2° about an
+	// origin 40 m away has a translation of 1.4 m however little the vehicle
+	// itself moved (the log of 6 November said 1.33 m for a few centimetres).
+	before := t.at
 	correction := t.applyClosure(g, snap, cl.nodes)
-	log.Printf("cartographer: the map is redrawn from %d keyframes, moved by up to %.2f m (%d loops in all); the vehicle moved %.2f m and %.1f°",
-		len(cl.nodes), cl.moved, len(t.closer.loops), math.Hypot(correction.x, correction.y), math.Abs(correction.theta)*180/math.Pi)
+	log.Printf("cartographer: the map is redrawn from %d keyframes, moved by up to %.2f m (%d loops in all); the vehicle moved %.2f m and turned %.1f°",
+		len(cl.nodes), cl.moved, len(t.closer.loops), math.Hypot(t.at.x-before.x, t.at.y-before.y), math.Abs(correction.theta)*180/math.Pi)
 }
 
 func copyPoses(frames []keyframe, nodes []pose) {

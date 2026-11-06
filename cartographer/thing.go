@@ -51,6 +51,12 @@ type CartographerConfig struct {
 	// the vehicle is. Returns beyond it still go into the map.
 	MatchRangeMetres float64 `json:"matchRangeMetres"`
 
+	// FreeRangeMetres is how far along a beam the cells are cleared. The
+	// return itself is drawn wherever it is; a long beam from a pose a
+	// fraction of a degree out would clear the walls it grazes (see
+	// grid.freeRange). Absent means 12 m; negative, no limit.
+	FreeRangeMetres float64 `json:"freeRangeMetres"`
+
 	// MinTravel and MinTurn are how far the vehicle must have moved before a
 	// sweep is folded into the map. Integrating every sweep from a standing
 	// vehicle burns the same evidence into the same cells until they saturate,
@@ -87,6 +93,12 @@ type CartographerConfig struct {
 
 func (c CartographerConfig) headingFromWalls() bool {
 	return c.HeadingFromWalls == nil || *c.HeadingFromWalls
+}
+
+// freeRange is the grid's freeRange: FreeRangeMetres, or 0, no limit, where it
+// is negative.
+func (c CartographerConfig) freeRange() float64 {
+	return math.Max(0, c.FreeRangeMetres)
 }
 
 // Traits holds the map and everything that changes it.
@@ -200,6 +212,7 @@ func initTemplate() *components.UnitAsset {
 			Resolution:       0.05,
 			PollMs:           200,
 			MatchRangeMetres: 10,
+			FreeRangeMetres:  12,
 			MinTravelMetres:  0.10,
 			MinTurnDegrees:   5,
 			MinValidFraction: 0.20,
@@ -254,6 +267,7 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 
 	t.readWheels = t.readLoaderWheels
 	t.g.matchRange = cfg.MatchRangeMetres
+	t.g.freeRange = cfg.freeRange()
 	if cfg.Loop.on() {
 		t.mem = newMemory(cfg.Loop)
 		t.closer = newCloser(cfg.Loop, cfg.MatchRangeMetres, cfg.Resolution)
@@ -351,6 +365,9 @@ func applyDefaults(cfg *CartographerConfig) {
 	}
 	if cfg.MatchRangeMetres <= 0 {
 		cfg.MatchRangeMetres = 10
+	}
+	if cfg.FreeRangeMetres == 0 {
+		cfg.FreeRangeMetres = 12
 	}
 	if cfg.MinValidFraction <= 0 {
 		cfg.MinValidFraction = 0.20
@@ -669,6 +686,7 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	t.haveGyroTurn = false
 
 	at, sharp := prior, true
+	wallsHeading := false // in a corridor, the walls set the heading
 	if !first {
 		m := g.match(prior, sw.Angles, sw.Distances, sw.Valid, t.cfg.Search)
 		at, sharp = m.at, m.sharp
@@ -689,6 +707,7 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 				// keep only what the walls cannot see.
 				if m.headingSharp && t.cfg.headingFromWalls() {
 					at.theta = m.at.theta
+					wallsHeading = true
 					t.mu.Lock()
 					t.wallHeadings++
 					n := t.wallHeadings
@@ -727,8 +746,18 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 
 	// The motion since the last sweep counts toward the edge to the next
 	// keyframe whether or not this sweep is drawn: the vehicle moved either way.
+	// How it was placed is how far the step may be off: see memory.step.
 	if t.mem != nil && !first {
-		t.mem.step(t.at, at, haveOdometry)
+		how := byConstantVelocity
+		switch {
+		case sharp:
+			how = byMatch
+		case wallsHeading:
+			how = byWallsHeading
+		case haveOdometry:
+			how = byWheels
+		}
+		t.mem.step(t.at, at, how)
 	}
 
 	moved := math.Hypot(at.x-t.at.x, at.y-t.at.y)
