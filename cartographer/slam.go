@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 
 	"github.com/sdoque/mbaigo/forms"
 )
@@ -390,6 +391,64 @@ type matchResult struct {
 	// line up. Sliding along parallel walls does not change their angle, so
 	// the heading of a match that slid is still the heading.
 	headingSharp bool
+}
+
+// The wide pass of a loop search (widePeaks): its step, how many returns it
+// skips, how many peaks it hands on, and how far apart they must be. 0.2 m
+// is twice the likelihood field's sigma, so no peak falls between two steps
+// unseen; at every eighth return a ±4 m window costs about what the usual
+// ±1.2 m coarse pass does.
+const (
+	wideStep       = 0.2
+	wideStride     = 8
+	widePeakCount  = 3
+	peakSeparation = 0.6
+)
+
+// widePeaks searches reach metres either way of prior, coarsely, and returns
+// the best widePeakCount poses at least peakSeparation apart, best first: the
+// places worth the usual search. Several, not one: a corridor's alias a
+// corridor's width to the side can outscore the right place at this
+// resolution, and the usual search round each decides between them.
+func (g *grid) widePeaks(prior pose, angles, distances []float64, valid []bool, reach float64, cfg SearchConfig) []pose {
+	if g.dirty {
+		g.rebuildField()
+	}
+	type peak struct {
+		at    pose
+		score float64
+	}
+	var all []peak
+	for dx := -reach; dx <= reach+1e-9; dx += wideStep {
+		for dy := -reach; dy <= reach+1e-9; dy += wideStep {
+			best := peak{score: math.Inf(-1)}
+			for dt := -cfg.AngleRange; dt <= cfg.AngleRange+1e-9; dt += cfg.CoarseAngle {
+				p := pose{prior.x + dx, prior.y + dy, prior.theta + dt}
+				if s := g.score(p, angles, distances, valid, wideStride); s > best.score {
+					best = peak{p, s}
+				}
+			}
+			all = append(all, best)
+		}
+	}
+	sort.Slice(all, func(a, b int) bool { return all[a].score > all[b].score })
+	var out []pose
+	for _, p := range all {
+		far := true
+		for _, q := range out {
+			if math.Hypot(p.at.x-q.x, p.at.y-q.y) < peakSeparation {
+				far = false
+				break
+			}
+		}
+		if far {
+			out = append(out, p.at)
+			if len(out) == widePeakCount {
+				break
+			}
+		}
+	}
+	return out
 }
 
 // probeDistance and probeAngle are how far the peak is nudged to see whether it

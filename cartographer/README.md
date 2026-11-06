@@ -304,9 +304,18 @@ sequenceDiagram
   least `minGapMetres` back along the path, and near enough by the map that the
   drift could explain the rest. The match is against a submap drawn from the
   older keyframe and its neighbours, not against the whole map: the whole map
-  already holds the doubled wall the loop is meant to remove.
+  already holds the doubled wall the loop is meant to remove. The window is
+  `search`'s ±1.2 m, until the path since the last loop accepted grows long:
+  then it is `driftFraction` of that path, up to `maxSearchMetres` (4 m). A
+  wide, coarse pass finds the best three places in it, and the usual search
+  is run round each.
 - **Believing it.** Corridors repeat, and a convincing match in the wrong place
-  folds the map. So a match must score at least `minScore` per return. It must
+  folds the map. So a match must score at least `minScore` per return, and a
+  corridor match `minCorridorScore`: a corridor has an alias a corridor's
+  width to the side, the sweep's left wall on the old pass's right wall. A
+  closure that would move some keyframe `bigCorrectionMetres` or turn one
+  `bigCorrectionDegrees` needs a match that fixes all three directions, or
+  `bigCorrectionMatches` corridor matches in a row. It must
   fix at least two directions. One that fixes only two, as in a corridor,
   keeps its heading and its position across the corridor, and takes the
   position along it from the estimate: the match's own position along a
@@ -355,7 +364,10 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 | `maxCandidates` | 3 | |
 | `submapMetres` / `submapKeyframes` | 16 / 5 | |
 | `search` | ±1.2 m, ±20°, 0.10 m / 2° → 0.0125 m / 0.5° | as the front end's `search` |
+| `maxSearchMetres` | 4 | how far the window may grow after a long stretch no loop has pinned |
 | `minScore` | 0.55 | per return; 1 is every return on a wall |
+| `minCorridorScore` | 0.65 | the same for a match that fixes only two directions |
+| `bigCorrectionMetres` / `bigCorrectionDegrees` / `bigCorrectionMatches` | 2 / 5 / 4 | a closure that big, on corridor matches alone, waits for that many in a row |
 | `consistentMatches` | 2 | keyframes in a row |
 | `maxChi2` | 7.8 | χ² of three degrees of freedom at 95 % |
 | `robustScale` | 3 | Cauchy, in standard deviations, on loops already accepted |
@@ -481,3 +493,37 @@ mean). The four runs of that drive range from 0.36 to 1.14 m before and from
 0.51 to 1.56 m now, so four runs do not tell the two apart. The replay casts
 its sweeps from the run's own map, with no glass and no stray returns, so it
 cannot show the black dots either way.
+
+**Driven again on 6 November, at 15:04**: two laps of one block, a loop
+through a side room, then up the long corridor that joins it to a second
+block, round that one, and back down the long corridor to the start. The two
+laps closed well, 368 loops. The long corridor did not: the way back down it
+was drawn a corridor's width, 3 m, beside the way up.
+- **The drift was out of reach.** After 190 m of new corridors round the
+  second block the vehicle came back about 8° and 3.8 m to the side of where
+  it had been. The loop search's ±1.2 m window could not reach the right
+  place. The window now grows with the path since the last loop accepted, up
+  to `maxSearchMetres`.
+- **An alias got in.** The best place inside the window was the sweep's
+  left wall on the old pass's right wall. It scored 0.58 and 0.56 on two
+  keyframes in a row, just above `minScore`, and moved the map 5.4 m. A
+  corridor match now needs `minCorridorScore`, and a closure that big on
+  corridor matches alone needs `bigCorrectionMatches` of them in a row.
+- **Then nothing could undo it.** Every later match agreed with the alias,
+  scored 0.40–0.43, and was refused; the right place stayed out of the
+  window.
+
+The replay cannot drive this run: its world would be the run's own map, with
+the corridor in it twice. On the two earlier drives, over four wheel-size
+errors, against the version before:
+
+| drive | | keyframe error, mean / worst | worst heading |
+|---|---|---|---|
+| 10:15 | before | 1.17 / 2.37 m | 6.6° |
+| | now | 1.07 / 2.20 m | 5.5° |
+| 12:08 | before | 0.34 / 1.04 m | 3.8° |
+| | now | 0.29 / 0.81 m | 3.4° |
+
+The big-correction rule never acted in these replays. `minCorridorScore` at
+0.7 cost the 12:08 drive five right loops and 0.47 m of mean error; at 0.65
+it costs nothing there and still refuses the alias.

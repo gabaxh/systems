@@ -618,3 +618,103 @@ func TestACorridorLoopKeepsTheCrossTrack(t *testing.T) {
 		}
 	}
 }
+
+// A corridor match must score MinCorridorScore; a match that fixes all three
+// directions only MinScore. The alias of 6 November scored 0.58.
+func TestACorridorMatchNeedsAHigherScore(t *testing.T) {
+	c := testCloser()
+	for _, tc := range []struct {
+		seen  int
+		score float64
+		want  bool
+	}{
+		{2, 0.58, false}, {2, 0.75, true}, {3, 0.58, true}, {3, 0.5, false}, {1, 0.95, false},
+	} {
+		if got := c.believable(loopMatch{seen: tc.seen, score: tc.score}); got != tc.want {
+			t.Errorf("%d directions at %.2f: believed %t, want %t", tc.seen, tc.score, got, tc.want)
+		}
+	}
+}
+
+// The window grows with the path since the last loop accepted, from the
+// search's own range to MaxSearchMetres, and shrinks again once a loop pins
+// the chain.
+func TestTheReachGrowsWithThePathSinceTheLastLoop(t *testing.T) {
+	c := testCloser()
+	m := &memory{}
+	for k := 0; k <= 400; k++ {
+		m.frames = append(m.frames, keyframe{id: k, path: 0.5 * float64(k)})
+	}
+	for _, tc := range []struct {
+		j    int
+		want float64
+	}{
+		{40, 1.2}, {120, 3}, {400, 4},
+	} {
+		if got := c.reach(m, tc.j); math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("keyframe %d, %.0f m from the start: reach %.2f m, want %.2f", tc.j, m.frames[tc.j].path, got, tc.want)
+		}
+	}
+	c.loops = []edge{{i: 3, j: 380, loop: true}}
+	if got := c.reach(m, 400); got != c.cfg.Search.SearchRange {
+		t.Errorf("10 m after a loop: reach %.2f m, want the search's own %.2f", got, c.cfg.Search.SearchRange)
+	}
+}
+
+// Coming back 2.5 m and 6° from where the map has it, the usual ±1.2 m search
+// cannot reach the right place; the wide pass finds it.
+func TestAWideSearchFindsAFarMatch(t *testing.T) {
+	g := newGrid(40, 40, 0.05)
+	for x := 1.0; x <= 19; x += 0.2 {
+		a, d, v := sweepFrom(pose{x: x}, 360, 359)
+		g.integrate(pose{x: x}, a, d, v)
+	}
+	truth := pose{6.5, 0.3, 0.05}
+	a, d, v := sweepFrom(truth, 360, 359)
+	prior := pose{truth.x - 2.5, truth.y - 0.6, truth.theta + 6*degree}
+	cfg := defaultLoopSearch()
+
+	near, _, _ := g.matchSampled(prior, a, d, v, cfg)
+	best := matchResult{score: math.Inf(-1)}
+	for _, p := range g.widePeaks(prior, a, d, v, 3, cfg) {
+		if r, _, _ := g.matchSampled(p, a, d, v, cfg); r.score > best.score {
+			best = r
+		}
+	}
+	nearErr := math.Hypot(near.at.x-truth.x, near.at.y-truth.y)
+	wideErr := math.Hypot(best.at.x-truth.x, best.at.y-truth.y)
+	t.Logf("usual search %.2f m out, wide %.3f m and %.2f° out", nearErr, wideErr, wrapAngle(best.at.theta-truth.theta)/degree)
+	if wideErr > 0.05 || math.Abs(wrapAngle(best.at.theta-truth.theta)) > 1*degree {
+		t.Errorf("the wide search found a pose %.3f m out", wideErr)
+	}
+	if nearErr < 0.5 {
+		t.Errorf("the usual search was only %.2f m out; the test does not need the wide one", nearErr)
+	}
+}
+
+// A closure that would move the map more than BigCorrectionMetres on
+// corridor matches alone waits until BigCorrectionMatches agree in a row; a
+// match that fixes all three directions, or a small correction, does not.
+func TestABigCorridorCorrectionWaitsForMoreMatches(t *testing.T) {
+	c := testCloser()
+	frames := []keyframe{{pose: pose{}}, {pose: pose{x: 1}}}
+	far := []pose{{}, {x: 1, y: 3}}    // moves one keyframe 3 m
+	near := []pose{{}, {x: 1, y: 0.5}} // 0.5 m
+	corridor := []loopMatch{{seen: 2}, {seen: 2}}
+	full := []loopMatch{{seen: 2}, {seen: 3}}
+
+	c.streak = make([]loopMatch, 2)
+	if wait, moved, _ := c.waitsForMore(corridor, far, frames); !wait || math.Abs(moved-3) > 1e-9 {
+		t.Errorf("3 m on two corridor matches: wait %t, moved %.2f", wait, moved)
+	}
+	if wait, _, _ := c.waitsForMore(full, far, frames); wait {
+		t.Error("a three-direction match was made to wait")
+	}
+	if wait, _, _ := c.waitsForMore(corridor, near, frames); wait {
+		t.Error("a 0.5 m correction was made to wait")
+	}
+	c.streak = make([]loopMatch, c.cfg.BigCorrectionMatches)
+	if wait, _, _ := c.waitsForMore(corridor, far, frames); wait {
+		t.Errorf("%d corridor matches in a row still waited", c.cfg.BigCorrectionMatches)
+	}
+}

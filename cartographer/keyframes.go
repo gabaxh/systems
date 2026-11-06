@@ -87,13 +87,41 @@ type LoopConfig struct {
 	SubmapKeyframes int          `json:"submapKeyframes"`
 	Search          SearchConfig `json:"search"`
 
-	// A match is believed when its score per return is at least MinScore,
+	// MaxSearchMetres is how far either way the window may grow after a long
+	// stretch nothing has pinned: to DriftFraction of the path since the last
+	// loop accepted, at least Search's own range and at most this. On 6
+	// November, after 190 m of new corridors, the vehicle came back 3.8 m to
+	// the side of where it had been, and the ±1.2 m window could not reach it.
+	MaxSearchMetres float64 `json:"maxSearchMetres"`
+
+	// A match is believed when its score per return is at least MinScore —
+	// MinCorridorScore if it fixes only two directions, as in a corridor —
 	// it fixes at least two directions, and ConsistentMatches keyframes in a
 	// row agree on it; and kept when its χ² after optimising is at most
 	// MaxChi2.
+	//
+	// A corridor has an alias a corridor's width to the side: the sweep's
+	// left wall on the old pass's right wall. On 6 November one scored 0.58,
+	// above MinScore, and joined two passes of the same corridor 3 m apart.
+	// Of the corridor matches accepted in the drives logged so far, the 5th
+	// percentile scored 0.68 to 0.87; the few below 0.7 were that alias, a
+	// match the rest of the graph later disagreed with by 2°, and three
+	// heading corrections of 1–1.5°. Three-direction matches, which have no
+	// such alias, scored as little as 0.55 and were right. 0.65 leaves the
+	// alias 0.07 short; at 0.7 the replayed drive of 12:08 lost five right
+	// loops, and its keyframes came out 0.47 m out on average against 0.29.
 	MinScore          float64 `json:"minScore"`
+	MinCorridorScore  float64 `json:"minCorridorScore"`
 	ConsistentMatches int     `json:"consistentMatches"`
 	MaxChi2           float64 `json:"maxChi2"`
+
+	// A closure that would move some keyframe BigCorrectionMetres or turn one
+	// BigCorrectionDegrees needs a match that fixes all three directions, or
+	// BigCorrectionMatches corridor matches in a row that agree. The 6
+	// November alias moved the map 5.4 m on two corridor matches of 0.57.
+	BigCorrectionMetres  float64 `json:"bigCorrectionMetres"`
+	BigCorrectionDegrees float64 `json:"bigCorrectionDegrees"`
+	BigCorrectionMatches int     `json:"bigCorrectionMatches"`
 
 	// RedrawMetres is how far a closure must move some keyframe for the map
 	// to be drawn again from the keyframes. Smaller corrections are kept in
@@ -168,6 +196,11 @@ func defaultLoop() LoopConfig {
 		SubmapKeyframes:               5,
 		Search:                        defaultLoopSearch(),
 		MinScore:                      0.55,
+		MinCorridorScore:              0.65,
+		MaxSearchMetres:               4,
+		BigCorrectionMetres:           2,
+		BigCorrectionDegrees:          5,
+		BigCorrectionMatches:          4,
 		ConsistentMatches:             2,
 		MaxChi2:                       7.8,
 		RedrawMetres:                  0.05,
@@ -228,6 +261,21 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.MinScore <= 0 {
 		c.MinScore = d.MinScore
+	}
+	if c.MinCorridorScore <= 0 {
+		c.MinCorridorScore = d.MinCorridorScore
+	}
+	if c.MaxSearchMetres <= 0 {
+		c.MaxSearchMetres = d.MaxSearchMetres
+	}
+	if c.BigCorrectionMetres <= 0 {
+		c.BigCorrectionMetres = d.BigCorrectionMetres
+	}
+	if c.BigCorrectionDegrees <= 0 {
+		c.BigCorrectionDegrees = d.BigCorrectionDegrees
+	}
+	if c.BigCorrectionMatches <= 0 {
+		c.BigCorrectionMatches = d.BigCorrectionMatches
 	}
 	if c.ConsistentMatches <= 0 {
 		c.ConsistentMatches = d.ConsistentMatches

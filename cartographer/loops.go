@@ -176,7 +176,22 @@ func (c *closer) match(m *memory, i, j int) loopMatch {
 	g := c.submap(m, i, j)
 	prior := compose(inverse(m.frames[i].pose), m.frames[j].pose)
 	a, d, v := m.frames[j].sweep.float64s()
-	res, info, seen := g.matchSampled(prior, a, d, v, c.cfg.Search)
+	var res matchResult
+	var info mat3
+	var seen int
+	if reach := c.reach(m, j); reach > c.cfg.Search.SearchRange {
+		// A wide, coarse pass over the whole reach, and the usual search
+		// round each of its best peaks: the usual window is what the number
+		// of directions a match fixes is judged against, so it stays as it is.
+		res.score = math.Inf(-1)
+		for _, p := range g.widePeaks(prior, a, d, v, reach, c.cfg.Search) {
+			if r, in, s := g.matchSampled(p, a, d, v, c.cfg.Search); r.score > res.score {
+				res, info, seen = r, in, s
+			}
+		}
+	} else {
+		res, info, seen = g.matchSampled(prior, a, d, v, c.cfg.Search)
+	}
 
 	returns := 0
 	for k := range v {
@@ -275,9 +290,34 @@ func edgeInformation(grid mat3, thetaZ float64) mat3 {
 	return q.mul(grid).mul(q.transpose())
 }
 
-// believable is the gate a single match must pass before it counts at all.
+// believable is the gate a single match must pass before it counts at all. A
+// corridor match, which fixes two directions, must score MinCorridorScore: it
+// has an alias a corridor's width to the side, and the alias scores about as
+// much as half the walls do.
 func (c *closer) believable(lm loopMatch) bool {
-	return lm.score >= c.cfg.MinScore && lm.seen >= 2
+	switch {
+	case lm.seen >= 3:
+		return lm.score >= c.cfg.MinScore
+	case lm.seen == 2:
+		return lm.score >= math.Max(c.cfg.MinScore, c.cfg.MinCorridorScore)
+	}
+	return false
+}
+
+// reach is how far either way keyframe j's matches are searched: DriftFraction
+// of the path since the graph last pinned the chain — the newest accepted loop
+// at or before j, or the start — and at least the search's own range, at most
+// MaxSearchMetres. Driving on through places already closed it stays small;
+// coming back after a long stretch of new corridors it grows with the drift
+// collected on the way.
+func (c *closer) reach(m *memory, j int) float64 {
+	since := m.frames[j].path
+	for _, e := range c.loops {
+		if e.j <= j && e.j < len(m.frames) {
+			since = math.Min(since, m.frames[j].path-m.frames[e.j].path)
+		}
+	}
+	return math.Max(c.cfg.Search.SearchRange, math.Min(c.cfg.DriftFraction*since, c.cfg.MaxSearchMetres))
 }
 
 // consistencyTolerance is how closely two matches must agree on the
@@ -387,6 +427,13 @@ func (c *closer) consider(m *memory, j int) (closure, bool) {
 			return closure{}, false
 		}
 	}
+	// A big correction on corridor matches alone waits for more of them. The
+	// streak is kept: the keyframes after may confirm it, or break it.
+	if wait, moved, turned := c.waitsForMore(fresh, g.nodes, m.frames); wait {
+		log.Printf("cartographer: loop waits, keyframe %d ↔ %d: on corridor matches alone it would move the map %.2f m and %.1f°; %d of %d matches in a row so far",
+			fresh[len(fresh)-1].j, fresh[len(fresh)-1].i, moved, turned*180/math.Pi, len(c.streak), c.cfg.BigCorrectionMatches)
+		return closure{}, false
+	}
 	// Phase two: everything, with the kernel on the loops, from where phase
 	// one left it.
 	g.optimise(graphOptions{maxIterations: c.cfg.MaxIterations, robust: c.cfg.RobustScale})
@@ -407,6 +454,37 @@ func (c *closer) consider(m *memory, j int) (closure, bool) {
 		}
 	}
 	return out, true
+}
+
+// movedBy is the furthest any keyframe moved from frames to nodes, and the
+// most any turned.
+func movedBy(nodes []pose, frames []keyframe) (metres, radians float64) {
+	for i, p := range nodes {
+		metres = math.Max(metres, math.Hypot(p.x-frames[i].pose.x, p.y-frames[i].pose.y))
+		radians = math.Max(radians, math.Abs(wrapAngle(p.theta-frames[i].pose.theta)))
+	}
+	return metres, radians
+}
+
+// waitsForMore says whether a closure that would put the keyframes at nodes,
+// on the matches fresh, must wait for more of the streak: it would move some
+// keyframe BigCorrectionMetres or turn one BigCorrectionDegrees, none of the
+// matches fixes all three directions, and fewer than BigCorrectionMatches
+// agree in a row. It also says how far the closure would move and turn them.
+func (c *closer) waitsForMore(fresh []loopMatch, nodes []pose, frames []keyframe) (wait bool, moved, turned float64) {
+	moved, turned = movedBy(nodes, frames)
+	big := moved >= c.cfg.BigCorrectionMetres || turned >= c.cfg.BigCorrectionDegrees*math.Pi/180
+	return big && !anyFixesAll(fresh) && len(c.streak) < c.cfg.BigCorrectionMatches, moved, turned
+}
+
+// anyFixesAll says whether one of the matches fixes all three directions.
+func anyFixesAll(matches []loopMatch) bool {
+	for _, lm := range matches {
+		if lm.seen >= 3 {
+			return true
+		}
+	}
+	return false
 }
 
 // loopBacklog is how many keyframes the loop closer may fall behind the front
