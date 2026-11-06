@@ -96,14 +96,19 @@ and it is a property of the geometry, not a defect to be tuned away.
 So the matcher probes its own answer: it nudges the winning pose and asks
 whether the score actually falls. A flat peak is reported as flat, and then:
 
-- **with odometry**, the odometry's position is taken and the matcher is not
-  allowed to slide it along the direction the map is indifferent to. The
-  **heading** is a separate question: parallel walls fix it even when they
-  cannot fix the position, so where the turning probes show a clear peak the
-  walls set the heading and the wheels supply only how far the vehicle went.
-  The wheels are worst at heading — a few millimetres of tyre or a moment of
-  slip is a turn that never happened — and left to them it bends every wall
-  drawn after it. `"headingFromWalls": false` turns this off, to compare maps;
+- **with odometry**, the odometry's position is taken along the direction the
+  map is indifferent to, and the matcher is not allowed to slide it there.
+  Across it the walls decide: the matcher probes the peak in 36 directions,
+  finds the one the score does not fall in — the corridor's axis — and keeps
+  its own position across that axis. Taken from the wheels, that position
+  drifted with every degree of heading error, and a corridor driven three
+  times came out three times, up to 0.4 m apart. `"crossTrackFromWalls":
+  false` turns this off. The **heading** is a separate question: parallel
+  walls fix it even when they cannot fix the position, so where the turning
+  probes show a clear peak the walls set the heading too. The wheels are
+  worst at heading — a few millimetres of tyre or a moment of slip is a turn
+  that never happened — and left to them it bends every wall drawn after it.
+  `"headingFromWalls": false` turns this off, to compare maps;
 - **without odometry**, the sweep is *not* integrated at all, and the system
   says so. A corridor mapped from a pose that cannot be known comes out the
   wrong length and looks entirely convincing.
@@ -303,17 +308,23 @@ sequenceDiagram
 - **Believing it.** Corridors repeat, and a convincing match in the wrong place
   folds the map. So a match must score at least `minScore` per return. It must
   fix at least two directions. One that fixes only two, as in a corridor,
-  keeps only its heading: the direction the corridor does not fix is never
-  found exactly, and the rest of the match is not to be trusted. It must be
-  found again from the next keyframe with the same correction. And once in the
-  graph, it must agree with the rest, within `maxChi2`.
+  keeps its heading and its position across the corridor, and takes the
+  position along it from the estimate: the match's own position along a
+  corridor is anywhere in the search window. The corridor's axis comes from
+  the submap, as the front end finds it, to within a degree. With
+  `"corridorCrossTrack": false` such a match keeps only its heading, as it
+  did before 7 November. It must be found again from the next keyframe with
+  the same correction. And once in the graph, it must agree with the rest,
+  within `maxChi2`.
 - **Optimising.** Levenberg–Marquardt on the graph, by conjugate gradients
   preconditioned by the chain of keyframes. A new loop starts from the headings
   and then the positions solved alone, and is judged without a robust kernel;
   loops already accepted get a Cauchy kernel (`robustScale`), so that one
   later found to be wrong cannot fold the map.
-- **Redrawing.** When some keyframe moves more than `redrawMetres`, the grid is
-  drawn again from every kept sweep, outside the lock, and swapped in. The
+- **Redrawing.** When some keyframe moves more than `redrawMetres`, or turns
+  more than `redrawDegrees`, the grid is drawn again from every kept sweep,
+  outside the lock, and swapped in. A closure too small for either stays in
+  the graph, and the log says how much it moved and turned. The
   vehicle's pose moves with the newest keyframe, and a sweep matched against
   the old grid during the swap is moved too. The frame stays
   `map@<start time>`; the `pose` service jumps once, by the size of the
@@ -322,11 +333,12 @@ sequenceDiagram
 The tests drive the ring corridor of `loops_test.go`, 20 × 10 m round a block,
 with a twentieth of a degree of phantom turn every metre:
 - the end keyframe goes from 0.25 m out to 4 mm;
-- the share of drawn walls within 10 cm of a real one goes from 60 % to 97 %
-  (98.6 % with `freeRangeMetres` off; see below).
+- the share of drawn walls within 10 cm of a real one goes from 60 % to 96 %
+  (97 % with `freeRangeMetres` off; see below).
 
 A plain corridor driven up and back with wheels reading 3 % long accepts
-23 loops, none of which moves a keyframe along the corridor. A 1 km loop of
+22 loops, none of which moves a keyframe along the corridor by more than
+4 mm of the 0.45 m the wheels added. A 1 km loop of
 2000 keyframes with 100° of drift in it closes in one iteration and 8 ms
 (`BenchmarkALongLoop`).
 
@@ -348,7 +360,8 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 | `maxChi2` | 7.8 | χ² of three degrees of freedom at 95 % |
 | `robustScale` | 3 | Cauchy, in standard deviations, on loops already accepted |
 | `maxIterations` | 20 | |
-| `redrawMetres` | 0.05 | |
+| `redrawMetres` / `redrawDegrees` | 0.05 / 0.25 | how far a closure must move or turn a keyframe for the map to be drawn again |
+| `corridorCrossTrack` | true | a corridor match keeps the position across the corridor as well as its heading |
 | `logPath` | | one CSV line per match tried, and one more for each put to the graph: `t,i,j,score,seen,dx,dy,dthetaDeg,chi2,believed,accepted`. `chi2` is the one `maxChi2` judges, before the robust kernel; 0 on lines for matches not put to the graph |
 | `graphPath` | | the pose graph in g2o format, after each closure |
 
@@ -387,11 +400,18 @@ them into the block. The g2o and the loop log said why:
   ahead: −0.5°, −1°, −1.5°, −2° in four keyframes. The rest of the graph
   disagrees with them by up to 2.1°, but the old weights let the chain bend
   to meet them. Against the new weights, `maxChi2` refuses the worst of them.
-- **Long beams cleared walls.** A beam now clears the cells only out to
-  `freeRangeMetres` (12 m, in the main traits; negative for no limit), and
-  its return is drawn wherever it is. A beam 20 m down a corridor from a
-  keyframe half a degree out passes 17 cm to the side and, at a grazing
-  angle, undoes the wall it runs along.
+- **Long beams cleared walls.** A beam 20 m down a corridor from a keyframe
+  half a degree out passes 17 cm to the side and, at a grazing angle, undoes
+  the wall it runs along. Beyond `freeRangeMetres` (12 m, in the main traits;
+  negative for no limit) a beam now counts a quarter as much, both the cells
+  it clears and the one it ends in. The first version cleared nothing beyond
+  12 m at all; see the next drive.
+- The log line "the vehicle moved … m" after a redraw was the translation of
+  the correction, a turn about the map's origin; it is now the vehicle's own
+  displacement.
+- The run's configuration still had `minOverlap`, `positionOverlap`,
+  `matchedMetres` and `matchedDegrees` from the reverted commits. This
+  version does not read them, and an unknown field is silently ignored.
 
 The run's graph, solved again with the new weights and judged again by
 `maxChi2` (`replay_test.go`, `-tags replay`): 3 of the 60 loops are refused,
@@ -420,9 +440,44 @@ with them (3.13 m, 1.35 / 3.26 m) and kept a third fewer loops:
 Drawing nothing at all beyond 12 m, rather than only clearing nothing beyond
 it, was worse still (4.8 m at 0.99). With less map to match against, the front
 end drifted.
-- The log line "the vehicle moved … m" after a redraw was the translation of
-  the correction, a turn about the map's origin; it is now the vehicle's own
-  displacement.
-- The run's configuration still had `minOverlap`, `positionOverlap`,
-  `matchedMetres` and `matchedDegrees` from the reverted commits. This
-  version does not read them, and an unknown field is silently ignored.
+
+**Driven again on 6 November, at 12:08**, with the changes above: once round
+the block, on down the first corridor to 5 m short of its end, and back in
+reverse — the same corridor three times. The walls of that corridor came out
+doubled, and the end of it as a cloud of black dots.
+- **Each pass was drawn beside the last.** Over the reverse pass the final
+  graph put the keyframes 0.1–0.4 m to the side of where their own matches
+  put them, against the first pass and the second alike. Nothing held the
+  position across a corridor. The front end took the whole position from the
+  wheels wherever the walls left it free along the corridor, and the loop
+  closer kept only the heading of a corridor match. Both now keep the
+  position across the corridor (`crossTrackFromWalls`, `corridorCrossTrack`).
+- **Heading corrections stayed in the graph.** A closure was drawn only if it
+  moved some keyframe 5 cm, and a heading correction hardly moves one; the
+  matches went on finding the same +0.5° to +1° after the loops that said so
+  had been accepted. A turn of `redrawDegrees` now redraws too, and a closure
+  that is not drawn says by how much it moved and turned. That inference is
+  for the next log to confirm.
+- **The black dots** were the first `freeRangeMetres`, which cleared nothing
+  beyond 12 m: every stray far return stayed. Beyond 12 m a beam now counts a
+  quarter.
+
+Replayed through the whole cartographer over four wheel-size errors, against
+the version before these changes:
+
+| drive | | keyframe error, mean / worst | worst heading | heading spread over 20 keyframes |
+|---|---|---|---|---|
+| 12:08, a corridor three times | before | 0.59 / 1.47 m | 6.5° | 7.9° |
+| | now | 0.34 / 1.04 m | 3.8° | 4.6° |
+| 10:15 | before | 0.77 / 1.92 m | 5.8° | 3.7° |
+| | now | 1.17 / 2.37 m | 6.6° | 3.4° |
+
+On the drive that goes down one corridor three times the error falls by
+about two fifths. On the earlier drive the result is worse on average, but no
+single change accounts for it: without the front end's position across the
+corridor it is worse still (1.33 / 3.46 m); without the loop closer's, the
+redraw on a turn, or the far weighting, it is much the same (1.08–1.19 m
+mean). The four runs of that drive range from 0.36 to 1.14 m before and from
+0.51 to 1.56 m now, so four runs do not tell the two apart. The replay casts
+its sweeps from the run's own map, with no glass and no stray returns, so it
+cannot show the black dots either way.

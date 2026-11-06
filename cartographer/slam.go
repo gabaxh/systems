@@ -95,9 +95,9 @@ type grid struct {
 	// they are still integrated into the map.
 	matchRange float64
 
-	// freeRange is how far along a beam the cells are cleared, in metres; 0
-	// means all the way to the return. The return itself is drawn wherever
-	// it is.
+	// freeRange is how far out a beam counts in full, in metres; 0 means all
+	// of it. Beyond it, what the beam says — the cells it passes are clear,
+	// the one it ends in is not — counts farWeight as much.
 	//
 	// A far beam is where a small heading error does the most damage to the
 	// map. A beam looking 20 m down a corridor from a keyframe half a degree
@@ -105,10 +105,16 @@ type grid struct {
 	// it clears every cell of the wall it runs along: −0.4 a beam against
 	// +0.85 a hit, so three beams undo a wall that was seen once. On 6
 	// November those beams cut white wedges through the inner walls into the
-	// block they surround. The far wall it hit is still drawn: the front end
-	// needs it. Drawing nothing beyond 12 m was tried first, and in a replay of
-	// that drive the front end, with less map to match against, ended 4.8 m
-	// out instead of 2.6 m.
+	// block they surround.
+	//
+	// Two harder limits were tried first. Drawing nothing beyond 12 m left the
+	// front end too little map to match against, and in a replay of that
+	// drive it ended 4.8 m out instead of 2.6 m. Drawing the far returns but
+	// clearing nothing beyond 12 m left every stray far return in the map for
+	// good, and on the next drive the end of a long corridor came out as a
+	// cloud of black dots. At a quarter weight a far return is still drawn,
+	// for the front end to match against, a few far beams through it clear
+	// it, and a grazing beam needs four times as many to undo a wall.
 	freeRange float64
 }
 
@@ -178,6 +184,10 @@ func (g *grid) add(cx, cy int, v float32) {
 // system cannot tell "nothing within range" from "a surface that returned
 // nothing", and a black door or a puddle marked as open floor is precisely the
 // error that would drive a vehicle into it. An unknown cell is an honest cell.
+// farWeight is how much a beam counts beyond freeRange. A variable only so
+// that the drive replay (simulate_test.go) can try others.
+var farWeight float32 = 0.25
+
 func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 	sx, sy, inside := g.cellOf(p.x, p.y)
 	if !inside {
@@ -195,14 +205,18 @@ func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 			prevOK = false
 			continue
 		}
+		w := float32(1)
 		if g.freeRange > 0 && distances[i] > g.freeRange {
+			// In full out to freeRange, at farWeight beyond it.
+			w = farWeight
 			if cx, cy, ok := g.cellOf(project(p, angles[i], g.freeRange)); ok {
 				g.ray(sx, sy, cx, cy, logFree)
+				g.ray(cx, cy, ex, ey, w*logFree)
 			}
 		} else {
 			g.ray(sx, sy, ex, ey, logFree)
 		}
-		g.add(ex, ey, logOcc)
+		g.add(ex, ey, w*logOcc)
 
 		// Join this return to the one before it when the two are close enough
 		// to be the same surface. A sweep samples a wall at intervals that grow
@@ -217,7 +231,7 @@ func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 		// drawn across the gap.
 		if prevOK {
 			if dx, dy := float64(ex-prevX)*g.res, float64(ey-prevY)*g.res; math.Hypot(dx, dy) <= surfaceGap {
-				g.ray(prevX, prevY, ex, ey, logOcc)
+				g.ray(prevX, prevY, ex, ey, w*logOcc)
 			}
 		}
 		prevX, prevY, prevOK = ex, ey, true
@@ -386,6 +400,56 @@ const (
 	probeAngle    = 3 * math.Pi / 180
 	sharpRatio    = 0.95
 )
+
+// axisSteps is how many directions, over half a turn, corridorAxis tries: 5°
+// apart. The position along the axis it finds is the wheels', and a match may
+// have slid along the corridor by up to the search range, 0.3 m; a direction
+// 2.5° out turns that into a centimetre across it.
+const axisSteps = 36
+
+// corridorAxis is, for a match whose position is not sharp, the one direction
+// the view leaves free: the axis of the corridor. ok is false when the score
+// falls in no direction either, as in an open hall.
+//
+// sharpness probes only along the map's x and y, which says whether the
+// position is fixed but not which way it is free. Down a corridor it is free
+// along the corridor and fixed across it: the walls say exactly how far the
+// sensor is from each of them. Without the axis the front end could only
+// take the whole position from the wheels, and on the drive of 6 November,
+// driven three times down the same corridor, each pass came out up to 0.4 m
+// to the side of the one before, and every wall twice.
+func (g *grid) corridorAxis(best pose, bestScore float64, angles, distances []float64, valid []bool) (axis float64, ok bool) {
+	if bestScore <= 0 {
+		return 0, false
+	}
+	// The lower of the two sides: a direction is free only if the score
+	// holds both ways along it.
+	probe := func(phi float64) float64 {
+		c, s := probeDistance*math.Cos(phi), probeDistance*math.Sin(phi)
+		a := g.score(pose{best.x + c, best.y + s, best.theta}, angles, distances, valid, 1)
+		b := g.score(pose{best.x - c, best.y - s, best.theta}, angles, distances, valid, 1)
+		return math.Min(a, b)
+	}
+	var scores [axisSteps]float64
+	free := 0
+	for k := range scores {
+		scores[k] = probe(float64(k) * math.Pi / axisSteps)
+		if scores[k] > scores[free] {
+			free = k
+		}
+	}
+	if scores[(free+axisSteps/2)%axisSteps] >= sharpRatio*bestScore {
+		return 0, false // free across it too: nothing to hold the position
+	}
+	// A parabola through the best direction and its two neighbours puts the
+	// axis between the steps. The directions wrap round at half a turn.
+	lo, hi := scores[(free+axisSteps-1)%axisSteps], scores[(free+1)%axisSteps]
+	offset := 0.0
+	if den := lo - 2*scores[free] + hi; den < 0 {
+		offset = math.Max(-0.5, math.Min(0.5, 0.5*(lo-hi)/den))
+	}
+	return (float64(free) + offset) * math.Pi / axisSteps, true
+}
 
 // match searches for the pose that best explains this sweep, starting from a
 // prior — the previous pose advanced by whatever motion is believed to have

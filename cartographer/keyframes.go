@@ -102,6 +102,20 @@ type LoopConfig struct {
 	// millimetres, and redrawing it each time would be all the work there is.
 	RedrawMetres float64 `json:"redrawMetres"`
 
+	// RedrawDegrees is the same for a turn: a closure that turns some keyframe
+	// by at least this much redraws the map even if nothing moved
+	// RedrawMetres. A heading correction hardly moves a keyframe, and judged
+	// by RedrawMetres alone it was kept in the graph but never reached the
+	// vehicle, which drove on with the old heading: on 6 November the matches
+	// went on finding the same +0.5° to +1° after the loops that said so had
+	// been accepted.
+	RedrawDegrees float64 `json:"redrawDegrees"`
+
+	// CorridorCrossTrack keeps, of a corridor match, the position across the
+	// corridor as well as the heading (see acrossCorridor). Absent means on;
+	// off keeps the heading only, as before 7 November.
+	CorridorCrossTrack *bool `json:"corridorCrossTrack,omitempty"`
+
 	// LogPath, when set, gets one CSV line per loop tried; GraphPath the pose
 	// graph in g2o format after each closure.
 	LogPath   string `json:"logPath"`
@@ -125,6 +139,10 @@ func defaultLoopSearch() SearchConfig {
 }
 
 func (c LoopConfig) on() bool { return c.Enabled != nil && *c.Enabled }
+
+func (c LoopConfig) corridorCrossTrack() bool {
+	return c.CorridorCrossTrack == nil || *c.CorridorCrossTrack
+}
 
 func defaultLoop() LoopConfig {
 	return LoopConfig{
@@ -153,6 +171,8 @@ func defaultLoop() LoopConfig {
 		ConsistentMatches:             2,
 		MaxChi2:                       7.8,
 		RedrawMetres:                  0.05,
+		RedrawDegrees:                 0.25,
+		CorridorCrossTrack:            &on,
 	}
 }
 
@@ -217,6 +237,9 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.RedrawMetres <= 0 {
 		c.RedrawMetres = d.RedrawMetres
+	}
+	if c.RedrawDegrees <= 0 {
+		c.RedrawDegrees = d.RedrawDegrees
 	}
 }
 

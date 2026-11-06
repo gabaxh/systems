@@ -201,8 +201,13 @@ func TestACorridorDrivenUpAndBackIsNotShortened(t *testing.T) {
 			t.Errorf("loop %d↔%d carries information %.3g along the corridor, %.3g across it", e.i, e.j, a, c)
 		}
 	}
+	// The wheels read 0.45 m long, and nothing here may take it out. The
+	// loops now hold the position across the corridor too (acrossCorridor),
+	// along an axis found to a fraction of a degree; through that, a few
+	// millimetres reach along it — 3.8 mm at worst, against 2 mm when they
+	// kept the heading only.
 	for i, p := range cl.nodes {
-		if d := p.x - m.frames[i].pose.x; math.Abs(d) > 0.002 {
+		if d := p.x - m.frames[i].pose.x; math.Abs(d) > 0.005 {
 			t.Errorf("keyframe %d moved %.4f m along the corridor", i, d)
 		}
 	}
@@ -559,5 +564,57 @@ func TestALaggingCloserClosesTheLoopOnce(t *testing.T) {
 	t.Logf("%d passes, %d loops, %d redraws; the vehicle %.3f m and %.2f° from the truth", passes, len(tr.closer.loops), tr.redraws, d, turn)
 	if d > 0.05 || turn > 1 {
 		t.Errorf("a lagging closer left the vehicle %.3f m and %.2f° from the truth", d, turn)
+	}
+}
+
+// A closure that turns a keyframe but hardly moves one is still drawn: a
+// heading the graph corrected and the vehicle never got is the vehicle driving
+// on with the old one.
+func TestATurnRedrawsTheMap(t *testing.T) {
+	tr := mappingTraits(nil)
+	tr.mem = testMemory()
+	tr.closer = testCloser()
+	remember(tr.mem, route(pose{}, leg{0, 3}), func(p pose) pose { return p })
+	at := tr.at
+	snap := tr.mem.snapshot()
+	nodes := framePoses(snap)
+	turn := 0.5 * degree
+	nodes[len(nodes)-1].theta += turn
+	tr.loopClosed(snap, closure{nodes: nodes, moved: 0.01, turned: turn})
+	if tr.redraws != 1 {
+		t.Fatalf("a 0.5° closure was not drawn (%d redraws)", tr.redraws)
+	}
+	if d := wrapAngle(tr.at.theta - at.theta); math.Abs(d-turn) > 1e-9 {
+		t.Errorf("the vehicle turned %.3f°, want %.3f°", d/degree, turn/degree)
+	}
+}
+
+// A corridor match keeps the position across the corridor and the heading,
+// and takes the position along it from the estimate: the match's own
+// position along a corridor is anywhere in the search window.
+func TestACorridorLoopKeepsTheCrossTrack(t *testing.T) {
+	for _, axisDeg := range []float64{0, 30, 97} {
+		axis := axisDeg * degree
+		ux, uy := math.Cos(axis), math.Sin(axis)
+		prior := pose{2, -1, 0.1}
+		// The match slid 1.1 m along the corridor and found the vehicle
+		// 0.25 m across it and 0.6° turned.
+		at := pose{prior.x + 1.1*ux - 0.25*uy, prior.y + 1.1*uy + 0.25*ux, prior.theta + 0.6*degree}
+		raw := mat3{{2e3, 1e3, 50}, {1e3, 3e4, 200}, {50, 200, 1e5}}
+		z, info := acrossCorridor(prior, at, axis, raw)
+
+		along := (z.x-prior.x)*ux + (z.y-prior.y)*uy
+		across := -(z.x-prior.x)*uy + (z.y-prior.y)*ux
+		if math.Abs(along) > 1e-9 || math.Abs(across-0.25) > 1e-9 || math.Abs(z.theta-at.theta) > 1e-12 {
+			t.Errorf("axis %.0f°: along %.4f, across %.4f, heading %.3f°; want 0, 0.25 and the match's", axisDeg, along, across, (z.theta-prior.theta)/degree)
+		}
+		// No information along the axis, some across it and in heading.
+		u := [3]float64{ux, uy, 0}
+		if a := info.mulVec(u); math.Abs(a[0])+math.Abs(a[1])+math.Abs(a[2]) > 1e-9 {
+			t.Errorf("axis %.0f°: information along the corridor: %v", axisDeg, a)
+		}
+		if p := [3]float64{-uy, ux, 0}; quad(p, info) <= 0 || info[2][2] <= 0 {
+			t.Errorf("axis %.0f°: nothing across the corridor or in heading: %v", axisDeg, info)
+		}
 	}
 }

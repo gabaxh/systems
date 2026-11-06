@@ -92,9 +92,10 @@ func newCloser(cfg LoopConfig, matchRange, resolution float64) *closer {
 // closure is what accepting a loop decided: the keyframe poses after
 // optimising, and the loop edges that were new.
 type closure struct {
-	nodes []pose
-	added []loopMatch
-	moved float64 // the furthest any keyframe moved, in metres
+	nodes  []pose
+	added  []loopMatch
+	moved  float64 // the furthest any keyframe moved, in metres
+	turned float64 // the most any keyframe turned, in radians
 }
 
 // candidates are the keyframes j could be a return to, nearest first.
@@ -183,15 +184,52 @@ func (c *closer) match(m *memory, i, j int) loopMatch {
 			returns++
 		}
 	}
+	z := res.at
 	if seen > 0 && seen < 3 {
-		info = headingOnly(info)
+		raw := info
+		info = headingOnly(raw)
+		if seen == 2 && c.cfg.corridorCrossTrack() {
+			if axis, ok := g.corridorAxis(res.at, res.score, a, d, v); ok {
+				z, info = acrossCorridor(prior, res.at, axis, raw)
+			}
+		}
 	}
-	lm := loopMatch{i: i, j: j, prior: prior, z: res.at, infoGrid: info, seen: seen}
+	lm := loopMatch{i: i, j: j, prior: prior, z: z, infoGrid: info, seen: seen}
 	if returns > 0 {
 		lm.score = res.score / float64(returns)
 	}
-	lm.info = edgeInformation(info, res.at.theta)
+	lm.info = edgeInformation(info, z.theta)
 	return lm
+}
+
+// acrossCorridor is a corridor match as the graph should have it: the
+// heading and the position across the corridor from the match, the position
+// along it from the estimate, prior. axis is the corridor's direction in i's
+// frame, as corridorAxis finds it on the submap; info the match's
+// information.
+//
+// The position across a corridor is what a second pass down it needs. On the
+// drive of 6 November, driven three times down the same corridor, the matches
+// kept saying the vehicle was 0.2 to 0.5 m to one side, consistently against
+// every old keyframe, while headingOnly threw it away; the pass came out
+// beside the first, and each wall twice.
+//
+// headingOnly exists because the first version leaked the meaningless
+// position along the corridor into the position across it, through a free
+// direction found a few degrees off the axis. Two things stop that here. The
+// position along the axis is the estimate's, so there is nothing along it to
+// leak. And the axis is the submap's own — the direction in which the score
+// does not fall — to within a degree, not read off the coarse search's
+// samples.
+func acrossCorridor(prior, at pose, axis float64, info mat3) (pose, mat3) {
+	ux, uy := math.Cos(axis), math.Sin(axis)
+	along := (prior.x-at.x)*ux + (prior.y-at.y)*uy
+	z := pose{at.x + along*ux, at.y + along*uy, at.theta}
+	// The information across the corridor and in heading, and none along it:
+	// Q Ω Q, with Q the projection onto the across direction and the heading.
+	px, py := -uy, ux
+	q := mat3{{px * px, px * py, 0}, {py * px, py * py, 0}, {0, 0, 1}}
+	return z, q.mul(info).mul(q)
 }
 
 // headingOnly keeps, of a match that does not fix all three directions, only
@@ -356,6 +394,7 @@ func (c *closer) consider(m *memory, j int) (closure, bool) {
 	out := closure{nodes: g.nodes, added: fresh}
 	for i, p := range g.nodes {
 		out.moved = math.Max(out.moved, math.Hypot(p.x-m.frames[i].pose.x, p.y-m.frames[i].pose.y))
+		out.turned = math.Max(out.turned, math.Abs(wrapAngle(p.theta-m.frames[i].pose.theta)))
 	}
 	for k, lm := range fresh {
 		c.streak[freshIdx[k]].accepted = true
@@ -453,8 +492,12 @@ func (t *Traits) loopClosed(snap *memory, cl closure) {
 		log.Printf("cartographer: loop closed, keyframe %d ↔ %d (score %.2f, %d directions): %.2f m and %.1f° from where the map had it",
 			lm.j, lm.i, lm.score, lm.seen, math.Hypot(dz.x, dz.y), math.Abs(dz.theta)*180/math.Pi)
 	}
-	if cl.moved < t.cfg.Loop.RedrawMetres {
-		return // in the graph, and too small to redraw the map for
+	if cl.moved < t.cfg.Loop.RedrawMetres && cl.turned < t.cfg.Loop.RedrawDegrees*math.Pi/180 {
+		// In the graph, and too small to redraw the map for. Said, so that a
+		// log shows how much of what the graph found reached the map.
+		log.Printf("cartographer: kept in the graph, not redrawn: keyframes moved up to %.3f m and turned up to %.2f°",
+			cl.moved, cl.turned*180/math.Pi)
+		return
 	}
 
 	redrawn := snap.snapshot()
