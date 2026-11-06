@@ -70,6 +70,25 @@ type ChauffeurConfig struct {
 	// MaxCurvature is used when the loader does not say.
 	MaxCurvature float64 `json:"maxCurvature"`
 
+	// Steering is how the route is followed: "pursuit", aiming at a point
+	// Lookahead along it, or "feedforward", steering the route's own curvature
+	// and allowing for the waist turning the front half (see pursuit.go).
+	Steering string `json:"steering"`
+	// FeedforwardLead is how far ahead of the vehicle the route's curvature is
+	// read, and FeedforwardWindow how much of the route it is averaged over.
+	FeedforwardLead   float64 `json:"feedforwardLeadMetres"`
+	FeedforwardWindow float64 `json:"feedforwardWindowMetres"`
+	// Correction is how gently feedforward corrects for being off the route: a
+	// pursuit this far ahead. Longer is gentler and slower to come back.
+	Correction float64 `json:"correctionMetres"`
+	// JointToFront and JointToRear are the loader's geometry, as in its own
+	// configuration: from the joint to each axle.
+	JointToFront float64 `json:"jointToFrontAxleMetres"`
+	JointToRear  float64 `json:"jointToRearAxleMetres"`
+	// LogSteering logs, for every new pose, where the vehicle is against the
+	// route and what it steers: for tuning on the vehicle.
+	LogSteering bool `json:"logSteering"`
+
 	// Vehicle picks the loader out of the cloud; ClearanceSensor picks which
 	// clearance to read, when there is more than one: the guetteur's or the vigie's.
 	Vehicle         map[string][]string `json:"vehicle"`
@@ -100,9 +119,37 @@ func applyDefaults(c *ChauffeurConfig) {
 	def(&c.RouteEndMoved, 1)
 	def(&c.RouteLonger, 3)
 	def(&c.MaxCurvature, 0.4)
+	if c.Steering == "" {
+		c.Steering = steerByPursuit
+	}
+	if c.FeedforwardLead < 0 {
+		c.FeedforwardLead = 0
+	}
+	def(&c.FeedforwardWindow, 0.6)
+	def(&c.Correction, 2.5)
+	def(&c.JointToFront, 0.6175)
+	def(&c.JointToRear, 0.6175)
 	if c.Vehicle == nil {
 		c.Vehicle = map[string][]string{"Model": {"artitrax"}}
 	}
+}
+
+const (
+	steerByPursuit     = "pursuit"
+	steerByFeedforward = "feedforward"
+)
+
+// check refuses a configuration that cannot be driven by.
+func (c ChauffeurConfig) check() error {
+	if c.Steering != steerByPursuit && c.Steering != steerByFeedforward {
+		return fmt.Errorf("steering is %q; it must be %q or %q", c.Steering, steerByPursuit, steerByFeedforward)
+	}
+	return nil
+}
+
+// readsArticulation is whether the waist's angle is wanted: to steer by, or to log.
+func (c ChauffeurConfig) readsArticulation() bool {
+	return c.Steering == steerByFeedforward || c.LogSteering
 }
 
 func (c ChauffeurConfig) tuning() tuning {
@@ -115,6 +162,13 @@ func (c ChauffeurConfig) tuning() tuning {
 		maxRouteAge:     time.Duration(c.MaxRouteAgeS) * time.Second,
 		brakeFor:        time.Second,
 		routeEndMoved:   c.RouteEndMoved, routeLonger: c.RouteLonger,
+		feedforward: c.Steering == steerByFeedforward,
+		ff: ffParams{
+			lead: c.FeedforwardLead, window: c.FeedforwardWindow, correction: c.Correction,
+			l1: c.JointToFront, l2: c.JointToRear,
+		},
+		maxArtAge:   time.Duration(c.MaxPoseAgeMs) * time.Millisecond,
+		logSteering: c.LogSteering,
 	}
 }
 
@@ -130,6 +184,8 @@ type Traits struct {
 	readRoute     func() (*forms.PathA_v1a, error)
 	readClearance func() (float64, time.Time, error)
 	readLimit     func() (float64, error)
+	// readArticulation is the waist's angle in radians, positive to the left.
+	readArticulation func() (float64, time.Time, error)
 
 	velocity, curvature, control, stop commandSink
 	replies                            chan reply
@@ -155,6 +211,9 @@ type latest struct {
 	clearAt   time.Time
 	haveClear bool
 	limit     float64
+	art       float64
+	artAt     time.Time
+	haveArt   bool
 }
 
 // commandSink is where a command goes: a sender, or a test.
@@ -199,6 +258,8 @@ func initTemplate() *components.UnitAsset {
 			HoldClearance: 0.8, StopClearance: 0.4, Arrive: 0.25, OffRoute: 0.2,
 			MaxPoseAgeMs: 1000, MaxClearanceAgeMs: 1000, MaxRouteAgeS: 15,
 			RouteEndMoved: 1, RouteLonger: 3, MaxCurvature: 0.4,
+			Steering: steerByPursuit, FeedforwardLead: 0, FeedforwardWindow: 0.6, Correction: 2.5,
+			JointToFront: 0.6175, JointToRear: 0.6175,
 			Vehicle:         map[string][]string{"Model": {"artitrax"}},
 			ClearanceSensor: map[string][]string{},
 		},
@@ -215,6 +276,9 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 		}
 	}
 	applyDefaults(&cfg)
+	if err := cfg.check(); err != nil {
+		log.Fatalf("chauffeur: %v", err)
+	}
 
 	protos := components.SProtocols(sys.Husk.ProtoPort)
 	get := func(def string, details map[string][]string) *components.Cervice {
@@ -247,6 +311,8 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 		v, _, err := fetchSignal(limitCer, sys)
 		return v, err
 	}
+	artCer := get("articulation", cfg.Vehicle)
+	t.readArticulation = func() (float64, time.Time, error) { return fetchArticulation(artCer, sys) }
 	vel := newSender("velocity", velCer, sys, unitMPerS, t.replies, velocityReply)
 	cur := newSender("curvature", curCer, sys, unitPerM, t.replies, curvatureReply)
 	ctl := newSender("control", ctlCer, sys, "", t.replies, controlReply)
@@ -265,6 +331,9 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 			"velocity": velCer, "curvature": curCer, "control": ctlCer, "stop": stopCer,
 		},
 		Traits: t,
+	}
+	if cfg.readsArticulation() {
+		ua.CervicesMap["articulation"] = artCer
 	}
 	ua.ServingFunc = func(w http.ResponseWriter, r *http.Request, servicePath string) {
 		serving(t, w, r, servicePath)
@@ -340,6 +409,22 @@ func fetchSignal(cer *components.Cervice, sys *components.System) (float64, time
 	return s.Value, s.Timestamp, nil
 }
 
+// fetchArticulation is the loader's measured waist angle, in radians.
+func fetchArticulation(cer *components.Cervice, sys *components.System) (float64, time.Time, error) {
+	f, err := fetch(cer, sys)
+	if err != nil {
+		return 0, time.Time{}, err
+	}
+	s, ok := f.(*forms.SignalA_v1a)
+	if !ok {
+		return 0, time.Time{}, fmt.Errorf("the articulation came as %s", f.FormVersion())
+	}
+	if s.Unit != "" && s.Unit != unitDegree {
+		return 0, time.Time{}, fmt.Errorf("an articulation in %s; it must be in degrees", s.Unit)
+	}
+	return s.Value * math.Pi / 180, s.Timestamp, nil
+}
+
 // startReading starts a goroutine per reading.
 func (t *Traits) startReading(ctx context.Context) {
 	every := func(period time.Duration, read func()) {
@@ -360,6 +445,22 @@ func (t *Traits) startReading(ctx context.Context) {
 	every(100*time.Millisecond, t.updateClearance)
 	every(time.Second, t.updateRoute)
 	every(5*time.Second, t.updateLimit)
+	if t.cfg.readsArticulation() {
+		every(100*time.Millisecond, t.updateArticulation)
+	}
+}
+
+func (t *Traits) updateArticulation() {
+	v, at, err := t.readArticulation()
+	if err == nil && at.IsZero() {
+		at = time.Now()
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.seen.haveArt = err == nil
+	if err == nil {
+		t.seen.art, t.seen.artAt = v, at
+	}
 }
 
 func (t *Traits) updatePose() {
@@ -444,6 +545,7 @@ func (t *Traits) cycle(now time.Time) {
 		now: now, havePose: s.havePose, x: s.pose.x, y: s.pose.y, th: s.pose.th,
 		poseFrame: s.pose.frame, poseAt: s.pose.at, route: s.route,
 		haveClear: s.haveClear, clearance: s.clearance, clearAt: s.clearAt, curveLimit: s.limit,
+		haveArt: s.haveArt, art: s.art, artAt: s.artAt,
 	})
 	after := t.m.code
 	t.mu.Unlock()

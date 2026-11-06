@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"testing"
 	"time"
 )
@@ -327,5 +328,60 @@ func TestARouteNobodyHasLookedAtHolds(t *testing.T) {
 		if m.code != codeDriving || m.route != next {
 			t.Errorf("%s: going on: %q, new route %v", name, m.code, m.route == next)
 		}
+	}
+}
+
+// The steering setting picks the law: on a curve, off to its outside, pursuit
+// and feedforward both steer, and differently.
+func TestTheSteeringSettingPicksTheLaw(t *testing.T) {
+	const k = 0.4
+	r := arcs(0, 0, 0, [2]float64{k, 8})
+	r.stamp = simEpoch
+	x, y := r.x[20], r.y[20]
+	th := math.Atan2(r.y[21]-r.y[19], r.x[21]-r.x[19])
+	steerWith := func(cfg tuning) float64 {
+		m := &mission{cfg: cfg, code: codeDriving, started: simEpoch}
+		o := observation{now: simEpoch.Add(2 * time.Second), havePose: true, x: x, y: y, th: th, poseFrame: "map@sim", poseAt: simEpoch.Add(2 * time.Second),
+			route: r, haveClear: true, clearance: 10, clearAt: simEpoch.Add(2 * time.Second), curveLimit: 0.48,
+			haveArt: true, art: articulationFor(k, simL1, simL2), artAt: simEpoch.Add(2 * time.Second)}
+		a := m.step(o)
+		if !a.drive || m.code != codeDriving {
+			t.Fatalf("%+v, %q", a, m.code)
+		}
+		return a.curvature
+	}
+	ff := steerWith(simFeedforward())
+	pp := steerWith(simTuning())
+	if math.Abs(ff-k) > 0.01 {
+		t.Errorf("feedforward on the curve: %.3f, want %.3f", ff, k)
+	}
+	if want := r.pursue(r.locate(0, x, y), x, y, th, simTuning().lookahead, 0.48); pp != want {
+		t.Errorf("pursuit: %.4f, want pure pursuit's %.4f", pp, want)
+	}
+}
+
+// Feedforward without the articulation goes on driving: losing it drops only the
+// allowance for the waist, and is no reason to hold.
+func TestALostArticulationIsNoHold(t *testing.T) {
+	m := &mission{cfg: simFeedforward()}
+	now := simEpoch
+	r := straightRoute(now)
+	m.start(now)
+	a := m.step(fineView(now, r))
+	m.granted(a.epoch, now)
+	for _, o := range []func(*observation){
+		func(o *observation) { o.haveArt = false },
+		func(o *observation) { o.haveArt, o.artAt = true, o.now.Add(-5*time.Second) }, // old
+		func(o *observation) { o.haveArt, o.artAt = true, o.now },                     // back
+	} {
+		now = now.Add(time.Second)
+		view := fineView(now, r)
+		o(&view)
+		if a = m.step(view); !a.drive || a.velocity != 0.5 || m.code != codeDriving {
+			t.Fatalf("%+v, %q", a, m.code)
+		}
+	}
+	if m.artLost {
+		t.Error("still counts the articulation as lost after it came back")
 	}
 }

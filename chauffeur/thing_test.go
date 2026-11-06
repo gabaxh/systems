@@ -70,6 +70,7 @@ func rig() (*Traits, map[string]*fakeSink) {
 	}
 	t.readClearance = func() (float64, time.Time, error) { return 10, time.Now(), nil }
 	t.readLimit = func() (float64, error) { return 0.48, nil }
+	t.readArticulation = func() (float64, time.Time, error) { return 0.1, time.Now(), nil }
 	return t, sinks
 }
 
@@ -271,5 +272,44 @@ func TestStateIsTheCode(t *testing.T) {
 	}
 	if Code(f.Value) != codeHoldObstacle {
 		t.Errorf("%v", f.Value)
+	}
+}
+
+func TestAnUnknownSteeringIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		steering string
+		ok       bool
+	}{{"", true}, {"pursuit", true}, {"feedforward", true}, {"Feedforward", false}, {"pid", false}} {
+		cfg := ChauffeurConfig{Steering: c.steering}
+		applyDefaults(&cfg)
+		if err := cfg.check(); (err == nil) != c.ok {
+			t.Errorf("steering %q: %v", c.steering, err)
+		}
+	}
+}
+
+// Steering by feedforward, the articulation is read and reaches the mission; by
+// pursuit, unless logging, it is not asked for at all.
+func TestTheArticulationIsReadOnlyWhenWanted(t *testing.T) {
+	for _, c := range []struct {
+		steering string
+		log      bool
+		want     bool
+	}{{"pursuit", false, false}, {"pursuit", true, true}, {"feedforward", false, true}} {
+		cfg := ChauffeurConfig{Steering: c.steering, LogSteering: c.log}
+		applyDefaults(&cfg)
+		if got := cfg.readsArticulation(); got != c.want {
+			t.Errorf("%s, logging %v: reads the articulation %v", c.steering, c.log, got)
+		}
+	}
+	tr, _ := rig()
+	tr.updateArticulation()
+	if !tr.seen.haveArt || tr.seen.art != 0.1 {
+		t.Errorf("read %+v", tr.seen)
+	}
+	tr.readArticulation = func() (float64, time.Time, error) { return 0, time.Time{}, refusedWith(http.StatusServiceUnavailable) }
+	tr.updateArticulation()
+	if tr.seen.haveArt {
+		t.Error("a 503 still counts as a reading")
 	}
 }

@@ -8,6 +8,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"time"
@@ -102,6 +103,14 @@ type tuning struct {
 	maxClearanceAge            time.Duration
 	brakeFor                   time.Duration
 	routeEndMoved, routeLonger float64
+
+	// feedforward steers by the route's own curvature (see pursuit.go), and
+	// otherwise by pure pursuit. maxArtAge is how old the articulation may be and
+	// still be allowed for. logSteering logs each new pose's steering.
+	feedforward bool
+	ff          ffParams
+	maxArtAge   time.Duration
+	logSteering bool
 }
 
 // observation is everything known at the start of a cycle.
@@ -117,6 +126,10 @@ type observation struct {
 	clearance  float64
 	clearAt    time.Time
 	curveLimit float64
+
+	haveArt bool
+	art     float64 // the measured articulation, radians, positive to the left
+	artAt   time.Time
 }
 
 // action is what one cycle sends.
@@ -159,6 +172,9 @@ type mission struct {
 	after      Code // what the code becomes once control is released
 	askedAt    time.Time
 	stopsOwed  int
+
+	artLost  bool      // feedforward is steering without the articulation, and has said so
+	loggedAt time.Time // the pose last logged, with logSteering
 }
 
 // start is a person saying go: from rest, or on from a hold.
@@ -333,8 +349,39 @@ func (m *mission) driveOn(o observation, a *action) {
 		m.rest(a)
 		return
 	}
-	m.curvature = m.route.pursue(m.at, o.x, o.y, o.th, m.cfg.lookahead, o.curveLimit)
+	m.curvature = m.steer(o)
 	a.drive, a.velocity, a.curvature = true, m.cfg.cruise, m.curvature
+}
+
+// steer is the curvature for this cycle, by feedforward or by pure pursuit.
+func (m *mission) steer(o observation) float64 {
+	haveArt := o.haveArt && o.now.Sub(o.artAt) <= m.cfg.maxArtAge
+	var s steer
+	if m.cfg.feedforward {
+		switch {
+		case !haveArt && !m.artLost:
+			log.Println("chauffeur: no recent articulation from the loader; steering without allowing for the waist")
+			m.artLost = true
+		case haveArt && m.artLost:
+			log.Println("chauffeur: the articulation is back")
+			m.artLost = false
+		}
+		s = m.route.pursueFeedforward(m.at, o.x, o.y, o.th, o.art, haveArt, m.cfg.ff, o.curveLimit)
+	} else {
+		s.curvature = m.route.pursue(m.at, o.x, o.y, o.th, m.cfg.lookahead, o.curveLimit)
+		s.offset, s.heading = m.route.errorsAt(m.at, o.x, o.y, o.th)
+		s.planned = m.route.curvatureOver(m.at.along, m.cfg.ff.window)
+	}
+	if m.cfg.logSteering && o.poseAt.After(m.loggedAt) {
+		m.loggedAt = o.poseAt
+		gamma := "-"
+		if haveArt {
+			gamma = fmt.Sprintf("%+.1f°", o.art*180/math.Pi)
+		}
+		log.Printf("chauffeur: steer at %.2f m: off %+.3f m, heading %+.1f°, route %+.3f, sent %+.3f /m, waist %s",
+			m.at.along, s.offset, s.heading*180/math.Pi, s.planned, s.curvature, gamma)
+	}
+	return s.curvature
 }
 
 // changedTooMuch is whether a replanned route is one the person did not look at:

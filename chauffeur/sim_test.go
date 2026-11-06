@@ -123,7 +123,21 @@ type simResult struct {
 // simDrive runs a mission along a route to its end, or until it holds or stops.
 // clearanceAt, if given, is the clearance ahead from where the vehicle is.
 func simDrive(r *route, v *simVehicle, poseDelaySweeps int, clearanceAt func(*simVehicle) float64) simResult {
-	m := &mission{cfg: simTuning()}
+	return simDriveWith(simTuning(), true, r, v, poseDelaySweeps, clearanceAt)
+}
+
+// simFeedforward is simTuning steering by feedforward.
+func simFeedforward() tuning {
+	cfg := simTuning()
+	cfg.feedforward, cfg.maxArtAge = true, time.Second
+	cfg.ff = ffParams{lead: 0, window: 0.6, correction: 2.5, l1: simL1, l2: simL2}
+	return cfg
+}
+
+// simDriveWith is simDrive with a tuning of its own, and with the loader's
+// articulation reading or without it.
+func simDriveWith(cfg tuning, withArt bool, r *route, v *simVehicle, poseDelaySweeps int, clearanceAt func(*simVehicle) float64) simResult {
+	m := &mission{cfg: cfg}
 	now := simEpoch
 	m.start(now)
 	type sample struct {
@@ -155,6 +169,7 @@ func simDrive(r *route, v *simVehicle, poseDelaySweeps int, clearanceAt func(*si
 		a := m.step(observation{
 			now: now, havePose: true, x: seen.x, y: seen.y, th: seen.th, poseFrame: "map@sim", poseAt: seen.at,
 			route: r, haveClear: true, clearance: clear, clearAt: now, curveLimit: 0.48,
+			haveArt: withArt, art: v.gamma, artAt: now,
 		})
 		if a.take {
 			m.granted(a.epoch, now)
@@ -291,5 +306,83 @@ func TestItStopsTheVehicleForSomethingVeryClose(t *testing.T) {
 	res := simDrive(r, &simVehicle{waistRate: 15 * math.Pi / 180}, 1, clear)
 	if res.code != codeStoppedTooClose {
 		t.Fatalf("ended %q, want a stop", res.code)
+	}
+}
+
+//-------------------------------------Feedforward
+
+// The routes TestTheVehicleFollowsARoute drives.
+func simRoutes() []struct {
+	name   string
+	pieces [][2]float64
+} {
+	const k = plannerCurvature
+	return []struct {
+		name   string
+		pieces [][2]float64
+	}{
+		{"straight", [][2]float64{{0, 15}}},
+		{"quarter turn at the tightest", [][2]float64{{0, 3}, {k, math.Pi / 2 / k}, {0, 5}}},
+		{"half circle at the tightest", [][2]float64{{0, 3}, {-k, math.Pi / k}, {0, 5}}},
+		{"an S", [][2]float64{{0, 2}, {k, 3}, {-k, 3}, {0, 4}}},
+		{"a double S", [][2]float64{{0, 2}, {k, 4}, {-k, 4}, {k, 4}, {0, 4}}},
+		{"small changes", [][2]float64{{0, 2}, {k / 2, 2}, {0, 1}, {-k / 2, 3}, {k / 2, 2}, {0, 3}}},
+	}
+}
+
+// Feedforward keeps much closer to the planner's tightest routes than pursuit
+// with the lookahead that stopped the waist hunting on the vehicle.
+func TestFeedforwardKeepsClose(t *testing.T) {
+	pursuit := simTuning()
+	pursuit.lookahead, pursuit.offRoute = 2.0, 5 // to see how far it strays, not where it would hold
+	for _, route := range simRoutes() {
+		for _, delay := range []int{1, 2} {
+			ff := simDriveWith(simFeedforward(), true, arcs(0, 0, 0, route.pieces...), &simVehicle{waistRate: 15 * math.Pi / 180}, delay, nil)
+			pp := simDriveWith(pursuit, true, arcs(0, 0, 0, route.pieces...), &simVehicle{waistRate: 15 * math.Pi / 180}, delay, nil)
+			t.Logf("%-30s pose %3d ms old: feedforward %.3f m off, pursuit 2.0 m %.3f m off", route.name, delay*200, ff.worstOffset, pp.worstOffset)
+			if ff.code != codeArrived {
+				t.Errorf("%s, pose %d ms old: ended %q, %.2f m off", route.name, delay*200, ff.code, ff.worstOffset)
+			}
+			if ff.worstOffset > 0.12 {
+				t.Errorf("%s, pose %d ms old: %.3f m off the route", route.name, delay*200, ff.worstOffset)
+			}
+			if ff.endError > 0.35 {
+				t.Errorf("%s: ended %.2f m from the route's end", route.name, ff.endError)
+			}
+		}
+	}
+}
+
+// A slow waist, and a vehicle set off to the side, as for pursuit.
+func TestFeedforwardWithASlowWaistAndAnOffsetStart(t *testing.T) {
+	const k = plannerCurvature
+	for _, pieces := range [][][2]float64{
+		{{0, 3}, {k, math.Pi / 2 / k}, {0, 5}},
+		{{0, 2}, {k / 2, 2}, {0, 1}, {-k / 2, 3}, {k / 2, 2}, {0, 3}},
+	} {
+		res := simDriveWith(simFeedforward(), true, arcs(0, 0, 0, pieces...), &simVehicle{waistRate: 8 * math.Pi / 180}, 1, nil)
+		if res.code != codeArrived {
+			t.Errorf("waist 8°/s: ended %q, %.2f m off", res.code, res.worstOffset)
+		}
+	}
+	res := simDriveWith(simFeedforward(), true, arcs(0, 0, 0, [2]float64{0, 12}), &simVehicle{y: 0.12, th: 5 * math.Pi / 180, waistRate: 15 * math.Pi / 180}, 1, nil)
+	if res.code != codeArrived || math.Abs(res.v.y) > 0.1 {
+		t.Errorf("from 0.12 m off: ended %q, %.2f m to the side", res.code, res.v.y)
+	}
+}
+
+// Without the articulation, feedforward still drives: it only no longer allows
+// for the waist turning the front half.
+func TestFeedforwardWithoutTheArticulationStillDrives(t *testing.T) {
+	const k = plannerCurvature
+	for _, pieces := range [][][2]float64{
+		{{0, 15}},
+		{{0, 2}, {k / 2, 2}, {0, 1}, {-k / 2, 3}, {k / 2, 2}, {0, 3}},
+	} {
+		res := simDriveWith(simFeedforward(), false, arcs(0, 0, 0, pieces...), &simVehicle{waistRate: 15 * math.Pi / 180}, 1, nil)
+		t.Logf("without the articulation: %.3f m off", res.worstOffset)
+		if res.code != codeArrived {
+			t.Errorf("ended %q, %.2f m off", res.code, res.worstOffset)
+		}
 	}
 }
