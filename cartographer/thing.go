@@ -51,6 +51,12 @@ type CartographerConfig struct {
 	// the vehicle is. Returns beyond it still go into the map.
 	MatchRangeMetres float64 `json:"matchRangeMetres"`
 
+	// FreeRangeMetres is how far along a beam the cells are cleared. The
+	// return itself is drawn wherever it is; a long beam from a pose a
+	// fraction of a degree out would clear the walls it grazes (see
+	// grid.freeRange). Absent means 12 m; negative, no limit.
+	FreeRangeMetres float64 `json:"freeRangeMetres"`
+
 	// MinTravel and MinTurn are how far the vehicle must have moved before a
 	// sweep is folded into the map. Integrating every sweep from a standing
 	// vehicle burns the same evidence into the same cells until they saturate,
@@ -71,6 +77,12 @@ type CartographerConfig struct {
 	// far the vehicle went. Absent means on. Off is there to compare maps.
 	HeadingFromWalls *bool `json:"headingFromWalls,omitempty"`
 
+	// CrossTrackFromWalls lets the walls set the position across a corridor,
+	// where they fix it, and the wheels only the position along it. Absent
+	// means on. Off takes the whole position from the wheels in a corridor,
+	// as before 7 November.
+	CrossTrackFromWalls *bool `json:"crossTrackFromWalls,omitempty"`
+
 	// Odometry is the loader's wheel encoders, turned into motion between
 	// sweeps. See odometry.go.
 	Odometry OdometryConfig `json:"odometry"`
@@ -87,6 +99,16 @@ type CartographerConfig struct {
 
 func (c CartographerConfig) headingFromWalls() bool {
 	return c.HeadingFromWalls == nil || *c.HeadingFromWalls
+}
+
+func (c CartographerConfig) crossTrackFromWalls() bool {
+	return c.CrossTrackFromWalls == nil || *c.CrossTrackFromWalls
+}
+
+// freeRange is the grid's freeRange: FreeRangeMetres, or 0, no limit, where it
+// is negative.
+func (c CartographerConfig) freeRange() float64 {
+	return math.Max(0, c.FreeRangeMetres)
 }
 
 // Traits holds the map and everything that changes it.
@@ -195,21 +217,23 @@ func initTemplate() *components.UnitAsset {
 			coverage.SubPath: &coverage,
 		},
 		Traits: &CartographerConfig{
-			WidthMetres:      60,
-			HeightMetres:     60,
-			Resolution:       0.05,
-			PollMs:           200,
-			MatchRangeMetres: 10,
-			MinTravelMetres:  0.10,
-			MinTurnDegrees:   5,
-			MinValidFraction: 0.20,
-			PGMPath:          "map.pgm",
-			PGMIntervalS:     10,
-			Search:           defaultSearch(),
-			HeadingFromWalls: &on,
-			Odometry:         defaultOdometry(),
-			Gyro:             defaultGyro(),
-			Loop:             defaultLoop(),
+			WidthMetres:         60,
+			HeightMetres:        60,
+			Resolution:          0.05,
+			PollMs:              200,
+			MatchRangeMetres:    10,
+			FreeRangeMetres:     12,
+			MinTravelMetres:     0.10,
+			MinTurnDegrees:      5,
+			MinValidFraction:    0.20,
+			PGMPath:             "map.pgm",
+			PGMIntervalS:        10,
+			Search:              defaultSearch(),
+			HeadingFromWalls:    &on,
+			CrossTrackFromWalls: &on,
+			Odometry:            defaultOdometry(),
+			Gyro:                defaultGyro(),
+			Loop:                defaultLoop(),
 		},
 	}
 }
@@ -254,6 +278,7 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 
 	t.readWheels = t.readLoaderWheels
 	t.g.matchRange = cfg.MatchRangeMetres
+	t.g.freeRange = cfg.freeRange()
 	if cfg.Loop.on() {
 		t.mem = newMemory(cfg.Loop)
 		t.closer = newCloser(cfg.Loop, cfg.MatchRangeMetres, cfg.Resolution)
@@ -351,6 +376,9 @@ func applyDefaults(cfg *CartographerConfig) {
 	}
 	if cfg.MatchRangeMetres <= 0 {
 		cfg.MatchRangeMetres = 10
+	}
+	if cfg.FreeRangeMetres == 0 {
+		cfg.FreeRangeMetres = 12
 	}
 	if cfg.MinValidFraction <= 0 {
 		cfg.MinValidFraction = 0.20
@@ -669,6 +697,7 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	t.haveGyroTurn = false
 
 	at, sharp := prior, true
+	wallsHeading := false // in a corridor, the walls set the heading
 	if !first {
 		m := g.match(prior, sw.Angles, sw.Distances, sw.Valid, t.cfg.Search)
 		at, sharp = m.at, m.sharp
@@ -678,8 +707,20 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 				// The view cannot pin the vehicle down, so the matcher cannot
 				// improve on odometry and trying makes it worse: it would slide
 				// the pose along whichever direction the map is indifferent to.
-				// Take the odometry's position and leave it alone.
+				// Take the odometry's position along that direction.
 				at = prior
+				// Across it the walls do fix the position, and the wheels'
+				// heading error, a degree say, turns into 0.3 m of sideways
+				// drift in 18 m. Driven down twice, a corridor then came out
+				// with each wall drawn twice. So where the view leaves only
+				// one direction free, the match sets the position across it.
+				if t.cfg.crossTrackFromWalls() {
+					if axis, ok := g.corridorAxis(m.at, m.score, sw.Angles, sw.Distances, sw.Valid); ok {
+						ux, uy := math.Cos(axis), math.Sin(axis)
+						along := (prior.x-m.at.x)*ux + (prior.y-m.at.y)*uy
+						at.x, at.y = m.at.x+along*ux, m.at.y+along*uy
+					}
+				}
 				// The heading is another matter. Parallel walls say nothing
 				// about how far along them the vehicle is, but exactly which
 				// way it faces, and the wheels are worst at precisely that: a
@@ -689,12 +730,13 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 				// keep only what the walls cannot see.
 				if m.headingSharp && t.cfg.headingFromWalls() {
 					at.theta = m.at.theta
+					wallsHeading = true
 					t.mu.Lock()
 					t.wallHeadings++
 					n := t.wallHeadings
 					t.mu.Unlock()
 					if n == 1 || n%500 == 0 {
-						log.Printf("cartographer: in a corridor — heading from the walls, position from the wheels (%d sweeps)", n)
+						log.Printf("cartographer: in a corridor — heading from the walls, and the position across it where they fix it; along it from the wheels (%d sweeps)", n)
 					}
 				}
 			} else {
@@ -727,8 +769,18 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 
 	// The motion since the last sweep counts toward the edge to the next
 	// keyframe whether or not this sweep is drawn: the vehicle moved either way.
+	// How it was placed is how far the step may be off: see memory.step.
 	if t.mem != nil && !first {
-		t.mem.step(t.at, at, haveOdometry)
+		how := byConstantVelocity
+		switch {
+		case sharp:
+			how = byMatch
+		case wallsHeading:
+			how = byWallsHeading
+		case haveOdometry:
+			how = byWheels
+		}
+		t.mem.step(t.at, at, how)
 	}
 
 	moved := math.Hypot(at.x-t.at.x, at.y-t.at.y)

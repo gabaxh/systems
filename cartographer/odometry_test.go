@@ -321,3 +321,70 @@ func TestWallsHoldTheHeadingAgainstUnevenWheels(t *testing.T) {
 		t.Errorf("without the walls the heading drifted only %.2f°; the test does not exercise the fix", off)
 	}
 }
+// Down a corridor the walls fix the position across it, though not along it.
+// A vehicle that has drifted sideways — as a degree of heading error does
+// over a few metres of wheels — is put back between the walls by the next
+// sweep, with crossTrackFromWalls; without it the drift stays, and a corridor
+// driven twice is drawn twice.
+func TestTheWallsHoldThePositionAcrossTheCorridor(t *testing.T) {
+	drive := func(fromWalls bool) (across, along float64) {
+		const step = 0.07
+		var left, right float64 = 57.3, 57.3
+		tr := mappingTraits(func() (wheelSample, wheelSample, error) {
+			now := time.Now()
+			return wheelSample{left, now}, wheelSample{right, now}, nil
+		})
+		tr.cfg.CrossTrackFromWalls = &fromWalls
+		truth := pose{x: 2}
+		start := time.Now()
+		for i := 0; i <= 15; i++ {
+			if i == 10 {
+				tr.at.y += 0.15 // drifted 15 cm to the left
+			}
+			tr.consume(scanAt(truth, start.Add(time.Duration(i)*200*time.Millisecond)))
+			truth.x += step
+			left += step
+			right += step
+		}
+		// The map's origin is the first sweep's pose, (2, 0).
+		driven := truth.x - step - 2
+		return tr.at.y, tr.at.x - driven
+	}
+	onAcross, onAlong := drive(true)
+	offAcross, offAlong := drive(false)
+	t.Logf("15 cm of sideways drift, 5 sweeps later: %.3f m from the walls, %.3f m without; along, %.3f and %.3f m", onAcross, offAcross, onAlong, offAlong)
+	if math.Abs(onAcross) > 0.03 {
+		t.Errorf("with the walls the vehicle is still %.3f m to the side", onAcross)
+	}
+	// Along the corridor both are a step short: the first wheel reading is only
+	// a baseline. Taking the position across it must not move it along it.
+	if math.Abs(onAlong-offAlong) > 0.02 {
+		t.Errorf("taking the position across the corridor moved it %.3f m along it", onAlong-offAlong)
+	}
+	if math.Abs(offAcross) < 0.1 {
+		t.Errorf("without the walls the drift was only %.3f m; the test does not exercise the fix", offAcross)
+	}
+}
+
+// The axis of the test corridor, which runs along x, is found to a degree and
+// a half, at the match's peak, where only the side walls are in range.
+func TestTheCorridorAxisIsFound(t *testing.T) {
+	g := newGrid(50, 50, 0.05)
+	g.matchRange = 4
+	for x := 10.0; x <= 18; x += 0.1 {
+		a, d, v := sweepFrom(pose{x: x}, 360, 359)
+		g.integrate(pose{x: x}, a, d, v)
+	}
+	for _, theta := range []float64{0, 0.2, -0.3} {
+		p := pose{15, 0.1, theta}
+		a, d, v := sweepFrom(p, 360, 359)
+		m := g.match(p, a, d, v, defaultSearch())
+		axis, ok := g.corridorAxis(m.at, m.score, a, d, v)
+		if !ok {
+			t.Fatalf("heading %.1f: no axis found", theta)
+		}
+		if e := math.Abs(wrapAngle(2*axis)) / 2; e > 1.5*degree {
+			t.Errorf("heading %.1f: axis %.2f°, want 0 ± 1.5°", theta, axis/degree)
+		}
+	}
+}

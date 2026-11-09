@@ -52,6 +52,15 @@ type LoopConfig struct {
 	// turns the heading.
 	Noise OdometryNoise `json:"noise"`
 
+	// Where the walls placed a sweep, they, not the wheels, say how far its
+	// heading may be off (see memory.step). MatchedHeadingDegreesPerMeter
+	// and MatchedTurnFraction take the place of the noise model's heading
+	// terms there. CorridorAlongFraction is the along-track error per step
+	// where the walls held only the heading and the wheels alone said how far.
+	MatchedHeadingDegreesPerMeter float64 `json:"matchedHeadingDegreesPerMeter"`
+	MatchedTurnFraction           float64 `json:"matchedTurnFraction"`
+	CorridorAlongFraction         float64 `json:"corridorAlongFraction"`
+
 	// MaxSweeps is how many sweeps are kept. Past it the oldest are thinned;
 	// keyframes are never dropped.
 	MaxSweeps int `json:"maxSweeps"`
@@ -78,13 +87,41 @@ type LoopConfig struct {
 	SubmapKeyframes int          `json:"submapKeyframes"`
 	Search          SearchConfig `json:"search"`
 
-	// A match is believed when its score per return is at least MinScore,
+	// MaxSearchMetres is how far either way the window may grow after a long
+	// stretch nothing has pinned: to DriftFraction of the path since the last
+	// loop accepted, at least Search's own range and at most this. On 6
+	// November, after 190 m of new corridors, the vehicle came back 3.8 m to
+	// the side of where it had been, and the ±1.2 m window could not reach it.
+	MaxSearchMetres float64 `json:"maxSearchMetres"`
+
+	// A match is believed when its score per return is at least MinScore —
+	// MinCorridorScore if it fixes only two directions, as in a corridor —
 	// it fixes at least two directions, and ConsistentMatches keyframes in a
 	// row agree on it; and kept when its χ² after optimising is at most
 	// MaxChi2.
+	//
+	// A corridor has an alias a corridor's width to the side: the sweep's
+	// left wall on the old pass's right wall. On 6 November one scored 0.58,
+	// above MinScore, and joined two passes of the same corridor 3 m apart.
+	// Of the corridor matches accepted in the drives logged so far, the 5th
+	// percentile scored 0.68 to 0.87; the few below 0.7 were that alias, a
+	// match the rest of the graph later disagreed with by 2°, and three
+	// heading corrections of 1–1.5°. Three-direction matches, which have no
+	// such alias, scored as little as 0.55 and were right. 0.65 leaves the
+	// alias 0.07 short; at 0.7 the replayed drive of 12:08 lost five right
+	// loops, and its keyframes came out 0.47 m out on average against 0.29.
 	MinScore          float64 `json:"minScore"`
+	MinCorridorScore  float64 `json:"minCorridorScore"`
 	ConsistentMatches int     `json:"consistentMatches"`
 	MaxChi2           float64 `json:"maxChi2"`
+
+	// A closure that would move some keyframe BigCorrectionMetres or turn one
+	// BigCorrectionDegrees needs a match that fixes all three directions, or
+	// BigCorrectionMatches corridor matches in a row that agree. The 6
+	// November alias moved the map 5.4 m on two corridor matches of 0.57.
+	BigCorrectionMetres  float64 `json:"bigCorrectionMetres"`
+	BigCorrectionDegrees float64 `json:"bigCorrectionDegrees"`
+	BigCorrectionMatches int     `json:"bigCorrectionMatches"`
 
 	// RedrawMetres is how far a closure must move some keyframe for the map
 	// to be drawn again from the keyframes. Smaller corrections are kept in
@@ -92,6 +129,20 @@ type LoopConfig struct {
 	// closed, every keyframe confirms the loop and moves the map a few
 	// millimetres, and redrawing it each time would be all the work there is.
 	RedrawMetres float64 `json:"redrawMetres"`
+
+	// RedrawDegrees is the same for a turn: a closure that turns some keyframe
+	// by at least this much redraws the map even if nothing moved
+	// RedrawMetres. A heading correction hardly moves a keyframe, and judged
+	// by RedrawMetres alone it was kept in the graph but never reached the
+	// vehicle, which drove on with the old heading: on 6 November the matches
+	// went on finding the same +0.5° to +1° after the loops that said so had
+	// been accepted.
+	RedrawDegrees float64 `json:"redrawDegrees"`
+
+	// CorridorCrossTrack keeps, of a corridor match, the position across the
+	// corridor as well as the heading (see acrossCorridor). Absent means on;
+	// off keeps the heading only, as before 7 November.
+	CorridorCrossTrack *bool `json:"corridorCrossTrack,omitempty"`
 
 	// LogPath, when set, gets one CSV line per loop tried; GraphPath the pose
 	// graph in g2o format after each closure.
@@ -117,26 +168,44 @@ func defaultLoopSearch() SearchConfig {
 
 func (c LoopConfig) on() bool { return c.Enabled != nil && *c.Enabled }
 
+func (c LoopConfig) corridorCrossTrack() bool {
+	return c.CorridorCrossTrack == nil || *c.CorridorCrossTrack
+}
+
 func defaultLoop() LoopConfig {
 	return LoopConfig{
 		Enabled:              &off,
 		KeyframeTravelMetres: 0.5,
 		KeyframeTurnDegrees:  15,
 		Noise:                defaultOdometryNoise(),
-		MaxSweeps:            20000,
-		RobustScale:          3,
-		MaxIterations:        20,
-		MinGapMetres:         10,
-		SearchRadiusMetres:   2,
-		DriftFraction:        0.05,
-		MaxCandidates:        3,
-		SubmapMetres:         16,
-		SubmapKeyframes:      5,
-		Search:               defaultLoopSearch(),
-		MinScore:             0.55,
-		ConsistentMatches:    2,
-		MaxChi2:              7.8,
-		RedrawMetres:         0.05,
+		// From the run of 6 November: the loop's 1.5° of heading belongs at
+		// the corners, where a new corridor is drawn from a turn, and not
+		// along a straight one, where the walls hold the heading sweep after
+		// sweep. 0.1°/m is 0.05° a keyframe; 2 % of a 90° corner is 1.8°.
+		MatchedHeadingDegreesPerMeter: 0.1,
+		MatchedTurnFraction:           0.02,
+		CorridorAlongFraction:         0.25,
+		MaxSweeps:                     20000,
+		RobustScale:                   3,
+		MaxIterations:                 20,
+		MinGapMetres:                  10,
+		SearchRadiusMetres:            2,
+		DriftFraction:                 0.05,
+		MaxCandidates:                 3,
+		SubmapMetres:                  16,
+		SubmapKeyframes:               5,
+		Search:                        defaultLoopSearch(),
+		MinScore:                      0.55,
+		MinCorridorScore:              0.65,
+		MaxSearchMetres:               4,
+		BigCorrectionMetres:           2,
+		BigCorrectionDegrees:          5,
+		BigCorrectionMatches:          4,
+		ConsistentMatches:             2,
+		MaxChi2:                       7.8,
+		RedrawMetres:                  0.05,
+		RedrawDegrees:                 0.25,
+		CorridorCrossTrack:            &on,
 	}
 }
 
@@ -150,6 +219,15 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.Noise == (OdometryNoise{}) {
 		c.Noise = d.Noise
+	}
+	if c.MatchedHeadingDegreesPerMeter <= 0 {
+		c.MatchedHeadingDegreesPerMeter = d.MatchedHeadingDegreesPerMeter
+	}
+	if c.MatchedTurnFraction <= 0 {
+		c.MatchedTurnFraction = d.MatchedTurnFraction
+	}
+	if c.CorridorAlongFraction <= 0 {
+		c.CorridorAlongFraction = d.CorridorAlongFraction
 	}
 	if c.MaxSweeps <= 0 {
 		c.MaxSweeps = d.MaxSweeps
@@ -184,6 +262,21 @@ func applyLoopDefaults(c *LoopConfig) {
 	if c.MinScore <= 0 {
 		c.MinScore = d.MinScore
 	}
+	if c.MinCorridorScore <= 0 {
+		c.MinCorridorScore = d.MinCorridorScore
+	}
+	if c.MaxSearchMetres <= 0 {
+		c.MaxSearchMetres = d.MaxSearchMetres
+	}
+	if c.BigCorrectionMetres <= 0 {
+		c.BigCorrectionMetres = d.BigCorrectionMetres
+	}
+	if c.BigCorrectionDegrees <= 0 {
+		c.BigCorrectionDegrees = d.BigCorrectionDegrees
+	}
+	if c.BigCorrectionMatches <= 0 {
+		c.BigCorrectionMatches = d.BigCorrectionMatches
+	}
 	if c.ConsistentMatches <= 0 {
 		c.ConsistentMatches = d.ConsistentMatches
 	}
@@ -192,6 +285,9 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.RedrawMetres <= 0 {
 		c.RedrawMetres = d.RedrawMetres
+	}
+	if c.RedrawDegrees <= 0 {
+		c.RedrawDegrees = d.RedrawDegrees
 	}
 }
 
@@ -261,9 +357,31 @@ type memory struct {
 
 func newMemory(cfg LoopConfig) *memory { return &memory{cfg: cfg} }
 
+// placed is how the front end placed a sweep, which is what says how far the
+// step to it may be off.
+type placed int
+
+const (
+	// byConstantVelocity: no odometry, and a view that did not fix the pose
+	// either — the least trusted.
+	byConstantVelocity placed = iota
+	// byWheels: the wheels, or gyrodometry, and nothing from the walls.
+	byWheels
+	// byWallsHeading: a corridor. The walls set the heading and the wheels
+	// the position along it.
+	byWallsHeading
+	// byMatch: the map fixed the whole pose.
+	byMatch
+)
+
+// minWallStepRadians is the least heading uncertainty a step the walls placed
+// has. It is far below the matcher's fine step of 0.5°: each sweep is set
+// against the same walls as the one before, so its error is not a new one
+// added to the last but mostly the same one again.
+const minWallStepRadians = 0.01 * math.Pi / 180
+
 // step accounts for the motion from one sweep to the next, from and to in the
-// map frame. measured says whether the wheels, or gyrodometry, measured it;
-// otherwise it was constant velocity.
+// map frame, the second placed as how says.
 //
 // The covariance of the motion since the last keyframe, r, grows as the
 // covariance of a composition does:
@@ -275,7 +393,24 @@ func newMemory(cfg LoopConfig) *memory { return &memory{cfg: cfg} }
 // uncertain position. Σ_δ is the step's own covariance from OdometryNoise,
 // turned into the keyframe's frame — which stepCovariance does when it is
 // given the heading.
-func (m *memory) step(from, to pose, measured bool) {
+//
+// Where the walls placed the sweep, the step's heading is theirs, not the
+// wheels'. Down a straight corridor the walls hold it sweep after sweep, so
+// it hardly wanders; what drift there is comes in at the corners, where a new
+// corridor is drawn from a turn. Weighing those steps as the wheels' 1.5°/m
+// made every keyframe of a straight corridor look free to turn half a degree,
+// and on 6 November the optimiser spread the loop's 1.5° along the top
+// corridor as a curve: one straight wall, drawn from keyframes 0.7° apart,
+// came out twice. So there the heading's noise is MatchedHeadingDegreesPerMeter
+// and MatchedTurnFraction of the turn. Down a corridor, where the wheels alone
+// say how far, the along-track noise is CorridorAlongFraction: their error is
+// mostly a scale error, the same every metre, which an independent error per
+// step understates.
+//
+// Σ keeps growing either way. 1b8fd2a reset it to the match's accuracy
+// instead, which made the chain so stiff that a right loop could not be met
+// and every one was refused.
+func (m *memory) step(from, to pose, how placed) {
 	if len(m.frames) == 0 {
 		return
 	}
@@ -289,8 +424,18 @@ func (m *memory) step(from, to pose, measured bool) {
 		{0, 1, c*delta.x - s*delta.y},
 		{0, 0, 1},
 	}
-	stepCov := m.cfg.Noise.stepCovariance(delta, r.theta)
-	if !measured {
+	noise := m.cfg.Noise
+	if how == byWallsHeading {
+		noise.AlongFraction = math.Max(noise.AlongFraction, m.cfg.CorridorAlongFraction)
+	}
+	stepCov := noise.stepCovariance(delta, r.theta)
+	if how == byWallsHeading || how == byMatch {
+		ds := math.Hypot(delta.x, delta.y)
+		turn := math.Max(minWallStepRadians,
+			m.cfg.MatchedHeadingDegreesPerMeter*math.Pi/180*ds+m.cfg.MatchedTurnFraction*math.Abs(delta.theta))
+		stepCov[2][2] = turn * turn
+	}
+	if how == byConstantVelocity {
 		for i := range stepCov {
 			for k := range stepCov[i] {
 				stepCov[i][k] *= blindFactor * blindFactor
