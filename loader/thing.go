@@ -630,6 +630,10 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		ServicesMap: servicesFor(vt.Kind, configuredAsset.Services),
 		Traits:      vt,
 	}
+	// Describe the configured vehicle geometry in metres for the knowledge graph.
+	vehicle.Details["TrackMetres"] = []string{fmt.Sprintf("%g", cfg.Geometry.Track)}
+	vehicle.Details["JointToFrontAxleMetres"] = []string{fmt.Sprintf("%g", cfg.Geometry.JointToFront)}
+	vehicle.Details["JointToRearAxleMetres"] = []string{fmt.Sprintf("%g", cfg.Geometry.JointToRear)}
 	vehicle.ServingFunc = func(w http.ResponseWriter, r *http.Request, servicePath string) {
 		serving(vt, w, r, servicePath)
 	}
