@@ -10,8 +10,8 @@ BUILD_DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 BUILD_HASH := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 PKG        := github.com/sdoque/mbaigo/components
 
-SYSTEMS := assessor authorizer beehive beekeeper busdriver ca cartographer clerk \
-           collector democrat drafter ds18b20 ds18b20F emulator envoy esr ethermostat \
+SYSTEMS := assessor authorizer beehive beekeeper busdriver ca cartographer chauffeur clerk \
+           collector commander democrat drafter ds18b20 ds18b20F emulator envoy esr ethermostat \
            filmer flattener gamer guetteur hobbyist kgrapher leveler loader maitreD \
            meteorologue modboss modeler navigator nurse orchestrator painter parallax \
            photographer recognizer revolutionary sailor sapper telegrapher \
@@ -36,11 +36,7 @@ win: $(foreach sys,$(PORTABLE),$(STAGING)/$(sys)/$(sys)_win64.exe)
 mac: $(foreach sys,$(PORTABLE),$(STAGING)/$(sys)/$(sys)_mac64)
 	@$(MAKE) --no-print-directory whitelist
 
-define build_portable
-$(call build_for,$(1),windows,amd64,_win64.exe)
-$(call build_for,$(1),darwin,$(MACARCH),_mac64)
-endef
-$(foreach sys,$(PORTABLE),$(eval $(call build_portable,$(sys))))
+
 
 # Default target: build everything
 all: rpi
@@ -121,6 +117,11 @@ endef
 
 $(foreach sys,$(SYSTEMS),$(eval $(call build_system,$(sys))))
 
+define build_portable
+$(call build_for,$(1),windows,amd64,_win64.exe)
+$(call build_for,$(1),darwin,$(MACARCH),_mac64)
+endef
+$(foreach sys,$(PORTABLE),$(eval $(call build_portable,$(sys))))
 # --- Whitelist generation -----------------------------------------------------
 #
 # A release of mbaigo systems must be paired with a whitelist that authorises

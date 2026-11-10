@@ -21,7 +21,8 @@ publishes what a consumer can act on. It does not map and it does not drive.
 | `scan` | `ScanA_v1a` | a 360° horizontal scan: in each 1° of direction, the nearest return in a band of heights — the form the guetteur speaks, so the cartographer reads it as it is |
 | `clearance` | `SignalA_v1a` | the nearest return in the corridor the vehicle will drive through, at any height it could hit, in meters forward of the reference point |
 | `yawrate` | `SignalA_v1a` | the rate of turn about the vertical, rad/s, positive to the left |
-| `heading` | `SignalA_v1a` | the yaw rate integrated since start, degrees. It drifts and never wraps; it is for comparing with the wheels, not for steering by |
+| `heading` | `SignalA_v1a` | the yaw rate integrated since the gyroscope's zero was known, degrees. It never wraps; it is for comparing with the wheels — the cartographer's gyrodometry — not for steering by. **503** just after a gap in the IMU stream, so that two readings differenced across the gap are not taken for a turn |
+| `bias` | `SignalA_v1a` | the gyroscope's zero about the vertical, °/s, stamped with when it was last measured at a standstill |
 | `pitch` / `roll` | `SignalA_v1a` | the tilt from gravity, degrees: pitch positive nose down, roll positive right side down (ISO 8855) |
 | `quality` | `SignalA_v1a` | the share of the last window's beams that came back, percent |
 
@@ -107,9 +108,29 @@ On the computer the lidar is wired to:
    at start and subtracts it. `yawrate` and `heading` answer 503 until it has;
    if the vehicle moves meanwhile, the log says so and it measures again. The
    zero also wanders as the lidar warms: the vertical one moved by 0.18°/s
-   between two runs four minutes apart. Over a long drive, whatever uses the
-   heading should go on estimating it, as the cartographer does the wheels'
-   drift.
+   between two runs four minutes apart, and by 1.9°/s over the first hundred
+   minutes from cold, fastest at about 0.055°/s a minute. So the vigie
+   measures it again **every time the vehicle stands still** for
+   `gyroZeroSeconds`. A steady slow turn is as smooth as a standstill, so a
+   new zero is taken only if it is within `maxBiasStepDegPerSec` of the last,
+   plus `biasDriftDegPerSecPerMinute` for every minute since; anything
+   further is the vehicle turning, and is counted in the log as "still but
+   off the zero". That count climbing while the vehicle really stands means
+   the zero has stuck: restart the vigie with the vehicle still.
+6. **Check the mount against gravity.** At the first standstill the log says
+   which way up the lidar is in its own frame, and the `rollDegrees` and
+   `pitchDegrees` that would level it for the configured `yawDegrees`. Set
+   them, with the vehicle on level ground: the yaw rate is the gyroscope's
+   rate about the vehicle's vertical only if the mount is right. Taken as
+   level, the Artitrax's lidar — turned 90° on its stick and tilted 11° —
+   reads every turn 2 % short and a fifth of every roll as turning. Gravity
+   does not give the yaw; a person standing ahead, at 0° in `scan`, does.
+7. **The IMU's time.** The lidar stamps its samples about 0.55 % fast against
+   this host's clock, so they are put on this host's clock (`clock.go`) before
+   the heading is integrated: on the raw stamps every turn would read 0.55 %
+   large. The motion services carry that time, the one the loader's wheels
+   are stamped on too. Every thirty seconds the log says how the zero is
+   kept: its value, standstills, refusals, gaps and IMU packets lost.
 
 **The configuration is written to the lidar and kept there.** With `configure`
 true (the default) the vigie tells the lidar to send its data to this host. A
@@ -130,8 +151,19 @@ ROS driver or Livox Viewer elsewhere would then stop receiving it. Set
 | `slice` | 0.3–1.5 m, 1°, 0.2–40 m, 200 ms | the band of heights, bin width, ranges and window that make the scan |
 | `clearance` | ±0.45 m, 0.1–1.6 m | the corridor ahead: half its width, and the heights the vehicle could hit |
 | `imuAverageMs` | 100 | the window the IMU's readings are averaged over |
-| `staleAfterMs` | 1000 | how old the newest data may be before the services stop answering |
-| `gyroZeroSeconds` | 3 | how long the vehicle must stand still at start for the gyroscope's zero to be measured |
+| `staleAfterMs` | 1000 | how old the newest points may be before `scan`, `clearance` and `quality` stop answering |
+| `imuStaleAfterMs` | 100 | how old the newest IMU sample may be before the motion services stop answering, and how long `heading` is withheld after a gap |
+| `maxGapMs` | 50 | the longest hole in the IMU stream integrated across |
+| `gyroZeroSeconds` | 3 | how long the vehicle must stand still for the gyroscope's zero to be measured, at start and every time after |
+| `standstillGyroStdDegPerSec` | 0.2 | the most any gyroscope axis may spread in a still window |
+| `standstillAccelToleranceG` | 0.01 | how far the accelerometer may read from 1 g in a still window |
+| `standstillMaxRateDegPerSec` | 2.7 | the largest first zero about the vertical; a cold Mid-360 read −1.3°/s |
+| `maxBiasStepDegPerSec` | 0.035 | how far a later zero may be from the last |
+| `biasDriftDegPerSecPerMinute` | 0.08 | and further, for each minute since the last: the warm-up's drift, with a margin |
+
+The standstill defaults were measured on the Artitrax, motors on and holding,
+in the gyro characterization of October 2026
+(`lidar/gyro_characterization_guide_2026-10-23.md` on branch `3D-LIDAR-system`).
 
 **The mount assumes the Mid-360's own frame is x forward, y left, z up**, as
 Livox draws it. That has not been checked on the vehicle. The quickest check is
@@ -149,5 +181,6 @@ person standing in front of it, at 0°.
   orchestrator offers; it needs a setting naming the one it wants.
 - **The point cloud itself.** About 200 000 points a second stays on board; a
   reduced cloud form can come when a consumer needs one.
-- **Time synchronization.** The lidar supports PTP. Its timestamps are used
-  only to integrate the yaw rate; everything else is stamped on arrival.
+- **Time synchronization.** The lidar supports PTP. Its timestamps are put on
+  this host's clock and used for the IMU only; the points are still stamped
+  on arrival. The same map could stamp them when a consumer needs it.

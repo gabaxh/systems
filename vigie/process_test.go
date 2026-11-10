@@ -131,10 +131,11 @@ func TestTheHeadingIntegratesTheYawRate(t *testing.T) {
 func TestTheSimulatedTunnelEndToEnd(t *testing.T) {
 	cfg := defaultConfig()
 	tr := &Traits{
-		cfg: cfg,
-		rot: cfg.Mount.rotation(),
-		pts: &cloud{window: time.Duration(cfg.Slice.AccumulateMs) * time.Millisecond},
-		imu: &motion{window: time.Duration(cfg.IMUAverageMs) * time.Millisecond},
+		cfg:   cfg,
+		rot:   cfg.Mount.rotation(),
+		pts:   &cloud{window: time.Duration(cfg.Slice.AccumulateMs) * time.Millisecond},
+		imu:   &motion{window: time.Duration(cfg.IMUAverageMs) * time.Millisecond},
+		clock: newClockMap(clockWindow),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
 	defer cancel()
