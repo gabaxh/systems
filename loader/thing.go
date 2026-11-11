@@ -600,6 +600,12 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		details := copyDetails(configuredAsset.Details)
 		details["Unit"] = []string{t.unit}
 		details["NodeID"] = []string{fmt.Sprintf("%d", m.NodeID)}
+		// Describe each wheel's configured rolling circumference in metres.
+		if m.Kind == "wheel" {
+			details["WheelCircumferenceMetres"] = []string{
+				fmt.Sprintf("%g", cfg.Geometry.circumferenceAt(m.position())),
+			}
+		}
 
 		ua := &components.UnitAsset{
 			Name:        m.Name,
