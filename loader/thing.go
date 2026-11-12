@@ -91,8 +91,10 @@ type LoaderConfig struct {
 	// sensor's calibration and the steering limits. See kinematics.go and
 	// waist.go: these are what make the loader drive a vehicle rather than
 	// five motors, and what change when it is moved to another machine.
-	Geometry Geometry    `json:"geometry"`
-	Waist    WaistConfig `json:"waist"`
+	Geometry Geometry `json:"geometry"`
+	// VehicleDetails describes the whole vehicle for RDF export.
+	VehicleDetails map[string][]string `json:"vehicleDetails,omitempty"`
+	Waist          WaistConfig         `json:"waist"`
 	// SpeedLoop holds each wheel at its speed against the slope; see
 	// speedloop.go.
 	SpeedLoop SpeedLoopConfig `json:"speedLoop"`
@@ -635,6 +637,9 @@ func newResource(configuredAsset usecases.ConfigurableAsset, sys *components.Sys
 		Details:     copyDetails(configuredAsset.Details),
 		ServicesMap: servicesFor(vt.Kind, configuredAsset.Services),
 		Traits:      vt,
+	}
+	for key, values := range cfg.VehicleDetails {
+		vehicle.Details[key] = values
 	}
 	// Describe the configured vehicle geometry in metres for the knowledge graph.
 	vehicle.Details["TrackMetres"] = []string{fmt.Sprintf("%g", cfg.Geometry.Track)}
