@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # ca and maitreD are built but not listed: they are never attested
-SYSTEMS="esr orchestrator guetteur cartographer loader gamer collector vigie kgrapher"
+SYSTEMS="esr orchestrator guetteur cartographer loader gamer collector vigie kgrapher envoy"
 
 
 for s in ca maitreD $SYSTEMS; do
