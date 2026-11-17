@@ -82,7 +82,7 @@ func remember(m *memory, truths []pose, wrong func(pose) pose) []pose {
 		prev := est
 		if k > 0 {
 			est = compose(est, wrong(compose(inverse(truths[k-1]), truth)))
-			m.step(prev, est, true)
+			m.step(prev, est, byWheels)
 		}
 		n := len(m.frames)
 		m.keep(est, sweep360(truth, testTime.Add(time.Duration(k)*200*time.Millisecond)))
@@ -201,8 +201,13 @@ func TestACorridorDrivenUpAndBackIsNotShortened(t *testing.T) {
 			t.Errorf("loop %d↔%d carries information %.3g along the corridor, %.3g across it", e.i, e.j, a, c)
 		}
 	}
+	// The wheels read 0.45 m long, and nothing here may take it out. The
+	// loops now hold the position across the corridor too (acrossCorridor),
+	// along an axis found to a fraction of a degree; through that, a few
+	// millimetres reach along it — 3.8 mm at worst, against 2 mm when they
+	// kept the heading only.
 	for i, p := range cl.nodes {
-		if d := p.x - m.frames[i].pose.x; math.Abs(d) > 0.002 {
+		if d := p.x - m.frames[i].pose.x; math.Abs(d) > 0.005 {
 			t.Errorf("keyframe %d moved %.4f m along the corridor", i, d)
 		}
 	}
@@ -403,7 +408,11 @@ func TestClosingTheRingRedrawsTheMap(t *testing.T) {
 	end := truth[len(truth)-1]
 	t.Logf("%d closures, %d redraws; %.1f %% of the walls drawn within 10 cm of a real one before, %.1f %% after; the vehicle %.3f m from the truth",
 		closures, tr.redraws, 100*before, 100*after, math.Hypot(tr.at.x-end.x, tr.at.y-end.y))
-	if after < 0.97 || after <= before {
+	// 98.6 % with every beam clearing the cells all the way to its return.
+	// With freeRange at 12 m it is 96.9 %: a stray far return is no longer
+	// cleared by the beams that pass through it later. That is the price of
+	// beams that no longer clear the walls they graze (see grid.freeRange).
+	if after < 0.96 || after <= before {
 		t.Errorf("%.1f %% of the redrawn map is on a real wall (%.1f %% before)", 100*after, 100*before)
 	}
 	if d := math.Hypot(tr.at.x-end.x, tr.at.y-end.y); d > 0.05 {
@@ -447,7 +456,7 @@ func TestWhatCameAfterTheSnapshotIsFound(t *testing.T) {
 	at := start
 	for k := 1; k <= 20; k++ {
 		next := compose(at, pose{x: 0.1})
-		m.step(at, next, true)
+		m.step(at, next, byWheels)
 		at = next
 		m.keep(at, sweep360(at, testTime))
 	}
@@ -555,5 +564,157 @@ func TestALaggingCloserClosesTheLoopOnce(t *testing.T) {
 	t.Logf("%d passes, %d loops, %d redraws; the vehicle %.3f m and %.2f° from the truth", passes, len(tr.closer.loops), tr.redraws, d, turn)
 	if d > 0.05 || turn > 1 {
 		t.Errorf("a lagging closer left the vehicle %.3f m and %.2f° from the truth", d, turn)
+	}
+}
+
+// A closure that turns a keyframe but hardly moves one is still drawn: a
+// heading the graph corrected and the vehicle never got is the vehicle driving
+// on with the old one.
+func TestATurnRedrawsTheMap(t *testing.T) {
+	tr := mappingTraits(nil)
+	tr.mem = testMemory()
+	tr.closer = testCloser()
+	remember(tr.mem, route(pose{}, leg{0, 3}), func(p pose) pose { return p })
+	at := tr.at
+	snap := tr.mem.snapshot()
+	nodes := framePoses(snap)
+	turn := 0.5 * degree
+	nodes[len(nodes)-1].theta += turn
+	tr.loopClosed(snap, closure{nodes: nodes, moved: 0.01, turned: turn})
+	if tr.redraws != 1 {
+		t.Fatalf("a 0.5° closure was not drawn (%d redraws)", tr.redraws)
+	}
+	if d := wrapAngle(tr.at.theta - at.theta); math.Abs(d-turn) > 1e-9 {
+		t.Errorf("the vehicle turned %.3f°, want %.3f°", d/degree, turn/degree)
+	}
+}
+
+// A corridor match keeps the position across the corridor and the heading,
+// and takes the position along it from the estimate: the match's own
+// position along a corridor is anywhere in the search window.
+func TestACorridorLoopKeepsTheCrossTrack(t *testing.T) {
+	for _, axisDeg := range []float64{0, 30, 97} {
+		axis := axisDeg * degree
+		ux, uy := math.Cos(axis), math.Sin(axis)
+		prior := pose{2, -1, 0.1}
+		// The match slid 1.1 m along the corridor and found the vehicle
+		// 0.25 m across it and 0.6° turned.
+		at := pose{prior.x + 1.1*ux - 0.25*uy, prior.y + 1.1*uy + 0.25*ux, prior.theta + 0.6*degree}
+		raw := mat3{{2e3, 1e3, 50}, {1e3, 3e4, 200}, {50, 200, 1e5}}
+		z, info := acrossCorridor(prior, at, axis, raw)
+
+		along := (z.x-prior.x)*ux + (z.y-prior.y)*uy
+		across := -(z.x-prior.x)*uy + (z.y-prior.y)*ux
+		if math.Abs(along) > 1e-9 || math.Abs(across-0.25) > 1e-9 || math.Abs(z.theta-at.theta) > 1e-12 {
+			t.Errorf("axis %.0f°: along %.4f, across %.4f, heading %.3f°; want 0, 0.25 and the match's", axisDeg, along, across, (z.theta-prior.theta)/degree)
+		}
+		// No information along the axis, some across it and in heading.
+		u := [3]float64{ux, uy, 0}
+		if a := info.mulVec(u); math.Abs(a[0])+math.Abs(a[1])+math.Abs(a[2]) > 1e-9 {
+			t.Errorf("axis %.0f°: information along the corridor: %v", axisDeg, a)
+		}
+		if p := [3]float64{-uy, ux, 0}; quad(p, info) <= 0 || info[2][2] <= 0 {
+			t.Errorf("axis %.0f°: nothing across the corridor or in heading: %v", axisDeg, info)
+		}
+	}
+}
+
+// A corridor match must score MinCorridorScore; a match that fixes all three
+// directions only MinScore. The alias of 6 November scored 0.58.
+func TestACorridorMatchNeedsAHigherScore(t *testing.T) {
+	c := testCloser()
+	for _, tc := range []struct {
+		seen  int
+		score float64
+		want  bool
+	}{
+		{2, 0.58, false}, {2, 0.75, true}, {3, 0.58, true}, {3, 0.5, false}, {1, 0.95, false},
+	} {
+		if got := c.believable(loopMatch{seen: tc.seen, score: tc.score}); got != tc.want {
+			t.Errorf("%d directions at %.2f: believed %t, want %t", tc.seen, tc.score, got, tc.want)
+		}
+	}
+}
+
+// The window grows with the path since the last loop accepted, from the
+// search's own range to MaxSearchMetres, and shrinks again once a loop pins
+// the chain.
+func TestTheReachGrowsWithThePathSinceTheLastLoop(t *testing.T) {
+	c := testCloser()
+	m := &memory{}
+	for k := 0; k <= 400; k++ {
+		m.frames = append(m.frames, keyframe{id: k, path: 0.5 * float64(k)})
+	}
+	for _, tc := range []struct {
+		j    int
+		want float64
+	}{
+		{40, 1.2}, {120, 3}, {400, 4},
+	} {
+		if got := c.reach(m, tc.j); math.Abs(got-tc.want) > 1e-9 {
+			t.Errorf("keyframe %d, %.0f m from the start: reach %.2f m, want %.2f", tc.j, m.frames[tc.j].path, got, tc.want)
+		}
+	}
+	c.loops = []edge{{i: 3, j: 380, loop: true}}
+	if got := c.reach(m, 400); got != c.cfg.Search.SearchRange {
+		t.Errorf("10 m after a loop: reach %.2f m, want the search's own %.2f", got, c.cfg.Search.SearchRange)
+	}
+}
+
+// Coming back 2.5 m and 6° from where the map has it, the usual ±1.2 m search
+// cannot reach the right place; the wide pass finds it.
+func TestAWideSearchFindsAFarMatch(t *testing.T) {
+	g := newGrid(40, 40, 0.05)
+	for x := 1.0; x <= 19; x += 0.2 {
+		a, d, v := sweepFrom(pose{x: x}, 360, 359)
+		g.integrate(pose{x: x}, a, d, v)
+	}
+	truth := pose{6.5, 0.3, 0.05}
+	a, d, v := sweepFrom(truth, 360, 359)
+	prior := pose{truth.x - 2.5, truth.y - 0.6, truth.theta + 6*degree}
+	cfg := defaultLoopSearch()
+
+	near, _, _ := g.matchSampled(prior, a, d, v, cfg)
+	best := matchResult{score: math.Inf(-1)}
+	for _, p := range g.widePeaks(prior, a, d, v, 3, cfg) {
+		if r, _, _ := g.matchSampled(p, a, d, v, cfg); r.score > best.score {
+			best = r
+		}
+	}
+	nearErr := math.Hypot(near.at.x-truth.x, near.at.y-truth.y)
+	wideErr := math.Hypot(best.at.x-truth.x, best.at.y-truth.y)
+	t.Logf("usual search %.2f m out, wide %.3f m and %.2f° out", nearErr, wideErr, wrapAngle(best.at.theta-truth.theta)/degree)
+	if wideErr > 0.05 || math.Abs(wrapAngle(best.at.theta-truth.theta)) > 1*degree {
+		t.Errorf("the wide search found a pose %.3f m out", wideErr)
+	}
+	if nearErr < 0.5 {
+		t.Errorf("the usual search was only %.2f m out; the test does not need the wide one", nearErr)
+	}
+}
+
+// A closure that would move the map more than BigCorrectionMetres on
+// corridor matches alone waits until BigCorrectionMatches agree in a row; a
+// match that fixes all three directions, or a small correction, does not.
+func TestABigCorridorCorrectionWaitsForMoreMatches(t *testing.T) {
+	c := testCloser()
+	frames := []keyframe{{pose: pose{}}, {pose: pose{x: 1}}}
+	far := []pose{{}, {x: 1, y: 3}}    // moves one keyframe 3 m
+	near := []pose{{}, {x: 1, y: 0.5}} // 0.5 m
+	corridor := []loopMatch{{seen: 2}, {seen: 2}}
+	full := []loopMatch{{seen: 2}, {seen: 3}}
+
+	c.streak = make([]loopMatch, 2)
+	if wait, moved, _ := c.waitsForMore(corridor, far, frames); !wait || math.Abs(moved-3) > 1e-9 {
+		t.Errorf("3 m on two corridor matches: wait %t, moved %.2f", wait, moved)
+	}
+	if wait, _, _ := c.waitsForMore(full, far, frames); wait {
+		t.Error("a three-direction match was made to wait")
+	}
+	if wait, _, _ := c.waitsForMore(corridor, near, frames); wait {
+		t.Error("a 0.5 m correction was made to wait")
+	}
+	c.streak = make([]loopMatch, c.cfg.BigCorrectionMatches)
+	if wait, _, _ := c.waitsForMore(corridor, far, frames); wait {
+		t.Errorf("%d corridor matches in a row still waited", c.cfg.BigCorrectionMatches)
 	}
 }

@@ -88,6 +88,12 @@ type Traits struct {
 
 	mapCer, poseCer, limitCer *components.Cervice
 
+	// What the planner reads. Fields, so that planning can be tested without a
+	// cartographer or a loader.
+	readMap   func() (*forms.MapA_v1a, error)
+	readPose  func() (here, error)
+	readLimit func() float64
+
 	mu      sync.Mutex
 	goal    *goal
 	path    *forms.PathA_v1a
@@ -127,13 +133,24 @@ func initTemplate() *components.UnitAsset {
 		RegPeriod:   10,
 		Description: "the planned route, in the map frame it was planned in",
 	}
+	cancelSvc := components.Service{
+		Definition: "cancelGoal",
+		SubPath:    "cancelGoal",
+		Details: map[string][]string{
+			"Forms":   {"SignalA_v1a"},
+			"Methods": components.HTTPMethods("PUT"),
+		},
+		RegPeriod:   30,
+		Description: "PUT 1 drops the destination: the goal service's DELETE, for a system, which can only GET and PUT",
+	}
 	return &components.UnitAsset{
 		Name:     "Planner",
 		Mission:  components.MissionControl,
 		Mobility: components.MobilityMovable,
 		ServicesMap: components.Services{
-			goalSvc.SubPath: &goalSvc,
-			pathSvc.SubPath: &pathSvc,
+			goalSvc.SubPath:   &goalSvc,
+			pathSvc.SubPath:   &pathSvc,
+			cancelSvc.SubPath: &cancelSvc,
 		},
 		Traits: &NavConfig{
 			PlanningResolution: 0.1,
@@ -172,6 +189,7 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 		poseCer:  get("pose", nil),
 		limitCer: get("curvatureLimit", cfg.Vehicle),
 	}
+	t.readMap, t.readPose, t.readLimit = t.theMap, t.whereAmI, t.curvature
 
 	ua := &components.UnitAsset{
 		Name:        uac.Name,
@@ -353,16 +371,27 @@ func (t *Traits) fetch(cer *components.Cervice) (forms.Form, error) {
 
 //-------------------------------------Planning
 
+// errGoalChanged is a replan whose goal was replaced or dropped while it ran.
+var errGoalChanged = errors.New("the destination changed while planning")
+
 // planTo plans from where the vehicle is to (gx, gy), and keeps the result.
-func (t *Traits) planTo(gx, gy float64, at here) (*goal, error) {
-	m, err := t.theMap()
+//
+// standing is the goal being planned again, or nil for a new one. A new goal
+// that cannot be reached is planned to the nearest point that can: the person
+// who set it is told, and can see the route before anything drives it. A standing
+// goal that could be reached and no longer can is another matter. Something has
+// blocked the way, and a route to the nearest point would look like any other to
+// whoever is following it, and end in an arrival at the obstacle. So there is no
+// route until the way opens.
+func (t *Traits) planTo(gx, gy float64, at here, standing *goal) (*goal, error) {
+	m, err := t.readMap()
 	if err != nil {
 		return nil, err
 	}
 	if m.Frame != at.frame {
 		return nil, fmt.Errorf("the map (%s) and the pose (%s) are from different runs of the cartographer", m.Frame, at.frame)
 	}
-	v := Vehicle{MaxCurvature: t.curvature(), Clearance: t.cfg.Clearance}
+	v := Vehicle{MaxCurvature: t.readLimit(), Clearance: t.cfg.Clearance}
 	start := time.Now()
 	p, err := plan(m, t.cfg.PlanningResolution, t.cfg.reading(), v, at.x, at.y, at.th, gx, gy)
 	if err != nil {
@@ -370,6 +399,9 @@ func (t *Traits) planTo(gx, gy float64, at here) (*goal, error) {
 	}
 	g := &goal{askedX: gx, askedY: gy, x: p.GoalX, y: p.GoalY, frame: at.frame}
 	if p.Adjusted {
+		if standing != nil && standing.why == "" {
+			return nil, fmt.Errorf("the way is blocked: %s", p.Why)
+		}
 		g.why = p.Why
 		// The nearest reachable point can be where the vehicle already is — a
 		// destination behind the end wall of a corridor, say. A one-pose route
@@ -385,6 +417,12 @@ func (t *Traits) planTo(gx, gy float64, at here) (*goal, error) {
 	}
 
 	t.mu.Lock()
+	// Checked here because planning takes time, and a destination dropped while
+	// it ran must stay dropped.
+	if standing != nil && t.goal != standing {
+		t.mu.Unlock()
+		return nil, errGoalChanged
+	}
 	t.goal, t.path = g, path
 	t.mu.Unlock()
 
@@ -412,29 +450,59 @@ func (t *Traits) replan(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		t.mu.Lock()
-		g := t.goal
-		t.mu.Unlock()
-		if g == nil {
-			continue
+		t.replanOnce()
+	}
+}
+
+// replanOnce is one pass of replan.
+//
+// A plan that fails withdraws the route but keeps the destination. The old route
+// was planned against a map that has since changed, and following it is how a
+// vehicle arrives at whatever made the plan fail; the destination still stands,
+// so the route comes back once the way opens.
+func (t *Traits) replanOnce() {
+	t.mu.Lock()
+	g := t.goal
+	t.mu.Unlock()
+	if g == nil {
+		return
+	}
+	at, err := t.readPose()
+	if err != nil {
+		return
+	}
+	switch {
+	case at.frame != g.frame:
+		log.Printf("navigator: the cartographer has started a new map (%s); the destination was in %s and is dropped",
+			at.frame, g.frame)
+		t.dropIf(g)
+	case math.Hypot(at.x-g.x, at.y-g.y) <= t.cfg.ArriveMetres:
+		log.Printf("navigator: arrived at (%.2f, %.2f)", g.x, g.y)
+		t.dropIf(g)
+	default:
+		if _, err := t.planTo(g.askedX, g.askedY, at, g); err != nil && !errors.Is(err, errGoalChanged) {
+			t.withdrawRoute(g, err)
 		}
-		at, err := t.whereAmI()
-		if err != nil {
-			continue
-		}
-		switch {
-		case at.frame != g.frame:
-			log.Printf("navigator: the cartographer has started a new map (%s); the destination was in %s and is dropped",
-				at.frame, g.frame)
-			t.drop()
-		case math.Hypot(at.x-g.x, at.y-g.y) <= t.cfg.ArriveMetres:
-			log.Printf("navigator: arrived at (%.2f, %.2f)", g.x, g.y)
-			t.drop()
-		default:
-			if _, err := t.planTo(g.askedX, g.askedY, at); err != nil {
-				log.Printf("navigator: replanning failed: %v", err)
-			}
-		}
+	}
+}
+
+// withdrawRoute takes down the route to a goal that can no longer be planned,
+// saying so when it goes rather than every replanSeconds after that.
+func (t *Traits) withdrawRoute(g *goal, why error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.goal != g || t.path == nil {
+		return
+	}
+	t.path = nil
+	log.Printf("navigator: no route for now, and the destination stands: %v", why)
+}
+
+func (t *Traits) dropIf(g *goal) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.goal == g {
+		t.goal, t.path = nil, nil
 	}
 }
 
@@ -491,7 +559,7 @@ func (t *Traits) goalService(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusUnprocessableEntity)
 			return
 		}
-		g, err := t.planTo(gx, gy, at)
+		g, err := t.planTo(gx, gy, at, nil)
 		if err != nil {
 			http.Error(w, "no route: "+err.Error(), http.StatusConflict)
 			return
@@ -522,10 +590,29 @@ func (t *Traits) pathService(w http.ResponseWriter, r *http.Request) {
 	p := t.path
 	t.mu.Unlock()
 	if p == nil {
-		http.Error(w, "no route: no destination has been set", http.StatusServiceUnavailable)
+		http.Error(w, "no route at the moment", http.StatusServiceUnavailable)
 		return
 	}
 	usecases.HTTPProcessGetRequest(w, r, p)
+}
+
+// cancelService drops the destination, for a system: the framework's consumers
+// can only GET and PUT, so the goal service's DELETE is out of their reach.
+func (t *Traits) cancelService(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method is not supported.", http.StatusNotFound)
+		return
+	}
+	sig, err := usecases.HTTPProcessSetRequest(w, r)
+	if err != nil {
+		http.Error(w, "malformed request", http.StatusBadRequest)
+		return
+	}
+	if sig.Value != 0 {
+		t.drop()
+		log.Println("navigator: destination dropped")
+	}
+	respond(w, &sig)
 }
 
 func poseForm(g *goal) *forms.PoseA_v1a {

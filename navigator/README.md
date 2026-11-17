@@ -5,9 +5,14 @@ to wherever it is asked to go — forward only, no tighter than the vehicle can
 turn, and to the nearest point it can reach when the destination itself cannot
 be reached, saying why.
 
-It plans; it does not drive. The route is a service that a chauffeur will
-follow. Until there is one, the navigator is how to see what the vehicle
-*would* do: set a destination by curl, and look at the picture.
+It plans; it does not drive. The route is a service that the
+[chauffeur](../chauffeur/) follows, and the [commander](../commander/) is the
+page that sets a destination by clicking on the map. On its own, the navigator
+is how to see what the vehicle *would* do: set a destination by curl, and look at
+the picture.
+
+A configuration written before `cancelGoal` existed does not list it, and the
+service is not offered: delete `systemconfig.json` and start again.
 
 > **Tested on the bench, not yet on the vehicle.** Run against the simulated
 > guetteur and the cartographer on a laptop: routes of 8 and 15 m down a
@@ -19,7 +24,8 @@ follow. Until there is one, the navigator is how to see what the vehicle
 | service | form | what it does |
 |---|---|---|
 | `goal` | `PolarA_v1a` or `PoseA_v1a` | **PUT** a destination and a route is planned to it; **GET** where the route ends; **DELETE** drops it |
-| `path` | `PathA_v1a` | the planned route, stamped with the map it was planned in |
+| `path` | `PathA_v1a` | the planned route, stamped with the map it was planned in; `503` when there is none at the moment |
+| `cancelGoal` | `SignalA_v1a` | **PUT** `1` drops the destination: `goal`'s DELETE, for a system, since consumers in this framework can only GET and PUT |
 
 It consumes the cartographer's `map` and `pose`, and the loader's
 `curvatureLimit`.
@@ -111,8 +117,10 @@ sequenceDiagram
             N->>N: drop the destination, it names somewhere else now
         else arrived within arriveMetres
             N->>N: drop the destination
-        else
-            N->>N: plan again from here, against the map as it now is
+        else a route comes back that reaches it
+            N->>N: this is the route now
+        else it cannot be planned, or a route that reached it no longer can
+            N->>N: take the route down and keep the destination,<br/>so the route comes back when the way opens
         end
     end
 ```
@@ -139,6 +147,15 @@ meters down a twenty-meter corridor.
 **The ground under the vehicle is free.** The scanner cannot see beneath
 itself, so the vehicle's own position is often unseen in the map. Unseen cells
 there are cleared; cells seen occupied are not.
+
+**A blocked way is not an arrival.** A new destination that cannot be reached
+is planned to the nearest point that can, because the person setting it is told
+and can look at the route first. A standing destination that could be reached
+and no longer can is different: something has blocked the way, and a route to the
+nearest point would end in an arrival at the obstacle. So `path` answers `503`
+until the way opens, the destination stands, and the same goes for any plan that
+fails. The old route is never left up: it was planned against a map that has
+since changed.
 
 **A route belongs to one map.** The cartographer names each run's map by its
 start time, `map@2026-09-27T06:13:50Z`, and starts again from nothing when it
@@ -172,8 +189,4 @@ cartographer's `map` and `pose` and the loader's `curvatureLimit`.
 
 ## Not here yet
 
-- **The chauffeur**, which follows the route. The route is ready for it: a
-  `PathA` whose frame it must compare with the pose's, and which it must refuse
-  when they differ.
-- **A view in the browser.** `plan.ppm` for now.
 - **Reversing**, and turning round. Not needed while the corridors loop.

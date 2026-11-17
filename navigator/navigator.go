@@ -91,6 +91,8 @@ func serving(t *Traits, w http.ResponseWriter, r *http.Request, servicePath stri
 		t.goalService(w, r)
 	case "path":
 		t.pathService(w, r)
+	case "cancelGoal":
+		t.cancelService(w, r)
 	default:
 		http.Error(w, "Invalid service path", http.StatusBadRequest)
 	}
