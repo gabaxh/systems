@@ -38,11 +38,19 @@ const (
 
 // CartographerConfig is what the operator may set.
 type CartographerConfig struct {
-	// The map's extent in metres and how fine its cells are. A hallway needs
-	// little area and reasonable resolution; 5 cm is enough to see a doorway.
+	// The map's starting extent in metres, centred on the first sweep, and how
+	// fine its cells are. 5 cm is enough to see a doorway.
 	WidthMetres  float64 `json:"widthMetres"`
 	HeightMetres float64 `json:"heightMetres"`
 	Resolution   float64 `json:"resolutionMetres"`
+
+	// The map grows as the vehicle drives: when it comes within
+	// GrowMarginMetres of an edge it is driving toward, that edge moves out by
+	// GrowStepMetres. A map sized for the whole building up front is mostly
+	// unknown cells, sent in full with every map request. Absent means 5 m and
+	// 10 m; a negative step keeps the map at its starting size.
+	GrowMarginMetres float64 `json:"growMarginMetres"`
+	GrowStepMetres   float64 `json:"growStepMetres"`
 
 	// PollMs is how often a sweep is asked for.
 	PollMs int `json:"pollMs"`
@@ -217,9 +225,11 @@ func initTemplate() *components.UnitAsset {
 			coverage.SubPath: &coverage,
 		},
 		Traits: &CartographerConfig{
-			WidthMetres:         60,
-			HeightMetres:        60,
+			WidthMetres:         30,
+			HeightMetres:        30,
 			Resolution:          0.05,
+			GrowMarginMetres:    5,
+			GrowStepMetres:      10,
 			PollMs:              200,
 			MatchRangeMetres:    10,
 			FreeRangeMetres:     12,
@@ -363,10 +373,16 @@ func newResource(uac usecases.ConfigurableAsset, sys *components.System) (*compo
 
 func applyDefaults(cfg *CartographerConfig) {
 	if cfg.WidthMetres <= 0 {
-		cfg.WidthMetres = 60
+		cfg.WidthMetres = 30
 	}
 	if cfg.HeightMetres <= 0 {
-		cfg.HeightMetres = 60
+		cfg.HeightMetres = 30
+	}
+	if cfg.GrowMarginMetres <= 0 {
+		cfg.GrowMarginMetres = 5
+	}
+	if cfg.GrowStepMetres == 0 {
+		cfg.GrowStepMetres = 10
 	}
 	if cfg.Resolution <= 0 {
 		cfg.Resolution = 0.05
@@ -783,6 +799,8 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 		t.mem.step(t.at, at, how)
 	}
 
+	t.growToward(g, t.at, at)
+
 	moved := math.Hypot(at.x-t.at.x, at.y-t.at.y)
 	turned := math.Abs(wrapAngle(at.theta-t.at.theta)) * 180 / math.Pi
 	if first || moved >= t.cfg.MinTravelMetres || turned >= t.cfg.MinTurnDegrees {
@@ -800,6 +818,45 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	}
 	t.at = at
 	t.lastSweep = sw.Timestamp
+}
+
+// growToward grows g ahead of a vehicle that moved from one pose to the next:
+// each edge it is within GrowMarginMetres of and driving toward moves out by
+// GrowStepMetres, or by as many steps as it takes to put it GrowMarginMetres
+// away again. An edge the vehicle is driving away from, or along, stays put,
+// so the map grows the way the vehicle goes and not round wherever it stops
+// near an edge. A vehicle outside the grid altogether, as a loop closure can
+// leave it, grows it whichever way it is going: a sweep from outside the grid
+// is not drawn at all. Under the lock.
+func (t *Traits) growToward(g *grid, from, to pose) {
+	step, margin := t.cfg.GrowStepMetres, t.cfg.GrowMarginMetres
+	if step <= 0 {
+		return
+	}
+	x0, y0, x1, y1 := g.bounds()
+	dx, dy := to.x-from.x, to.y-from.y
+	need := func(room, toward float64) bool { return room < 0 || (room < margin && toward > 0) }
+	// The box the grid must cover; cover grows each side it does not reach
+	// in whole steps.
+	bx0, by0, bx1, by1 := x0, y0, x1, y1
+	if need(to.x-x0, -dx) {
+		bx0 = to.x - margin
+	}
+	if need(x1-to.x, dx) {
+		bx1 = to.x + margin
+	}
+	if need(to.y-y0, -dy) {
+		by0 = to.y - margin
+	}
+	if need(y1-to.y, dy) {
+		by1 = to.y + margin
+	}
+	if !g.cover(bx0, by0, bx1, by1, step) {
+		return
+	}
+	nx0, ny0, nx1, ny1 := g.bounds()
+	log.Printf("cartographer: the map has grown to %.0f × %.0f m (x %.0f to %.0f, y %.0f to %.0f), the vehicle at x=%.2f y=%.2f",
+		nx1-nx0, ny1-ny0, nx0, nx1, ny0, ny1, to.x, to.y)
 }
 
 // snapshot writes the picture a person looks at.

@@ -22,6 +22,14 @@ forms carry the run in their frame — `map@2026-09-27T06:13:50Z`, the start tim
 and anything planned in one run, like a [navigator](../navigator/) route, must be
 refused in another.
 
+**The map grows with the drive.** It starts `widthMetres` × `heightMetres`
+(30 × 30 m) round the first sweep. When the vehicle comes within
+`growMarginMetres` (5 m) of an edge it is driving toward, that edge moves out
+by `growStepMetres` (10 m); edges it drives away from or along stay put. So the
+`map` form's width, height and origin change during a run, and a consumer must
+read them from every form, not once. A loop-closure redraw keeps the grown
+size. A negative `growStepMetres` keeps the map at its starting size.
+
 A `map.pgm` is also written to disk every ten seconds. That is the artefact a
 person looks at; the `map` service is what a system consumes.
 
