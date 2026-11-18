@@ -225,9 +225,11 @@ func TestNoReturnNoLoop(t *testing.T) {
 }
 
 // The candidates are the keyframes far enough back along the path, near
-// enough across the map, nearest first and no more than asked for.
+// enough across the map, nearest first and no more than asked for. By the
+// path, as before 19 November.
 func TestCandidatesAreFarAlongAndNearAcross(t *testing.T) {
 	c := testCloser()
+	c.cfg.SearchSigmas = -1
 	c.cfg.MaxCandidates = 2
 	m := testMemory()
 	// A path that comes back past its start: keyframes at path 0, 1, … 20 m.
@@ -244,13 +246,13 @@ func TestCandidatesAreFarAlongAndNearAcross(t *testing.T) {
 	// Keyframe 20 is at x=0, 20 m along: keyframes 0…10 are 10 m or more
 	// back; by the map, 0 is 0.3 m away, 1 is 1.04 m, 2 is 2.02 m, 3 is 3.0 m.
 	got := c.candidates(m, 20)
-	if len(got) != 2 || got[0] != 0 || got[1] != 1 {
+	if len(got) != 2 || got[0].i != 0 || got[1].i != 1 {
 		t.Errorf("candidates %v, want [0 1]", got)
 	}
 	// Keyframe 15 is at x=5, 15 m along: only 0…5 are 10 m back, and the
 	// radius is 2 + 0.05 × (15 − path).
 	got = c.candidates(m, 15)
-	if len(got) != 2 || got[0] != 5 || got[1] != 4 {
+	if len(got) != 2 || got[0].i != 5 || got[1].i != 4 {
 		t.Errorf("candidates %v, want [5 4]", got)
 	}
 }
@@ -636,11 +638,12 @@ func TestACorridorMatchNeedsAHigherScore(t *testing.T) {
 	}
 }
 
-// The window grows with the path since the last loop accepted, from the
-// search's own range to MaxSearchMetres, and shrinks again once a loop pins
-// the chain.
+// By the path, the window grows with the path since the last loop accepted,
+// from the search's own range to MaxSearchMetres, and shrinks again once a
+// loop pins the chain.
 func TestTheReachGrowsWithThePathSinceTheLastLoop(t *testing.T) {
 	c := testCloser()
+	c.cfg.SearchSigmas = -1
 	m := &memory{}
 	for k := 0; k <= 400; k++ {
 		m.frames = append(m.frames, keyframe{id: k, path: 0.5 * float64(k)})
@@ -651,12 +654,12 @@ func TestTheReachGrowsWithThePathSinceTheLastLoop(t *testing.T) {
 	}{
 		{40, 1.2}, {120, 3}, {400, 4},
 	} {
-		if got := c.reach(m, tc.j); math.Abs(got-tc.want) > 1e-9 {
+		if got := c.pathReach(m, tc.j); math.Abs(got-tc.want) > 1e-9 {
 			t.Errorf("keyframe %d, %.0f m from the start: reach %.2f m, want %.2f", tc.j, m.frames[tc.j].path, got, tc.want)
 		}
 	}
 	c.loops = []edge{{i: 3, j: 380, loop: true}}
-	if got := c.reach(m, 400); got != c.cfg.Search.SearchRange {
+	if got := c.pathReach(m, 400); got != c.cfg.Search.SearchRange {
 		t.Errorf("10 m after a loop: reach %.2f m, want the search's own %.2f", got, c.cfg.Search.SearchRange)
 	}
 }
@@ -692,29 +695,49 @@ func TestAWideSearchFindsAFarMatch(t *testing.T) {
 	}
 }
 
-// A closure that would move the map more than BigCorrectionMetres on
-// corridor matches alone waits until BigCorrectionMatches agree in a row; a
-// match that fixes all three directions, or a small correction, does not.
-func TestABigCorridorCorrectionWaitsForMoreMatches(t *testing.T) {
+// A closure that would move the map more than BigCorrectionMetres waits until
+// BigCorrectionMatches agree in a row, corridor matches or not; a small
+// correction does not.
+func TestABigCorrectionWaitsForMoreMatches(t *testing.T) {
 	c := testCloser()
 	frames := []keyframe{{pose: pose{}}, {pose: pose{x: 1}}}
 	far := []pose{{}, {x: 1, y: 3}}    // moves one keyframe 3 m
 	near := []pose{{}, {x: 1, y: 0.5}} // 0.5 m
 	corridor := []loopMatch{{seen: 2}, {seen: 2}}
-	full := []loopMatch{{seen: 2}, {seen: 3}}
+	full := []loopMatch{{seen: 3}, {seen: 3}}
 
 	c.streak = make([]loopMatch, 2)
 	if wait, moved, _ := c.waitsForMore(corridor, far, frames); !wait || math.Abs(moved-3) > 1e-9 {
 		t.Errorf("3 m on two corridor matches: wait %t, moved %.2f", wait, moved)
 	}
-	if wait, _, _ := c.waitsForMore(full, far, frames); wait {
-		t.Error("a three-direction match was made to wait")
-	}
 	if wait, _, _ := c.waitsForMore(corridor, near, frames); wait {
 		t.Error("a 0.5 m correction was made to wait")
+	}
+	if wait, _, _ := c.waitsForMore(full, near, frames); wait {
+		t.Error("a 0.5 m correction on three-direction matches was made to wait")
 	}
 	c.streak = make([]loopMatch, c.cfg.BigCorrectionMatches)
 	if wait, _, _ := c.waitsForMore(corridor, far, frames); wait {
 		t.Errorf("%d corridor matches in a row still waited", c.cfg.BigCorrectionMatches)
+	}
+	if wait, _, _ := c.waitsForMore(full, far, frames); wait {
+		t.Errorf("%d three-direction matches in a row still waited", c.cfg.BigCorrectionMatches)
+	}
+}
+
+// The closure of 18 November, keyframes 297 and 298 against 73: a side
+// opening matched onto the junction 4.4 m further along the corridor, with a
+// turn of 6°, fixing all three directions on both. Two such matches, or
+// three, are not enough for a correction that size.
+func TestAThreeDirectionAliasWaits(t *testing.T) {
+	c := testCloser()
+	frames := []keyframe{{pose: pose{}}, {pose: pose{x: 1}}}
+	alias := []pose{{}, {x: 5.4, y: 1.5, theta: 6 * math.Pi / 180}}
+	matches := []loopMatch{{seen: 3, score: 0.67}, {seen: 3, score: 0.68}}
+	for n := 2; n < c.cfg.BigCorrectionMatches; n++ {
+		c.streak = make([]loopMatch, n)
+		if wait, moved, turned := c.waitsForMore(matches, alias, frames); !wait {
+			t.Errorf("%d three-direction matches in a row let in %.1f m and %.0f°", n, moved, turned*180/math.Pi)
+		}
 	}
 }

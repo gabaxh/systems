@@ -313,17 +313,21 @@ sequenceDiagram
   drift could explain the rest. The match is against a submap drawn from the
   older keyframe and its neighbours, not against the whole map: the whole map
   already holds the doubled wall the loop is meant to remove. The window is
-  `search`'s ±1.2 m, until the path since the last loop accepted grows long:
-  then it is `driftFraction` of that path, up to `maxSearchMetres` (4 m). A
-  wide, coarse pass finds the best three places in it, and the usual search
-  is run round each.
+  `searchSigmas` (3) standard deviations of where the keyframe is relative
+  to the older one, as the pose graph has it with every edge and every loop
+  accepted so far: the block of H⁻¹ the two span, three solves of the graph
+  per candidate. It is at least `search`'s ±1.2 m and at most
+  `maxSearchMetres` (4 m). Where it is wider than `search`'s range, a wide,
+  coarse pass finds the best three places in it, and the usual search is run
+  round each. With `searchSigmas` negative the window is the rule from before
+  19 November: `driftFraction` of the path since the last loop accepted.
 - **Believing it.** Corridors repeat, and a convincing match in the wrong place
   folds the map. So a match must score at least `minScore` per return, and a
   corridor match `minCorridorScore`: a corridor has an alias a corridor's
   width to the side, the sweep's left wall on the old pass's right wall. A
   closure that would move some keyframe `bigCorrectionMetres` or turn one
-  `bigCorrectionDegrees` needs a match that fixes all three directions, or
-  `bigCorrectionMatches` corridor matches in a row. It must
+  `bigCorrectionDegrees` needs `bigCorrectionMatches` matches in a row,
+  whatever they fix (see the drive of 18 November, below). It must
   fix at least two directions. One that fixes only two, as in a corridor,
   keeps its heading and its position across the corridor, and takes the
   position along it from the estimate: the match's own position along a
@@ -372,10 +376,11 @@ A plain corridor driven up and back with wheels reading 3 % long accepts
 | `maxCandidates` | 3 | |
 | `submapMetres` / `submapKeyframes` | 16 / 5 | |
 | `search` | ±1.2 m, ±20°, 0.10 m / 2° → 0.0125 m / 0.5° | as the front end's `search` |
-| `maxSearchMetres` | 4 | how far the window may grow after a long stretch no loop has pinned |
+| `maxSearchMetres` | 4 | how far the window may grow |
+| `searchSigmas` | 3 | the window, in standard deviations of the graph's uncertainty between the two keyframes; negative for the path rule |
 | `minScore` | 0.55 | per return; 1 is every return on a wall |
 | `minCorridorScore` | 0.65 | the same for a match that fixes only two directions |
-| `bigCorrectionMetres` / `bigCorrectionDegrees` / `bigCorrectionMatches` | 2 / 5 / 4 | a closure that big, on corridor matches alone, waits for that many in a row |
+| `bigCorrectionMetres` / `bigCorrectionDegrees` / `bigCorrectionMatches` | 2 / 5 / 4 | a closure that big waits for that many matches in a row |
 | `consistentMatches` | 2 | keyframes in a row |
 | `maxChi2` | 7.8 | χ² of three degrees of freedom at 95 % |
 | `robustScale` | 3 | Cauchy, in standard deviations, on loops already accepted |
@@ -535,3 +540,69 @@ errors, against the version before:
 The big-correction rule never acted in these replays. `minCorridorScore` at
 0.7 cost the 12:08 drive five right loops and 0.47 m of mean error; at 0.65
 it costs nothing there and still refuses the alias.
+
+**Driven on 18 November**, with the map growing from 30 m: along the top
+corridor, down the long one on the right, round the block below and back
+along its middle corridor, then up the long corridor again to the start. The
+way up was drawn 5 m beside the way down, its doors level with the first
+copy's.
+- **A junction aliased.** Coming along the middle corridor toward the
+  junction, keyframes 297 and 298 matched keyframe 73's submap with a side
+  opening 4.4 m short of the junction on the junction itself: 0.67 and 0.68,
+  all three directions fixed. A match that fixed all three was exempt from
+  the big-correction rule, so two were enough, and the closure moved the
+  vehicle 4.4 m along the corridor and turned it 6° (χ² 7.0). The vehicle
+  then turned up into the long corridor 5 m east of where the graph had it.
+- **Then nothing could undo it.** The keyframes after it saw the alias fade:
+  300 to 304 wanted to go back west, against the window's edge, with scores
+  falling from 0.63 to 0.31, and 300 was refused at χ² 9. The accepted loop
+  had shrunk the window to ±1.2 m, and all the way up the long corridor the
+  matches against the way down scored 0.2–0.4: the right place was 5 m off.
+  The corner at the top closed (3.6–3.9 m) but only bent the end of the
+  corridor onto it.
+- **Every big correction now waits** for `bigCorrectionMatches` matches in a
+  row, three-direction ones too (`TestAThreeDirectionAliasWaits`). At a real
+  junction that is a metre more driving; here the streak would have broken at
+  keyframe 300, three short of four.
+
+Not yet confirmed by a replay: the drive was not exported.
+
+**The window from the graph's uncertainty** (`searchSigmas`), 19 November.
+The path rule (`driftFraction` of the path since the last loop accepted)
+does not see where the uncertainty is: a stretch held by the walls drifts
+less than one on the wheels alone, a heading error grows into position with
+the distance from where it was made, and after any loop the rule shrinks the
+window to ±1.2 m wherever the vehicle has got to since. The graph knows all
+of that: the covariance of one keyframe seen from another is a block of H⁻¹,
+the same system matrix the optimiser solves. On a plain chain it is the edges
+compounded one after another, and a loop fuses with it as
+(Σ⁻¹ + Ω)⁻¹ (`search_test.go`).
+
+On the graph of 18 November, at the junction, with the false loop left out:
+
+| keyframes | σ along / across, heading | window |
+|---|---|---|
+| 73 ↔ 297, the junction | 0.91 / 0.95 m, 1.2° | 3.0 m |
+| 60 ↔ 325, up the long corridor | 1.06 / 1.04 m, 1.4° | 3.5 m |
+| 30 ↔ 360 | 1.15 / 1.41 m, 1.4° | 4.0 m |
+
+The path rule searched ±4 m at the junction; the alias that got in was
+4.4 m along the corridor and 6° round, five standard deviations in both.
+What the window cannot do is undo a false loop already accepted: with it in
+the graph, the uncertainty up the long corridor is 0.3–0.6 m, the window
+1.2–1.9 m, as small as the path rule made it. A false loop has to be kept out
+(the big-correction rule above), not searched round.
+
+Which older keyframes are tried stays by the path
+(`searchRadiusMetres` + `driftFraction` × the path between). Taking them
+within `searchRadiusMetres` plus the window was tried: round the ring of
+`loops_test.go`, whose wheels' noise model is thirty times its drift, the
+window sits at its 4 m cap, keyframes 5 m short of the start were tried, and
+the loop closed early on partial overlap (scores 0.64 and 0.70, against
+0.81); 86 % of the redrawn walls were within 10 cm of a real one, against
+97 %. With the window alone the ring gives 97.0 % (96.7 % by the path).
+
+It costs three solves of the graph per candidate, only for keyframes that
+have one: 22 ms per keyframe on the 392 keyframes and 6 loops of 18 November,
+37–40 conjugate-gradient iterations a solve. It grows with the graph and the
+loops in it; a long run with hundreds of loops is worth timing.

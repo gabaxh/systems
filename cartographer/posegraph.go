@@ -219,7 +219,27 @@ func (g *poseGraph) assemble(model linearModel) system {
 // conjugate gradients converges in a few iterations for each (subgraph
 // preconditioning: Dellaert, Carlson, Ila, Ni and Thorpe, IROS 2010).
 func (g *poseGraph) solve(sys system, lambda float64) ([][3]float64, bool) {
+	solveFor, ok := g.linearSolver(sys, lambda)
+	if !ok {
+		return nil, false
+	}
+	rhs := make([][3]float64, len(g.nodes))
+	for i := range rhs {
+		for c := 0; c < 3; c++ {
+			rhs[i][c] = -sys.b[i][c]
+		}
+	}
+	return solveFor(rhs), true
+}
+
+// linearSolver factors the preconditioner for (H + λ·diag(H)) once and returns
+// what solves the system for any right-hand side, node 0 held fixed. solve
+// uses it for −b; marginals for the columns of a Jacobian.
+func (g *poseGraph) linearSolver(sys system, lambda float64) (func(rhs [][3]float64) [][3]float64, bool) {
 	n := len(g.nodes)
+	// The edges as they are now: a solver kept for later (marginals) must not
+	// see an edge added to the graph after it, which sys has no block for.
+	edges := g.edges[:len(g.edges):len(g.edges)]
 	damped := make([]mat3, n)
 	for i := 1; i < n; i++ {
 		d := sys.diag[i]
@@ -228,7 +248,7 @@ func (g *poseGraph) solve(sys system, lambda float64) ([][3]float64, bool) {
 		}
 		damped[i] = d
 	}
-	precondition, ok := chainPreconditioner(g.edges, sys.off, damped)
+	precondition, ok := chainPreconditioner(edges, sys.off, damped)
 	if !ok {
 		return nil, false
 	}
@@ -239,7 +259,7 @@ func (g *poseGraph) solve(sys system, lambda float64) ([][3]float64, bool) {
 		for i := 1; i < n; i++ {
 			y[i] = damped[i].mulVec(x[i])
 		}
-		for k, e := range g.edges {
+		for k, e := range edges {
 			o := sys.off[k]
 			yi := o.mulVec(x[e.j])
 			yj := o.transpose().mulVec(x[e.i])
@@ -258,53 +278,120 @@ func (g *poseGraph) solve(sys system, lambda float64) ([][3]float64, bool) {
 		return s
 	}
 
-	x := make([][3]float64, n)
-	r := make([][3]float64, n)
-	z := make([][3]float64, n)
-	p := make([][3]float64, n)
-	hp := make([][3]float64, n)
-	for i := 1; i < n; i++ {
-		for c := 0; c < 3; c++ {
-			r[i][c] = -sys.b[i][c]
-		}
-	}
-	precondition(r, z)
-	copy(p, z)
-	rz := dot(r, z)
-	norm0 := math.Sqrt(dot(r, r))
-	if norm0 == 0 {
-		return x, true
-	}
-	// With the chain as preconditioner a few iterations per loop are enough;
-	// the limit is for a graph that is not a chain at all.
-	limit := 3 * n
-	for it := 0; it < limit; it++ {
-		mulH(p, hp)
-		php := dot(p, hp)
-		if php <= 0 {
-			break
-		}
-		alpha := rz / php
+	return func(rhs [][3]float64) [][3]float64 {
+		x := make([][3]float64, n)
+		r := make([][3]float64, n)
+		z := make([][3]float64, n)
+		p := make([][3]float64, n)
+		hp := make([][3]float64, n)
 		for i := 1; i < n; i++ {
-			for c := 0; c < 3; c++ {
-				x[i][c] += alpha * p[i][c]
-				r[i][c] -= alpha * hp[i][c]
-			}
-		}
-		if math.Sqrt(dot(r, r)) <= 1e-10*norm0 {
-			break
+			r[i] = rhs[i]
 		}
 		precondition(r, z)
-		next := dot(r, z)
-		beta := next / rz
-		rz = next
-		for i := 1; i < n; i++ {
-			for c := 0; c < 3; c++ {
-				p[i][c] = z[i][c] + beta*p[i][c]
+		copy(p, z)
+		rz := dot(r, z)
+		norm0 := math.Sqrt(dot(r, r))
+		if norm0 == 0 {
+			return x
+		}
+		// With the chain as preconditioner a few iterations per loop are
+		// enough; the limit is for a graph that is not a chain at all.
+		limit := 3 * n
+		for it := 0; it < limit; it++ {
+			mulH(p, hp)
+			php := dot(p, hp)
+			if php <= 0 {
+				break
+			}
+			alpha := rz / php
+			for i := 1; i < n; i++ {
+				for c := 0; c < 3; c++ {
+					x[i][c] += alpha * p[i][c]
+					r[i][c] -= alpha * hp[i][c]
+				}
+			}
+			if math.Sqrt(dot(r, r)) <= 1e-10*norm0 {
+				break
+			}
+			precondition(r, z)
+			next := dot(r, z)
+			beta := next / rz
+			rz = next
+			for i := 1; i < n; i++ {
+				for c := 0; c < 3; c++ {
+					p[i][c] = z[i][c] + beta*p[i][c]
+				}
 			}
 		}
+		return x
+	}, true
+}
+
+// marginals answers how uncertain one keyframe is relative to another, given
+// every edge of the graph: the block of H⁻¹ the two span, H linearised at the
+// graph's current poses. This is the covariance Grisetti et al. read off the
+// system matrix: what the chain of motion between two keyframes says, made
+// smaller by every loop that ties the stretches between them together.
+type marginals struct {
+	nodes    []pose
+	solveFor func(rhs [][3]float64) [][3]float64
+}
+
+// marginals linearises the graph, without the robust kernel, and factors what
+// relative needs. The kernel is left out because the loops it is for are
+// accepted ones, whose residuals are small and whose weight is then about 1.
+func (g *poseGraph) marginals() (*marginals, bool) {
+	if len(g.nodes) < 2 {
+		return nil, false
 	}
-	return x, true
+	solveFor, ok := g.linearSolver(g.linearise(0), 0)
+	if !ok {
+		return nil, false
+	}
+	return &marginals{nodes: g.nodes, solveFor: solveFor}, true
+}
+
+// relative is the covariance of keyframe j's pose as seen from keyframe i,
+// t2v(x_i⁻¹ ∘ x_j), in i's frame: the frame a loop match searches in.
+//
+// With J the Jacobian of that pose with respect to all the nodes, nonzero
+// only in i's and j's blocks, the covariance is J H⁻¹ Jᵀ: three solves, one
+// for each row of J, each against the same factored preconditioner.
+func (mg *marginals) relative(i, j int) mat3 {
+	n := len(mg.nodes)
+	a, b := jacobians(pose{}, mg.nodes[i], mg.nodes[j])
+	var y [3][][3]float64
+	for r := 0; r < 3; r++ {
+		rhs := make([][3]float64, n)
+		rhs[i] = a[r]
+		for c := 0; c < 3; c++ {
+			rhs[j][c] += b[r][c]
+		}
+		y[r] = mg.solveFor(rhs)
+	}
+	var cov mat3
+	for s := 0; s < 3; s++ {
+		for r := 0; r < 3; r++ {
+			var v float64
+			for c := 0; c < 3; c++ {
+				if i != 0 { // node 0 is not a variable
+					v += a[s][c] * y[r][i][c]
+				}
+				if j != 0 {
+					v += b[s][c] * y[r][j][c]
+				}
+			}
+			cov[s][r] = v
+		}
+	}
+	// Symmetric up to the solver's tolerance; made exactly so.
+	for s := 0; s < 3; s++ {
+		for r := s + 1; r < 3; r++ {
+			m := (cov[s][r] + cov[r][s]) / 2
+			cov[s][r], cov[r][s] = m, m
+		}
+	}
+	return cov
 }
 
 // chainPreconditioner factors the block-tridiagonal part of the damped H — its

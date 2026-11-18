@@ -87,12 +87,24 @@ type LoopConfig struct {
 	SubmapKeyframes int          `json:"submapKeyframes"`
 	Search          SearchConfig `json:"search"`
 
-	// MaxSearchMetres is how far either way the window may grow after a long
-	// stretch nothing has pinned: to DriftFraction of the path since the last
-	// loop accepted, at least Search's own range and at most this. On 6
-	// November, after 190 m of new corridors, the vehicle came back 3.8 m to
-	// the side of where it had been, and the ±1.2 m window could not reach it.
+	// MaxSearchMetres is how far either way the window may grow, and at least
+	// it is Search's own range. On 6 November, after 190 m of new corridors,
+	// the vehicle came back 3.8 m to the side of where it had been, and the
+	// ±1.2 m window could not reach it.
 	MaxSearchMetres float64 `json:"maxSearchMetres"`
+
+	// SearchSigmas sizes the window by the graph's own uncertainty:
+	// SearchSigmas standard deviations of where keyframe j is relative to
+	// candidate i, given every edge, accepted loops included (see marginals),
+	// within Search's range and MaxSearchMetres. Absent means 3.
+	//
+	// Negative keeps the rule from before 19 November, by the path:
+	// DriftFraction of the path since the last loop accepted. That rule does
+	// not see where the uncertainty is. On 18 November it searched ±4 m at
+	// the junction, where the graph's 3σ was 3.0 m, and the alias that got in
+	// was 4.4 m along the corridor and 6° round, five standard deviations in
+	// both.
+	SearchSigmas float64 `json:"searchSigmas"`
 
 	// A match is believed when its score per return is at least MinScore —
 	// MinCorridorScore if it fixes only two directions, as in a corridor —
@@ -116,9 +128,10 @@ type LoopConfig struct {
 	MaxChi2           float64 `json:"maxChi2"`
 
 	// A closure that would move some keyframe BigCorrectionMetres or turn one
-	// BigCorrectionDegrees needs a match that fixes all three directions, or
-	// BigCorrectionMatches corridor matches in a row that agree. The 6
-	// November alias moved the map 5.4 m on two corridor matches of 0.57.
+	// BigCorrectionDegrees needs BigCorrectionMatches matches in a row that
+	// agree. The 6 November alias moved the map 5.4 m on two corridor matches
+	// of 0.57; the 18 November one 4.4 m and 6° on two matches of 0.68 that
+	// fixed all three directions (see closer.waitsForMore).
 	BigCorrectionMetres  float64 `json:"bigCorrectionMetres"`
 	BigCorrectionDegrees float64 `json:"bigCorrectionDegrees"`
 	BigCorrectionMatches int     `json:"bigCorrectionMatches"`
@@ -198,6 +211,7 @@ func defaultLoop() LoopConfig {
 		MinScore:                      0.55,
 		MinCorridorScore:              0.65,
 		MaxSearchMetres:               4,
+		SearchSigmas:                  3,
 		BigCorrectionMetres:           2,
 		BigCorrectionDegrees:          5,
 		BigCorrectionMatches:          4,
@@ -267,6 +281,9 @@ func applyLoopDefaults(c *LoopConfig) {
 	}
 	if c.MaxSearchMetres <= 0 {
 		c.MaxSearchMetres = d.MaxSearchMetres
+	}
+	if c.SearchSigmas == 0 {
+		c.SearchSigmas = d.SearchSigmas
 	}
 	if c.BigCorrectionMetres <= 0 {
 		c.BigCorrectionMetres = d.BigCorrectionMetres
