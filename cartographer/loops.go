@@ -580,9 +580,14 @@ func (t *Traits) loopClosed(snap *memory, cl closure) {
 
 	redrawn := snap.snapshot()
 	copyPoses(redrawn.frames, cl.nodes)
-	g := newGrid(t.cfg.WidthMetres, t.cfg.HeightMetres, t.cfg.Resolution)
-	g.matchRange = t.cfg.MatchRangeMetres
-	g.freeRange = t.cfg.freeRange()
+	// The map has grown with the drive, so the redraw starts from the grid as
+	// it is now and not from the configured starting size, which would cut off
+	// everything outside it. The closure may also have moved keyframes nearer
+	// an edge, or past it.
+	t.mu.RLock()
+	g := emptyLike(t.g)
+	t.mu.RUnlock()
+	t.coverKeyframes(g, redrawn.frames)
 	redrawn.drawAll(g)
 
 	t.mu.Lock()
@@ -595,6 +600,21 @@ func (t *Traits) loopClosed(snap *memory, cl closure) {
 	correction := t.applyClosure(g, snap, cl.nodes)
 	log.Printf("cartographer: the map is redrawn from %d keyframes, moved by up to %.2f m (%d loops in all); the vehicle moved %.2f m and turned %.1f°",
 		len(cl.nodes), cl.moved, len(t.closer.loops), math.Hypot(t.at.x-before.x, t.at.y-before.y), math.Abs(correction.theta)*180/math.Pi)
+}
+
+// coverKeyframes grows g, in GrowStepMetres steps, until every keyframe is at
+// least GrowMarginMetres inside it. Nothing, with growth off.
+func (t *Traits) coverKeyframes(g *grid, frames []keyframe) {
+	step, margin := t.cfg.GrowStepMetres, t.cfg.GrowMarginMetres
+	if step <= 0 || len(frames) == 0 {
+		return
+	}
+	x0, y0, x1, y1 := g.bounds()
+	for _, f := range frames {
+		x0, x1 = min(x0, f.pose.x-margin), max(x1, f.pose.x+margin)
+		y0, y1 = min(y0, f.pose.y-margin), max(y1, f.pose.y+margin)
+	}
+	g.cover(x0, y0, x1, y1, step)
 }
 
 func copyPoses(frames []keyframe, nodes []pose) {
@@ -621,6 +641,13 @@ func (t *Traits) applyClosure(g *grid, snap *memory, nodes []pose) pose {
 	copyPoses(m.frames[:len(snap.frames)], nodes)
 	for _, k := range frames {
 		m.frames[k].pose = compose(correction, m.frames[k].pose)
+	}
+	// The front end may have grown the old grid while this one was drawn;
+	// the new one is at least as big, and reaches the newer keyframes too.
+	ox0, oy0, ox1, oy1 := t.g.bounds()
+	g.cover(ox0, oy0, ox1, oy1, 0)
+	t.coverKeyframes(g, m.frames)
+	for _, k := range frames {
 		m.frames[k].sweep.draw(g, m.frames[k].pose)
 	}
 	for _, s := range sweeps {

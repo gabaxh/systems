@@ -135,6 +135,77 @@ func newGrid(widthM, heightM, res float64) *grid {
 	}
 }
 
+// emptyLike is a blank grid with g's size, place, resolution and ranges: what
+// a redraw draws into, so that a map that has grown stays grown.
+func emptyLike(g *grid) *grid {
+	return &grid{
+		width: g.width, height: g.height, res: g.res,
+		originX: g.originX, originY: g.originY,
+		cells: make([]float32, g.width*g.height),
+		field: make([]float32, g.width*g.height),
+		ex0:   g.width, ey0: g.height, ex1: -1, ey1: -1,
+		matchRange: g.matchRange,
+		freeRange:  g.freeRange,
+	}
+}
+
+// bounds is the part of the world the grid covers, in metres.
+func (g *grid) bounds() (x0, y0, x1, y1 float64) {
+	return g.originX, g.originY,
+		g.originX + float64(g.width)*g.res, g.originY + float64(g.height)*g.res
+}
+
+// growBy adds cells to the grid's four sides: left and right in x, down and
+// up in y. Everything already drawn keeps its place in the world; only its
+// indices move. The likelihood field moves with the cells, and the new cells
+// are unknown and far from any wall, as a fresh grid's are.
+func (g *grid) growBy(left, right, down, up int) {
+	left, right, down, up = max(0, left), max(0, right), max(0, down), max(0, up)
+	if left+right+down+up == 0 {
+		return
+	}
+	w, h := g.width+left+right, g.height+down+up
+	cells := make([]float32, w*h)
+	field := make([]float32, w*h)
+	for y := 0; y < g.height; y++ {
+		src := y * g.width
+		dst := (y+down)*w + left
+		copy(cells[dst:dst+g.width], g.cells[src:src+g.width])
+		copy(field[dst:dst+g.width], g.field[src:src+g.width])
+	}
+	g.cells, g.field = cells, field
+	g.width, g.height = w, h
+	g.originX -= float64(left) * g.res
+	g.originY -= float64(down) * g.res
+	if g.ex1 >= g.ex0 && g.ey1 >= g.ey0 {
+		g.ex0 += left
+		g.ex1 += left
+		g.ey0 += down
+		g.ey1 += down
+	} else {
+		g.ex0, g.ey0, g.ex1, g.ey1 = w, h, -1, -1
+	}
+}
+
+// cover grows the grid until it covers the box (x0, y0)–(x1, y1), in steps
+// of step metres on each side that needs it (exactly as far as needed if step
+// is 0 or less). It reports whether it grew.
+func (g *grid) cover(x0, y0, x1, y1, step float64) bool {
+	gx0, gy0, gx1, gy1 := g.bounds()
+	cells := func(short float64) int {
+		if short <= 0 {
+			return 0
+		}
+		if step > 0 {
+			short = math.Ceil(short/step) * step
+		}
+		return int(math.Ceil(short/g.res - 1e-9))
+	}
+	l, r, d, u := cells(gx0-x0), cells(x1-gx1), cells(gy0-y0), cells(y1-gy1)
+	g.growBy(l, r, d, u)
+	return l+r+d+u > 0
+}
+
 func (g *grid) cellOf(x, y float64) (int, int, bool) {
 	cx := int(math.Floor((x - g.originX) / g.res))
 	cy := int(math.Floor((y - g.originY) / g.res))
