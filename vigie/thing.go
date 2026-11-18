@@ -163,7 +163,7 @@ func initTemplate() *components.UnitAsset {
 	}
 	services := components.Services{scan.SubPath: scan}
 	for _, s := range []*components.Service{
-		signal("clearance", unitMetre, qkLength, "the nearest return in the corridor ahead; unavailable rather than optimistic when nothing came back from it", 2),
+		signal("clearance", unitMetre, qkLength, "the nearest return in the corridor ahead, or how far its floor was seen when nothing stood in the way; unavailable rather than optimistic when neither came back", 2),
 		signal("yawrate", unitRadPerS, qkAngularVel, "the vehicle's rate of turn about the vertical, positive to the left", 2),
 		signal("heading", unitDegree, qkAngle, "the yaw rate integrated since the gyroscope's zero was known: never wraps; unavailable just after a gap in the stream", 2),
 		signal("bias", unitDegPerS, qkAngularVel, "the gyroscope's zero about the vertical, as last measured at a standstill", 5),
@@ -196,7 +196,10 @@ func defaultConfig() VigieConfig {
 			BinDegrees: 1, MinRangeMetres: 0.2, MaxRangeMetres: 40,
 			AccumulateMs: 200,
 		},
-		Clearance:       ClearanceConfig{HalfWidthMetres: 0.45, MinHeightMetres: 0.1, MaxHeightMetres: 1.6},
+		Clearance: ClearanceConfig{
+			HalfWidthMetres: 0.45, MinHeightMetres: 0.1, MaxHeightMetres: 1.6,
+			FloorToleranceMetres: 0.3, MinFloorPoints: 10,
+		},
 		IMUAverageMs:    100,
 		GyroZeroSeconds: 3,
 		StaleAfterMs:    1000,
@@ -232,6 +235,13 @@ func applyDefaults(c *VigieConfig) {
 	}
 	if c.Clearance.HalfWidthMetres <= 0 {
 		c.Clearance = d.Clearance
+	}
+	// A file older than the floor check sets the corridor but not these.
+	if c.Clearance.FloorToleranceMetres <= 0 {
+		c.Clearance.FloorToleranceMetres = d.Clearance.FloorToleranceMetres
+	}
+	if c.Clearance.MinFloorPoints == 0 { // negative is off, and stays
+		c.Clearance.MinFloorPoints = d.Clearance.MinFloorPoints
 	}
 	if c.GyroZeroSeconds <= 0 {
 		c.GyroZeroSeconds = d.GyroZeroSeconds

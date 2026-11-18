@@ -104,6 +104,13 @@ type ClearanceConfig struct {
 	HalfWidthMetres float64 `json:"halfWidthMetres"`
 	MinHeightMetres float64 `json:"minHeightMetres"` // above the ground: lower is the floor
 	MaxHeightMetres float64 `json:"maxHeightMetres"` // the vehicle's height and a margin
+	// FloorToleranceMetres is how far below the ground a return may be and
+	// still count as the floor; lower is a reflection (a puddle, glass).
+	FloorToleranceMetres float64 `json:"floorToleranceMetres"`
+	// MinFloorPoints is how many floor returns in the corridor prove the lidar
+	// sees ahead when nothing else came back from it. Negative turns it off:
+	// an empty corridor is then always blind.
+	MinFloorPoints int `json:"minFloorPoints"`
 }
 
 // sweep is one horizontal scan, in the vehicle frame: angle zero straight
@@ -211,26 +218,40 @@ func slice(pts []timedPoint, cfg SliceConfig, body Box, first, last time.Time) s
 }
 
 // clearanceAhead is the nearest return in the corridor ahead, measured forward
-// from the reference point. ok is false when nothing in the corridor came
-// back: a lidar that saw nothing there cannot say whether the way is clear or
-// it was blind, and a consumer must not be handed a distance for either.
+// from the reference point.
+//
+// When nothing in the corridor stood at a height the vehicle could hit, the
+// floor decides. A beam that came back from the floor at 12 m went 12 m
+// without meeting anything: the lidar works and sees that far. So with at
+// least MinFloorPoints floor returns in the corridor, the answer is the
+// farthest of them — how far the way was seen to be empty, a measurement and
+// never more than one. Without them ok is false: a lidar that saw neither an
+// obstacle nor the floor cannot say whether the way is clear or it was blind
+// (fog, a dirty window, a drop-off ahead), and a consumer must not be handed a
+// distance for either.
 func clearanceAhead(pts []timedPoint, cfg ClearanceConfig, body Box) (float64, bool) {
-	best := math.Inf(1)
+	nearest := math.Inf(1)
+	floorFar, floorN := 0.0, 0
 	for _, p := range pts {
-		if p.x <= 0 || math.Abs(p.y) > cfg.HalfWidthMetres || p.z < cfg.MinHeightMetres || p.z > cfg.MaxHeightMetres {
+		if p.x <= 0 || math.Abs(p.y) > cfg.HalfWidthMetres || body.contains(p.x, p.y) {
 			continue
 		}
-		if body.contains(p.x, p.y) {
-			continue
-		}
-		if p.x < best {
-			best = p.x
+		switch {
+		case p.z >= cfg.MinHeightMetres && p.z <= cfg.MaxHeightMetres:
+			nearest = math.Min(nearest, p.x) // something the vehicle could hit
+		case p.z < cfg.MinHeightMetres && p.z > -cfg.FloorToleranceMetres:
+			floorN++ // the floor: the beam got this far
+			floorFar = math.Max(floorFar, p.x)
 		}
 	}
-	if math.IsInf(best, 1) {
+	switch {
+	case !math.IsInf(nearest, 1):
+		return nearest, true
+	case cfg.MinFloorPoints >= 0 && floorN >= max(cfg.MinFloorPoints, 1):
+		return floorFar, true
+	default:
 		return 0, false
 	}
-	return best, true
 }
 
 //-------------------------------------The IMU
