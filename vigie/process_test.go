@@ -93,7 +93,7 @@ func TestTheSliceKeepsTheNearestInTheBand(t *testing.T) {
 }
 
 func TestClearanceSeesWhatTheLaserPlaneWouldMiss(t *testing.T) {
-	cfg := ClearanceConfig{HalfWidthMetres: 0.45, MinHeightMetres: 0.1, MaxHeightMetres: 1.6}
+	cfg := ClearanceConfig{HalfWidthMetres: 0.45, MinHeightMetres: 0.1, MaxHeightMetres: 1.6, FloorToleranceMetres: 0.3, MinFloorPoints: 10}
 	pts := []timedPoint{
 		{x: 6, y: 0, z: 0.5},  // ahead
 		{x: 4, y: 0, z: 1.55}, // a hanging cable, above any single scan plane at 0.5 m
@@ -105,6 +105,75 @@ func TestClearanceSeesWhatTheLaserPlaneWouldMiss(t *testing.T) {
 	}
 	if _, ok := clearanceAhead(pts[2:], cfg, Box{}); ok {
 		t.Error("a corridor nothing came back from was reported as a distance")
+	}
+}
+
+// floorAhead is n returns from the floor in the corridor, spread from 8 m out
+// to farthest.
+func floorAhead(n int, farthest float64) []timedPoint {
+	pts := make([]timedPoint, n)
+	for i := range pts {
+		x := farthest
+		if n > 1 {
+			x = 8 + (farthest-8)*float64(i)/float64(n-1)
+		}
+		pts[i] = timedPoint{x: x, y: -0.4 + 0.8*float64(i%5)/4, z: 0.02}
+	}
+	return pts
+}
+
+// In an empty hall nothing stands in the corridor; the floor says the lidar
+// saw it was empty, and how far.
+func TestClearanceTrustsTheFloorItSees(t *testing.T) {
+	cfg := ClearanceConfig{HalfWidthMetres: 0.45, MinHeightMetres: 0.1, MaxHeightMetres: 1.6, FloorToleranceMetres: 0.3, MinFloorPoints: 10}
+	moved := func(pts []timedPoint, f func(*timedPoint)) []timedPoint {
+		out := append([]timedPoint(nil), pts...)
+		for i := range out {
+			f(&out[i])
+		}
+		return out
+	}
+	off := cfg
+	off.MinFloorPoints = -1
+	unset := cfg
+	unset.MinFloorPoints = 0
+
+	cases := []struct {
+		name   string
+		cfg    ClearanceConfig
+		pts    []timedPoint
+		want   float64
+		wantOK bool
+	}{
+		{"the floor out to 15 m", cfg, floorAhead(10, 15), 15, true},
+		{"an obstacle before the floor", cfg, append(floorAhead(10, 15), timedPoint{x: 4, z: 0.5}), 4, true},
+		{"too little floor", cfg, floorAhead(9, 15), 0, false},
+		{"floor beside the corridor", cfg, moved(floorAhead(10, 15), func(p *timedPoint) { p.y += 1 }), 0, false},
+		{"floor behind", cfg, moved(floorAhead(10, 15), func(p *timedPoint) { p.x = -p.x }), 0, false},
+		{"a reflection below the floor", cfg, moved(floorAhead(10, 15), func(p *timedPoint) { p.z = -0.5 }), 0, false},
+		{"the floor check off", off, floorAhead(50, 15), 0, false},
+		{"a zero minimum with no floor", unset, nil, 0, false},
+		{"a zero minimum with floor", unset, floorAhead(1, 12), 12, true},
+	}
+	for _, c := range cases {
+		d, ok := clearanceAhead(c.pts, c.cfg, Box{})
+		if ok != c.wantOK || d != c.want {
+			t.Errorf("%s: %.2f %v, want %.2f %v", c.name, d, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+// A configuration written before the floor check gets it, unless it turned it off.
+func TestAnOlderClearanceGetsTheFloorCheck(t *testing.T) {
+	c := VigieConfig{Clearance: ClearanceConfig{HalfWidthMetres: 0.6, MinHeightMetres: 0.1, MaxHeightMetres: 1.6}}
+	applyDefaults(&c)
+	if c.Clearance.HalfWidthMetres != 0.6 || c.Clearance.MinFloorPoints != 10 || c.Clearance.FloorToleranceMetres != 0.3 {
+		t.Errorf("%+v, want the corridor kept and the floor check's defaults", c.Clearance)
+	}
+	c = VigieConfig{Clearance: ClearanceConfig{HalfWidthMetres: 0.6, MinFloorPoints: -1}}
+	applyDefaults(&c)
+	if c.Clearance.MinFloorPoints != -1 {
+		t.Errorf("minFloorPoints %d, want -1 kept: it turns the check off", c.Clearance.MinFloorPoints)
 	}
 }
 

@@ -32,13 +32,26 @@ point the mount is measured from. When the cartographer reads the vigie's
 `scan`, its `scannerMount` is therefore zero: the vigie has already moved the
 scan to the reference point.
 
-**`clearance` answers 503, not a distance, when nothing came back from the
-corridor ahead**, for the guetteur's reason: a lidar that saw nothing there
-cannot say whether the way is clear or it was blind, and every number is a
-distance somebody will act on. `quality` says which. In a straight drift longer
-than the lidar's range this means `clearance` is unavailable while the way is in
-fact clear; a consumer has to treat that as "cannot see", which is the safe
-reading and the one this system can stand behind.
+**`clearance` is the nearest return in the corridor ahead** — ±`halfWidthMetres`,
+between `minHeightMetres` and `maxHeightMetres` above the ground. **When nothing
+stands there, the floor decides.** A beam that came back from the floor at 12 m
+went 12 m without meeting anything, so with at least `minFloorPoints` floor
+returns in the corridor (between `−floorToleranceMetres` and `minHeightMetres`),
+`clearance` is the farthest of them: how far the way was seen to be empty. With
+the lidar 1 m up, its lowest beams (−7°) reach the floor from about 8 m, so in an
+empty hall this reads 8–20 m.
+
+**It answers 503, not a distance, when neither came back**, for the guetteur's
+reason: a lidar that saw nothing there cannot say whether the way is clear or it
+was blind, and every number is a distance somebody will act on. `quality` says
+which. Fog, a dirty window and a drop-off ahead — a dock edge, stairs down — all
+take the floor away, and all read as "cannot see".
+
+The floor check depends on the mount. One degree of `pitchDegrees` wrong moves the
+floor 17 cm at 10 m: nose down, the floor rises into the corridor and reads as an
+obstacle; nose up, it sinks, and `floorToleranceMetres` is the slack for that.
+A negative `minFloorPoints` turns the check off, and an empty corridor is then
+always 503.
 
 ## From the lidar to a scan
 
@@ -149,7 +162,7 @@ ROS driver or Livox Viewer elsewhere would then stop receiving it. Set
 | `mount` | z 1.0 m | where the lidar is, from the reference point on the ground, and how it is turned: `xMetres`, `yMetres`, `zMetres`, `rollDegrees`, `pitchDegrees`, `yawDegrees` |
 | `body` | none | the vehicle's own outline, `minX`…`maxY` in meters, whose returns are ignored |
 | `slice` | 0.3–1.5 m, 1°, 0.2–40 m, 200 ms | the band of heights, bin width, ranges and window that make the scan |
-| `clearance` | ±0.45 m, 0.1–1.6 m | the corridor ahead: half its width, and the heights the vehicle could hit |
+| `clearance` | ±0.45 m, 0.1–1.6 m, floor 0.3 m, 10 points | the corridor ahead: half its width, the heights the vehicle could hit, how far below the ground a floor return may be, and how many prove the way empty (`halfWidthMetres`, `minHeightMetres`, `maxHeightMetres`, `floorToleranceMetres`, `minFloorPoints`; negative turns the floor check off) |
 | `imuAverageMs` | 100 | the window the IMU's readings are averaged over |
 | `staleAfterMs` | 1000 | how old the newest points may be before `scan`, `clearance` and `quality` stop answering |
 | `imuStaleAfterMs` | 100 | how old the newest IMU sample may be before the motion services stop answering, and how long `heading` is withheld after a gap |
