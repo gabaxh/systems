@@ -36,7 +36,7 @@ start the vehicle. In an authorized cloud the policy must allow all of the above
 | 3 | arrived | at rest, control released | `engage 1`, no pad needed |
 | 4 | coming to rest | velocity 0, then releases control | by itself |
 | 10 | hold: something closer than `holdClearanceMetres` | velocity 0, keeps control | `engage 1` |
-| 11 | hold: no clearance reading | | |
+| 11 | hold: no clearance reading — the sensor is down, or (vigie) nothing came back from the corridor, not even the floor | | |
 | 12 | hold: no recent pose | | |
 | 13 | hold: route and pose in different maps | | |
 | 14 | hold: no route, or an old one | | |
