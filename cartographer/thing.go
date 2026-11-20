@@ -52,6 +52,14 @@ type CartographerConfig struct {
 	GrowMarginMetres float64 `json:"growMarginMetres"`
 	GrowStepMetres   float64 `json:"growStepMetres"`
 
+	// GrowFitMetres grows the map, in the same steps, until every valid
+	// return within this distance of the sensor lands inside it, whichever
+	// way the vehicle is going. The margin alone grows the map round the
+	// vehicle, not round what it sees: on 20 November a room seen through a
+	// door from a corridor 7.5 m from the edge was cut in half by it, and the
+	// edge never moved. Absent means 12 m, as FreeRangeMetres; negative, off.
+	GrowFitMetres float64 `json:"growFitMetres"`
+
 	// PollMs is how often a sweep is asked for.
 	PollMs int `json:"pollMs"`
 
@@ -230,6 +238,7 @@ func initTemplate() *components.UnitAsset {
 			Resolution:          0.05,
 			GrowMarginMetres:    5,
 			GrowStepMetres:      10,
+			GrowFitMetres:       12,
 			PollMs:              200,
 			MatchRangeMetres:    10,
 			FreeRangeMetres:     12,
@@ -383,6 +392,9 @@ func applyDefaults(cfg *CartographerConfig) {
 	}
 	if cfg.GrowStepMetres == 0 {
 		cfg.GrowStepMetres = 10
+	}
+	if cfg.GrowFitMetres == 0 {
+		cfg.GrowFitMetres = 12
 	}
 	if cfg.Resolution <= 0 {
 		cfg.Resolution = 0.05
@@ -804,6 +816,7 @@ func (t *Traits) consume(sw *forms.ScanA_v1a) {
 	moved := math.Hypot(at.x-t.at.x, at.y-t.at.y)
 	turned := math.Abs(wrapAngle(at.theta-t.at.theta)) * 180 / math.Pi
 	if first || moved >= t.cfg.MinTravelMetres || turned >= t.cfg.MinTurnDegrees {
+		t.growToFit(g, at, sw.Angles, sw.Distances, sw.Valid)
 		g.integrate(at, sw.Angles, sw.Distances, sw.Valid)
 		t.integrated++
 		if t.mem != nil {
@@ -851,12 +864,39 @@ func (t *Traits) growToward(g *grid, from, to pose) {
 	if need(y1-to.y, dy) {
 		by1 = to.y + margin
 	}
-	if !g.cover(bx0, by0, bx1, by1, step) {
+	if g.cover(bx0, by0, bx1, by1, step) {
+		logGrowth(g, to, "the vehicle came near an edge")
+	}
+}
+
+// growToFit grows g, in GrowStepMetres steps, until every valid return within
+// GrowFitMetres of the sensor at p lands inside it, a cell to spare. Returns
+// further out do not grow it: there the beam counts a quarter (see
+// grid.freeRange), and a stray return 40 m off would grow the map by a room
+// that is not there. Under the lock.
+func (t *Traits) growToFit(g *grid, p pose, angles, distances []float64, valid []bool) {
+	step, reach := t.cfg.GrowStepMetres, t.cfg.GrowFitMetres
+	if step <= 0 || reach <= 0 {
 		return
 	}
-	nx0, ny0, nx1, ny1 := g.bounds()
-	log.Printf("cartographer: the map has grown to %.0f × %.0f m (x %.0f to %.0f, y %.0f to %.0f), the vehicle at x=%.2f y=%.2f",
-		nx1-nx0, ny1-ny0, nx0, nx1, ny0, ny1, to.x, to.y)
+	x0, y0, x1, y1 := g.bounds()
+	for i := range angles {
+		if i >= len(valid) || i >= len(distances) || !valid[i] || distances[i] > reach {
+			continue
+		}
+		wx, wy := project(p, angles[i], distances[i])
+		x0, x1 = math.Min(x0, wx-g.res), math.Max(x1, wx+g.res)
+		y0, y1 = math.Min(y0, wy-g.res), math.Max(y1, wy+g.res)
+	}
+	if g.cover(x0, y0, x1, y1, step) {
+		logGrowth(g, p, "returns fell outside it")
+	}
+}
+
+func logGrowth(g *grid, at pose, why string) {
+	x0, y0, x1, y1 := g.bounds()
+	log.Printf("cartographer: the map has grown to %.0f × %.0f m (x %.0f to %.0f, y %.0f to %.0f): %s, the vehicle at x=%.2f y=%.2f",
+		x1-x0, y1-y0, x0, x1, y0, y1, why, at.x, at.y)
 }
 
 // snapshot writes the picture a person looks at.

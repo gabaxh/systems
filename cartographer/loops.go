@@ -181,6 +181,7 @@ func (c *closer) window(cov mat3) float64 {
 func (c *closer) submap(m *memory, i, j int) *grid {
 	g := newGrid(c.cfg.SubmapMetres, c.cfg.SubmapMetres, c.resolution)
 	g.matchRange = c.matchRange
+	g.dropPastEdge = true // see grid.dropPastEdge
 	origin := inverse(m.frames[i].pose)
 	from, to := i-c.cfg.SubmapKeyframes, i+c.cfg.SubmapKeyframes
 	if from < 0 {
@@ -654,9 +655,13 @@ func (t *Traits) loopClosed(snap *memory, cl closure) {
 }
 
 // coverKeyframes grows g, in GrowStepMetres steps, until every keyframe is at
-// least GrowMarginMetres inside it. Nothing, with growth off.
+// least GrowMarginMetres inside it, and every valid return of its sweep within
+// GrowFitMetres lands inside it: the redrawn map is grown as the live one was
+// (growToward, growToFit), round where the keyframes now are. A closure that
+// moves the keyframes moves their returns too, and near an edge some move
+// past it. Nothing, with growth off.
 func (t *Traits) coverKeyframes(g *grid, frames []keyframe) {
-	step, margin := t.cfg.GrowStepMetres, t.cfg.GrowMarginMetres
+	step, margin, reach := t.cfg.GrowStepMetres, t.cfg.GrowMarginMetres, t.cfg.GrowFitMetres
 	if step <= 0 || len(frames) == 0 {
 		return
 	}
@@ -664,6 +669,18 @@ func (t *Traits) coverKeyframes(g *grid, frames []keyframe) {
 	for _, f := range frames {
 		x0, x1 = min(x0, f.pose.x-margin), max(x1, f.pose.x+margin)
 		y0, y1 = min(y0, f.pose.y-margin), max(y1, f.pose.y+margin)
+		if reach <= 0 {
+			continue
+		}
+		s := f.sweep
+		for k := range s.angles {
+			if k >= len(s.valid) || k >= len(s.distances) || !s.valid[k] || float64(s.distances[k]) > reach {
+				continue
+			}
+			wx, wy := project(f.pose, float64(s.angles[k]), float64(s.distances[k]))
+			x0, x1 = min(x0, wx-g.res), max(x1, wx+g.res)
+			y0, y1 = min(y0, wy-g.res), max(y1, wy+g.res)
+		}
 	}
 	g.cover(x0, y0, x1, y1, step)
 }

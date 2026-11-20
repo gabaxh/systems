@@ -154,3 +154,104 @@ func TestARedrawCoversItsKeyframes(t *testing.T) {
 		t.Errorf("x %g..%g y %g..%g, want x -15..25 y -35..15", x0, x1, y0, y1)
 	}
 }
+
+// A beam whose return lies past the edge of the grid still clears the cells
+// it crosses, out to the edge, and marks none occupied. It used to be dropped
+// whole, and a vehicle driving toward an edge left a grey wedge ahead of it.
+func TestABeamPastTheEdgeClearsUpToIt(t *testing.T) {
+	for _, angle := range []float64{0, 30, -135, 90} {
+		g := newGrid(10, 10, 0.1) // −5 … 5 m
+		p := pose{0.05, 0.05, 0}
+		g.integrate(p, []float64{angle}, []float64{20}, []bool{true})
+		occupied := 0
+		for _, v := range g.cells {
+			if v > 0 {
+				occupied++
+			}
+		}
+		if occupied > 0 {
+			t.Errorf("%.0f°: %d cells marked occupied by a return off the grid", angle, occupied)
+		}
+		// Every cell of the line out to the last cell inside the grid, that
+		// one included, is clear, and the last one is at the edge.
+		sx, sy, _ := g.cellOf(p.x, p.y)
+		last := [2]int{sx, sy}
+		for d := 0.0; ; d += 0.01 {
+			cx, cy, ok := g.cellOf(project(p, angle, d))
+			if !ok {
+				break
+			}
+			last = [2]int{cx, cy}
+		}
+		if last[0] != 0 && last[1] != 0 && last[0] != g.width-1 && last[1] != g.height-1 {
+			t.Fatalf("%.0f°: the beam's last cell %v is not at the edge", angle, last)
+		}
+		for _, c := range append(line(sx, sy, last[0], last[1]), last) {
+			if v := g.at(c[0], c[1]); v >= 0 {
+				t.Errorf("%.0f°: cell %v on the beam is %g, not clear", angle, c, v)
+				break
+			}
+		}
+	}
+	// A submap drops such a beam whole (see grid.dropPastEdge).
+	g := newGrid(10, 10, 0.1)
+	g.dropPastEdge = true
+	g.integrate(pose{0.05, 0.05, 0}, []float64{0}, []float64{20}, []bool{true})
+	for _, v := range g.cells {
+		if v != 0 {
+			t.Fatal("a submap drew a beam whose return is off it")
+		}
+	}
+}
+
+// Past freeRange the cleared part counts farWeight, as it does for a beam
+// whose return is on the grid.
+func TestABeamPastTheEdgeIsWeighedLikeAnyOther(t *testing.T) {
+	g := newGrid(10, 10, 0.1)
+	g.freeRange = 2
+	p := pose{0.05, 0.05, 0}
+	g.integrate(p, []float64{0}, []float64{20}, []bool{true})
+	near, _, _ := g.cellOf(1, 0.05)
+	far, row, _ := g.cellOf(4, 0.05)
+	if v := g.at(near, row); math.Abs(float64(v-logFree)) > 1e-6 {
+		t.Errorf("1 m along: %g, want %g", v, logFree)
+	}
+	if v := g.at(far, row); math.Abs(float64(v-farWeight*logFree)) > 1e-6 {
+		t.Errorf("4 m along: %g, want %g", v, farWeight*logFree)
+	}
+}
+
+// The map grows to fit the returns within GrowFitMetres, whichever way the
+// vehicle is going; a return further out does not grow it. The room of 20
+// November was seen from 7.5 m inside the edge, beyond the margin.
+func TestTheMapGrowsToFitWhatTheLidarSees(t *testing.T) {
+	tr := growingTraits()
+	p := pose{-7.5, 0, math.Pi / 2} // facing north, 7.5 m from the west edge
+	tr.growToFit(tr.g, p,
+		[]float64{90, 0, -90, 45}, // west, north, east, north-west, in the sensor's frame
+		[]float64{11, 3, 30, 2},   // the east one is past GrowFitMetres
+		[]bool{true, true, true, true})
+	x0, y0, x1, y1 := tr.g.bounds()
+	if !sameMetres(x0, -25) || !sameMetres(x1, 15) || !sameMetres(y0, -15) || !sameMetres(y1, 15) {
+		t.Errorf("x %g..%g y %g..%g, want x -25..15 y -15..15", x0, x1, y0, y1)
+	}
+	// Off, it does nothing.
+	tr = growingTraits()
+	tr.cfg.GrowFitMetres = -1
+	tr.growToFit(tr.g, p, []float64{90}, []float64{11}, []bool{true})
+	if x0, _, _, _ := tr.g.bounds(); !sameMetres(x0, -15) {
+		t.Errorf("with growFitMetres off the map grew to x0 = %g", x0)
+	}
+}
+
+// A redraw's grid fits the keyframes' returns too, where the closure has put
+// the keyframes.
+func TestARedrawFitsItsKeyframesReturns(t *testing.T) {
+	tr := growingTraits()
+	g := emptyLike(tr.g)
+	west := storedSweep{angles: []float32{180}, distances: []float32{11}, valid: []bool{true}}
+	tr.coverKeyframes(g, []keyframe{{pose: pose{-7.5, 0, 0}, sweep: west}})
+	if x0, _, _, _ := g.bounds(); !sameMetres(x0, -25) {
+		t.Errorf("the redraw's grid starts at x0 = %g, want -25", x0)
+	}
+}

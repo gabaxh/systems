@@ -27,8 +27,24 @@ refused in another.
 `growMarginMetres` (5 m) of an edge it is driving toward, that edge moves out
 by `growStepMetres` (10 m); edges it drives away from or along stay put. So the
 `map` form's width, height and origin change during a run, and a consumer must
-read them from every form, not once. A loop-closure redraw keeps the grown
-size. A negative `growStepMetres` keeps the map at its starting size.
+read them from every form, not once. It also grows, in the same steps,
+until every return within `growFitMetres` (12 m) of the sensor lands inside
+it, whichever way the vehicle is going: the margin alone grows the map round
+the vehicle, not round what it sees. A beam whose return is still past the
+edge clears the cells it crosses out to the edge, and only the return is left
+out. A loop-closure redraw keeps the grown size, and fits the keyframes'
+returns where the closure has put them. A negative `growStepMetres` keeps the
+map at its starting size; a negative `growFitMetres` grows it by the margin
+alone.
+
+On 20 November, with growth by the margin alone, a beam whose return was past
+the edge was dropped whole, free cells and all. Driving toward an edge left a
+grey wedge ahead of the vehicle; a room seen through a door from a corridor
+7.5 m inside the edge, beyond the margin, was cut in half by it, with a grey
+triangle where the beams that reached past it should have cleared; and after
+the loop closed at the start, the redraw moved some of the room's returns past
+the edge and more of it went grey. The loop closer's submaps still drop such
+beams, on purpose (`grid.dropPastEdge`).
 
 A `map.pgm` is also written to disk every ten seconds. That is the artefact a
 person looks at; the `map` service is what a system consumes.

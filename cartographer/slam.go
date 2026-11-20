@@ -117,6 +117,16 @@ type grid struct {
 	// for the front end to match against, a few far beams through it clear
 	// it, and a grazing beam needs four times as many to undo a wall.
 	freeRange float64
+
+	// dropPastEdge drops a beam whose return is past the edge, rather than
+	// clearing the cells it crosses out to the edge (see clearToEdge). The
+	// loop closer's submaps set it. A submap is 16 m round one keyframe, drawn
+	// with no freeRange, and dropping the beams that reach past it is what
+	// limits their range there: cleared out to the edge, the grazing ones wear
+	// the walls away near it, the ends of the worn walls fix a corridor match
+	// along the corridor, and the corridor driven up and back is shortened
+	// (TestACorridorDrivenUpAndBackIsNotShortened).
+	dropPastEdge bool
 }
 
 func newGrid(widthM, heightM, res float64) *grid {
@@ -144,8 +154,9 @@ func emptyLike(g *grid) *grid {
 		cells: make([]float32, g.width*g.height),
 		field: make([]float32, g.width*g.height),
 		ex0:   g.width, ey0: g.height, ex1: -1, ey1: -1,
-		matchRange: g.matchRange,
-		freeRange:  g.freeRange,
+		matchRange:   g.matchRange,
+		freeRange:    g.freeRange,
+		dropPastEdge: g.dropPastEdge,
 	}
 }
 
@@ -274,6 +285,16 @@ func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 		wx, wy := project(p, angles[i], distances[i])
 		ex, ey, ok := g.cellOf(wx, wy)
 		if !ok {
+			// The return is past the edge of the grid. What the beam says up
+			// to the edge still holds — the cells it crossed are clear — and
+			// only the return itself has nowhere to go. Dropping the whole
+			// beam, as this did until 20 November, left a grey wedge ahead of
+			// a vehicle driving toward an edge, and a room seen through a door
+			// near one was drawn with a hole in it, and lost more of it each
+			// time a loop closure moved its returns past the edge.
+			if !g.dropPastEdge {
+				g.clearToEdge(p, sx, sy, wx, wy, angles[i])
+			}
 			prevOK = false
 			continue
 		}
@@ -309,6 +330,47 @@ func (g *grid) integrate(p pose, angles, distances []float64, valid []bool) {
 		prevX, prevY, prevOK = ex, ey, true
 	}
 	g.dirty = true
+}
+
+// clearToEdge draws the free part of a beam from the sensor, at p in cell
+// (sx, sy), toward a return at (wx, wy) beyond the grid: clear out to where
+// it leaves the grid, the last cell inside included, in full out to freeRange
+// and at farWeight beyond it, as integrate draws a beam whose return is
+// inside. No cell is marked occupied.
+func (g *grid) clearToEdge(p pose, sx, sy int, wx, wy, angleDeg float64) {
+	// Where the segment from the sensor to the return leaves the grid: the
+	// first of the four edges it reaches, a hundredth of a cell inside.
+	x0, y0, x1, y1 := g.bounds()
+	in := 0.01 * g.res
+	dx, dy := wx-p.x, wy-p.y
+	t := 1.0
+	switch {
+	case dx > 0:
+		t = math.Min(t, (x1-in-p.x)/dx)
+	case dx < 0:
+		t = math.Min(t, (x0+in-p.x)/dx)
+	}
+	switch {
+	case dy > 0:
+		t = math.Min(t, (y1-in-p.y)/dy)
+	case dy < 0:
+		t = math.Min(t, (y0+in-p.y)/dy)
+	}
+	t = math.Max(t, 0)
+	cx, cy, ok := g.cellOf(p.x+t*dx, p.y+t*dy)
+	if !ok {
+		return
+	}
+	if g.freeRange > 0 && t*math.Hypot(dx, dy) > g.freeRange {
+		if fx, fy, ok := g.cellOf(project(p, angleDeg, g.freeRange)); ok {
+			g.ray(sx, sy, fx, fy, logFree)
+			g.ray(fx, fy, cx, cy, farWeight*logFree)
+			g.add(cx, cy, farWeight*logFree)
+		}
+		return
+	}
+	g.ray(sx, sy, cx, cy, logFree)
+	g.add(cx, cy, logFree)
 }
 
 // surfaceGap is how far apart two adjacent returns may be and still be treated
